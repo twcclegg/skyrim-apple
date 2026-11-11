@@ -46,7 +46,7 @@ def parse_user_config(text):
 def dxvk_option_types():
     types = {}
     for component in DXVK_COMPONENTS:
-        for path in (ROOT / "android/app/jni/dxvk/src" / component).rglob("*.cpp"):
+        for path in (ROOT / "third_party/dxvk/src" / component).rglob("*.cpp"):
             for kind, name in OPTION_READ.findall(path.read_text(errors="replace")):
                 types[name] = kind
     return types

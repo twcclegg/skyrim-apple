@@ -17,7 +17,7 @@ from inputs import ROOT, digest, verify_generated
 
 SCHEMA = 1
 SCOPE = "private-native-windows-skyrim-macos-build"
-SOURCE_DIRECTORIES = ("runtime", "android/app/jni/dxvk", "android/app/jni/SDL2")
+SOURCE_DIRECTORIES = ("runtime", "third_party/dxvk", "third_party/SDL2")
 MACOS_SOURCES = ("CMakeLists.txt", "build.sh", "bootstrap.sh", "inputs.py",
                  "prepare_game.py", "build_receipt.py", "requirements.txt", "runtime.conf")
 CONFIG_FILES = ("CMakeCache.txt", "compile_commands.json")

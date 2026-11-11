@@ -282,6 +282,8 @@ def engine(args):
     manifest_sha, receipt = verified_generation(gen, args.game_dir)
     game = Path(args.game_dir or receipt["game_directory"]).resolve()
     require_host("xcrun", "cmake", "ninja", sdk=sdk)
+    if not (ROOT / "third_party/dxvk/CMakeLists.txt").is_file():
+        fail("DXVK is a git submodule that isn't checked out: git submodule update --init third_party/dxvk")
     jobs = str(args.jobs)
     run([sys.executable, IPAD / "build_ffmpeg.py", "--jobs", jobs, *(["--sdk", sdk] if sdk != "iphoneos" else []),
          *(["--source-archive", args.ffmpeg_archive] if args.ffmpeg_archive else [])], f"ffmpeg-{sdk}")

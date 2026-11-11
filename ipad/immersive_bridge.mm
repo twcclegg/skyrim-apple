@@ -14,7 +14,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <unordered_map>
-#include "skyrim_present_tap.h"
+#include "dxvk_present_tap.h"
 
 extern "C" {
 typedef struct skyrim_immersive_frame {
@@ -63,7 +63,7 @@ std::unordered_map<uint64_t, Cached> g_cache;
 std::unordered_map<uint64_t, id<MTLTexture>> g_depth_cache;  /* R32Float, sampled as it is */
 PFN_vkExportMetalObjectsEXT g_export;
 
-Entry entry_of(const skyrim_present_tap_frame *frame) {
+Entry entry_of(const dxvk_present_tap_frame *frame) {
     Entry entry;
     entry.state = frame->state;
     entry.device = frame->vk_device;
@@ -79,7 +79,7 @@ Entry entry_of(const skyrim_present_tap_frame *frame) {
     return entry;
 }
 
-void on_frame(void *, const skyrim_present_tap_frame *frame) {
+void on_frame(void *, const dxvk_present_tap_frame *frame) {
     Entry drop = entry_of(frame);
     {
         std::lock_guard<std::mutex> hold(g_lock);
@@ -94,7 +94,7 @@ void on_frame(void *, const skyrim_present_tap_frame *frame) {
             }
         }
     }
-    if (drop.valid) skyrim_present_tap_release(drop.state, drop.slot);
+    if (drop.valid) dxvk_present_tap_release(drop.state, drop.slot);
 }
 
 /* The texture to sample for a frame: exported once per tap image, through an sRGB view because the image holds
@@ -152,14 +152,14 @@ extern "C" void skyrim_immersive_start(void) {
         std::lock_guard<std::mutex> hold(g_lock);
         g_active = true;
     }
-    skyrim_present_tap_set(on_frame, nullptr);
-    skyrim_present_tap_set_exclusive(1);
+    dxvk_present_tap_set(on_frame, nullptr);
+    dxvk_present_tap_set_exclusive(1);
     fprintf(stderr, "immersive: tap registered, tap-only presents on\n");
 }
 
 extern "C" void skyrim_immersive_stop(void) {
-    skyrim_present_tap_set_exclusive(0);
-    skyrim_present_tap_set(nullptr, nullptr);
+    dxvk_present_tap_set_exclusive(0);
+    dxvk_present_tap_set(nullptr, nullptr);
     Entry waiting[2];
     {
         std::lock_guard<std::mutex> hold(g_lock);
@@ -168,8 +168,8 @@ extern "C" void skyrim_immersive_stop(void) {
         std::swap(waiting[1], g_mailbox[1]);
     }
     for (const Entry &entry : waiting)
-        if (entry.valid) skyrim_present_tap_release(entry.state, entry.slot);
-    if (g_shown.valid) skyrim_present_tap_release(g_shown.state, g_shown.slot);
+        if (entry.valid) dxvk_present_tap_release(entry.state, entry.slot);
+    if (g_shown.valid) dxvk_present_tap_release(g_shown.state, g_shown.slot);
     g_shown = Entry();
     g_cache.clear();
     g_depth_cache.clear();
@@ -177,22 +177,22 @@ extern "C" void skyrim_immersive_stop(void) {
     fprintf(stderr, "immersive: tap cleared, window presents back on\n");
 }
 
-extern "C" void skyrim_immersive_release(void *state, uint32_t slot) { skyrim_present_tap_release(state, slot); }
+extern "C" void skyrim_immersive_release(void *state, uint32_t slot) { dxvk_present_tap_release(state, slot); }
 
 extern "C" int skyrim_immersive_acquire(skyrim_immersive_frame *out) {
     *out = skyrim_immersive_frame();
     Entry taken, skipped;
     {
         std::lock_guard<std::mutex> hold(g_lock);
-        if (g_mailbox[1].valid && skyrim_present_tap_ready(g_mailbox[1].state, g_mailbox[1].frame)) {
+        if (g_mailbox[1].valid && dxvk_present_tap_ready(g_mailbox[1].state, g_mailbox[1].frame)) {
             std::swap(skipped, g_mailbox[0]);
             std::swap(taken, g_mailbox[1]);
-        } else if (g_mailbox[0].valid && skyrim_present_tap_ready(g_mailbox[0].state, g_mailbox[0].frame)) {
+        } else if (g_mailbox[0].valid && dxvk_present_tap_ready(g_mailbox[0].state, g_mailbox[0].frame)) {
             std::swap(taken, g_mailbox[0]);
             std::swap(g_mailbox[0], g_mailbox[1]);
         }
     }
-    if (skipped.valid) skyrim_present_tap_release(skipped.state, skipped.slot);
+    if (skipped.valid) dxvk_present_tap_release(skipped.state, skipped.slot);
     if (taken.valid) {
         if (g_shown.valid) {
             out->retired = 1;

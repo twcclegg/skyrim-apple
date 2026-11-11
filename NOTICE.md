@@ -8,8 +8,8 @@ The shared launcher references Dark Eco's single-title library, separate setting
 
 Third-party components retain their own licenses, including:
 
-- SDL2: [zlib license](android/app/jni/SDL2/LICENSE.txt), plus notices for its incorporated components.
-- DXVK / dxvk-native: zlib license, with copyright notices retained in the source tree; see the [upstream license](https://github.com/Joshua-Ashton/dxvk-native/blob/master/LICENSE).
+- SDL2: the 2.30.9 release, fetched unmodified at build time by `tools/fetch_sdl.py`; [zlib license](https://github.com/libsdl-org/SDL/blob/release-2.30.9/LICENSE.txt), plus notices for its incorporated components.
+- DXVK / dxvk-native: zlib license, with copyright notices retained in the source tree; see the [upstream license](https://github.com/Joshua-Ashton/dxvk-native/blob/master/LICENSE). Built from the [twcclegg/dxvk-native](https://github.com/twcclegg/dxvk-native) fork (git submodule `third_party/dxvk`, branch `skyrim-apple`), which carries the Android port's mobile-GPU patches and this project's changes as separate commits on top of `native-1.9.2b`.
 - MoltenVK: obtained separately from the [KhronosGroup/MoltenVK](https://github.com/KhronosGroup/MoltenVK) project; its license and third-party notices apply.
 - FFmpeg: the decoder-only dependency is built without GPL or nonfree options; [FFmpeg licensing](https://ffmpeg.org/legal.html) and the source's LGPL notices apply.
 

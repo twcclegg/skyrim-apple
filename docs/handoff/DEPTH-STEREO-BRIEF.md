@@ -44,7 +44,7 @@ not only rotation. `docs/perf/IMMERSIVE_OPTIONS.md` compares it with the two alt
    DXVK's command list. Give each slot a second image and copy the R32F target into it in the same place. The
    bridge knows the D3D9 surface; the tap needs its `DxvkImage`
    (`D3D9Surface::GetCommonTexture()->GetImage()`). Add the image and its format to
-   `skyrim_present_tap_frame`, and export it in `ipad/immersive_bridge.mm` like the colour image.
+   `dxvk_present_tap_frame`, and export it in `ipad/immersive_bridge.mm` like the colour image.
 2. **Camera values with each frame:** near, far, the frustum, and the head pose the frame was rendered for.
    The plan's NiCamera notes say where they are; the frame ring in the plan already carries the pose.
 3. **The compositor pass** (`apple/Sources/App/ImmersiveScreen.swift`): instead of one world-locked quad, draw

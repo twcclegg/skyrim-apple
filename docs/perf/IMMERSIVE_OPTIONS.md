@@ -59,7 +59,7 @@ issues each scene draw once per eye with the vertex shader shifting clip-space x
 `eye * separation * (w - convergence)`. The game thread's cost doesn't change; the replay runs on DXVK's
 command thread and the GPU.
 
-What the vendored DXVK 1.9.2 offers (*read*, by a read-only study of `android/app/jni/dxvk`):
+What our DXVK 1.9.2 offers (*read*, by a read-only study of what is now `third_party/dxvk`):
 
 - **Where the shift goes:** `src/dxso/dxso_compiler.cpp` `emitVsFinalize()` (line 3914), between
   `emitLinkerOutputSetup()` and `emitVsClipping()`; the fixed-function vertex shader
@@ -71,7 +71,7 @@ What the vendored DXVK 1.9.2 offers (*read*, by a read-only study of `android/ap
   to a twin of each back-buffer-sized render target and depth buffer. Twins rather than a double-wide target,
   because post passes compute UVs over the whole texture. Vulkan multiview isn't used anywhere in this DXVK and
   would need layered targets that the translated `sampler2D` shaders can't read.
-- **Present:** `skyrim_present_tap_frame` carries one image; it would carry two.
+- **Present:** `dxvk_present_tap_frame` carries one image; it would carry two.
 
 Risks: effects that rebuild position from depth with the mono projection (water, fog, imagespace) will be
 slightly off; the HUD and full-screen passes must be recognised and left unshifted; the game culls for one
