@@ -38,7 +38,7 @@ mkdir -p "$OUTPUT" "$ROOT/apple/Resources"
 printf '%s\n' "$ROOT" > "$ROOT/apple/Resources/checkout-path.txt"
 # Regenerate icons only when the original artwork changes, so concurrent builds never read a
 # half-written catalog image.
-ARTWORK="$ROOT/vision/Artwork/SkyrimAdjacent-original.png"
+ARTWORK="$ROOT/apple/Artwork/SkyrimAdjacent-original.png"
 CATALOG_IMAGE="$ROOT/apple/Resources/Common.xcassets/LauncherArtwork.imageset/Artwork.png"
 if [ ! -f "$CATALOG_IMAGE" ] || [ "$ARTWORK" -nt "$CATALOG_IMAGE" ]; then
     swift "$ROOT/apple/prepare_assets.swift"
