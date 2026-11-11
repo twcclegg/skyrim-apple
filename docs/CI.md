@@ -4,7 +4,7 @@ Two workflows, split by whether they need game-derived code.
 
 | Workflow | Runs on | Needs game files | Triggered by |
 |---|---|---|---|
-| `CI` (`.github/workflows/ci.yml`) | GitHub-hosted `macos-15` | No | every push and pull request |
+| `CI` (`.github/workflows/ci.yml`) | GitHub-hosted `macos-26` (Apple Silicon) | No | pull requests and pushes to `main` |
 | `Full build (private runner)` (`full-build.yml`) | the self-hosted M5 (`skyrim-private`) | Yes, on that Mac only | pushes to this repository, manual runs |
 
 ## CI (hosted, game-free)

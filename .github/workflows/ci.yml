@@ -4,6 +4,7 @@ name: CI
 
 on:
   push:
+    branches: [main]
   pull_request:
   workflow_dispatch:
 
@@ -17,7 +18,7 @@ concurrency:
 jobs:
   game-free:
     name: Runtime and tooling (game-free)
-    runs-on: macos-15
+    runs-on: macos-26
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
