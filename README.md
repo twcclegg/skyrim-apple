@@ -85,7 +85,7 @@ This is initial gameplay acceptance, not a full-game or performance certificatio
 - **The 4 GiB reservation is refused:** inspect the app's actual signed entitlements and embedded profile. Adding a key to an entitlements file does not grant the capability.
 - Diagnostics are in `Documents/SkyrimNative/status.json` and `Documents/SkyrimLogs/`. Remove personal paths and account/device identifiers before attaching logs to an issue. Do not upload game files, generated source, saves, or signing credentials.
 
-Please [open an issue](https://github.com/zschwendi/skyrim-apple/issues) with the device, OS, source revision, and steps to reproduce. Feature requests and reports from legitimate owned installations are welcome.
+Please [open an issue](https://github.com/twcclegg/skyrim-apple/issues) with the device, OS, source revision, and steps to reproduce. Feature requests and reports from legitimate owned installations are welcome.
 
 ## Credits and source
 
