@@ -9,6 +9,11 @@ on its own device evidence.
 on the Low preset, with audio, keyboard and saves. The trackpad can't keep the pointer in
 a Shared Space window, so mouse look stops at the window's edge.
 
+3D immersive with head tracking (M2 and the M3a path: the game's depth on a world-locked screen, the head
+turning the game camera) mostly works and is borderline playable on the M2 at the Low preset and 1280×720
+in quiet scenes; busy scenes such as combat drop frames. Open problems: the trackpad still loses the pointer,
+and the headset powered off twice on battery (never on AC). See [HEAD_TRACKING.md](HEAD_TRACKING.md).
+
 ## How the existing iPad runtime works (what we inherit)
 
 - `gen/` (private, per-user) is the x86 game lifted to C; compiled for arm64 with the runtime.
