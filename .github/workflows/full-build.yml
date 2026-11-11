@@ -1,0 +1,84 @@
+# Full game build on a private self-hosted Mac runner (see docs/CI.md). It builds from privately generated
+# code that never leaves that machine: no artifacts are uploaded, only hashes go into the job summary.
+#
+# Only pushes to this repository and manual runs reach the runner. There is deliberately no pull_request
+# trigger, so a pull request from someone else's fork can never run code on it. Jobs queue while the runner
+# is offline; GitHub drops a job that has waited 24 hours.
+name: Full build (private runner)
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: full-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  full:
+    name: Generated code, macOS game, visionOS engine and app
+    # Opt-in per repository: set the Actions variable SKYRIM_PRIVATE_RUNNER to true once a runner is registered.
+    if: vars.SKYRIM_PRIVATE_RUNNER == 'true'
+    runs-on: [self-hosted, macOS, ARM64, skyrim-private]
+    timeout-minutes: 240
+    env:
+      # Set in the runner's .env (see docs/CI.md):
+      #   SKYRIM_CI_GAME_DIR  your original installation (with TESV_unpacked.exe and the two DirectX DLLs)
+      #   SKYRIM_CI_HOME      private cache root outside the workspace (generated code lives here)
+      SKYRIM_BUILD_JOBS: 2
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          clean: true
+
+      - name: Check runner configuration
+        run: |
+          test -n "$SKYRIM_CI_GAME_DIR" && test -d "$SKYRIM_CI_GAME_DIR" || { echo "::error::SKYRIM_CI_GAME_DIR is not set or missing"; exit 1; }
+          test -n "$SKYRIM_CI_HOME" && mkdir -p "$SKYRIM_CI_HOME/gen"
+          pmset -g batt | head -1
+          sw_vers -productVersion; xcodebuild -version | head -1
+
+      - name: Bootstrap
+        run: macos/bootstrap.sh
+
+      - name: Generated code (reused unless the lifter changed)
+        id: gen
+        run: |
+          KEY=$(cat tools/*.py macos/launcher/*.py macos/requirements.txt | shasum -a 256 | cut -c1-16)
+          GEN="$SKYRIM_CI_HOME/gen/$KEY"
+          if [ ! -f "$GEN/input-manifest.json" ]; then
+            rm -rf gen
+            python3 ipad/build.py prepare --game-dir "$SKYRIM_CI_GAME_DIR"
+            mkdir -p "$(dirname "$GEN")" && mv gen "$GEN"
+            # Keep the two newest generations.
+            ls -1dt "$SKYRIM_CI_HOME"/gen/*/ | tail -n +3 | while read -r old; do rm -rf "$old"; done
+          fi
+          echo "dir=$GEN" >> "$GITHUB_OUTPUT"
+          echo "Generated code: \`$KEY\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: macOS game build and tests
+        run: |
+          cmake -S macos -B macos/build/ci -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_DEPLOYMENT_TARGET=13.0 \
+            -DLB_STRICT_ORDER=ON -DSKYRIM_BUILD_GAME=ON -DSKYRIM_GEN_DIR="${{ steps.gen.outputs.dir }}"
+          cmake --build macos/build/ci --parallel "$SKYRIM_BUILD_JOBS"
+          ctest --test-dir macos/build/ci --output-on-failure
+
+      - name: visionOS engine
+        run: python3 ipad/build.py engine --platform visionos --gen-dir "${{ steps.gen.outputs.dir }}"
+
+      - name: visionOS app (unsigned)
+        run: python3 ipad/build.py app --platform visionos --skip-metal
+
+      - name: Hashes
+        if: always()
+        run: |
+          {
+            echo '| Output | SHA-256 |'; echo '|---|---|'
+            for f in macos/build/ci/skyrim_macos ipad/build/visionos/out/libSkyrimNative.a \
+                     ipad/build/visionos/DerivedData/Build/Products/Release-xros/Skyrim.app/Skyrim; do
+              [ -f "$f" ] && echo "| \`$f\` | \`$(shasum -a 256 "$f" | cut -c1-16)…\` |"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
