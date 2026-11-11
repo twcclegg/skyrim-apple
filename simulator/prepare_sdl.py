@@ -9,9 +9,12 @@ import hashlib
 import json
 from pathlib import Path
 import shutil
+import sys
 
 ROOT=Path(__file__).resolve().parents[1]
-SOURCE=ROOT/"android/app/jni/SDL2"
+sys.path.insert(0,str(ROOT/"tools"))
+import fetch_sdl  # noqa: E402
+SOURCE=fetch_sdl.SOURCE
 
 
 def replace_once(text,before,after):
@@ -141,6 +144,7 @@ def main():
     output=args.output.resolve()
     if ROOT not in output.parents or "build" not in output.relative_to(ROOT).parts:
         parser.error("The SDL overlay must stay in this checkout's ignored build tree")
+    fetch_sdl.ensure()
     shutil.copytree(SOURCE,output,dirs_exist_ok=True,copy_function=shutil.copy2)
     delegate=output/"src/video/uikit/SDL_uikitappdelegate.m"
     window=output/"src/video/uikit/SDL_uikitwindow.m"

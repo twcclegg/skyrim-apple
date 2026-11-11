@@ -39,7 +39,8 @@ add_library(Vulkan::Vulkan STATIC IMPORTED GLOBAL)
 set_target_properties(Vulkan::Vulkan PROPERTIES IMPORTED_LOCATION "${SKYRIM_MOLTENVK_LIBRARY}"
   INTERFACE_INCLUDE_DIRECTORIES "${SKYRIM_MOLTENVK_ROOT}/include"
   INTERFACE_LINK_LIBRARIES "-framework Metal;-framework QuartzCore;-framework Foundation;-framework IOSurface;-framework CoreGraphics;-framework UIKit")
-add_subdirectory("${SKYRIM_ROOT}/android/app/jni/dxvk" dxvk)
+set(DXVK_VULKAN_INCLUDE_DIR "${SKYRIM_MOLTENVK_ROOT}/include")
+add_subdirectory("${SKYRIM_ROOT}/third_party/dxvk" dxvk)
 set_target_properties(dxvk_d3d9 PROPERTIES INSTALL_NAME_DIR "@rpath" BUILD_WITH_INSTALL_NAME_DIR TRUE)
 
 file(GLOB RT_C CONFIGURE_DEPENDS "${SKYRIM_ROOT}/runtime/*.c")

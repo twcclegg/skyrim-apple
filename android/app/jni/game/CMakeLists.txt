@@ -20,8 +20,9 @@ file(GLOB D3DC_SRC ${PORT}/gen/x3da_*.c)
 set_source_files_properties(${D3DC_SRC} PROPERTIES COMPILE_OPTIONS "-O2")
 
 add_library(main SHARED ${RT_SRC} ${RT_CXX} $<TARGET_OBJECTS:lbgen>)
-target_include_directories(main PRIVATE ${PORT}/runtime ${PORT}/gen ../sdlinc
-    ../dxvk/include/native/directx ../dxvk/include/native/windows ../dxvk/include/native)
+target_include_directories(main PRIVATE ${PORT}/runtime ${PORT}/gen ${PORT}/third_party/sdlinc
+    ${PORT}/third_party/dxvk/include/native/directx ${PORT}/third_party/dxvk/include/native/windows
+    ${PORT}/third_party/dxvk/include/native)
 target_compile_definitions(main PRIVATE DXVK_NATIVE GAME_SKYRIM)
 target_compile_options(main PRIVATE -O2 -fno-strict-aliasing -fwrapv -fsigned-char -Wno-everything
     $<$<COMPILE_LANGUAGE:C>:-std=gnu11>)

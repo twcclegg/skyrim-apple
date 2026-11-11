@@ -476,7 +476,7 @@ static void bisect_present(void) {
 IDirect3DSurface9 *d3d_scene_depth_target(void);
 void d3d_scene_depth_reset(void);
 #if defined(__APPLE__)
-extern "C" void skyrim_present_tap_set_depth(void *surface);  // DXVK present tap (skyrim_present_tap.h)
+extern "C" void dxvk_present_tap_set_depth(void *surface);  // DXVK present tap (dxvk_present_tap.h)
 #endif
 
 #if defined(__APPLE__)
@@ -691,13 +691,13 @@ void B_IDirect3DDevice9_Present(CPU *c) {
      * camera), so the frame carries none and the compositor shows it on its fixed screen. */
     g_frame_camera_valid = !menu_open() && game_camera_read(&g_frame_camera);
     game_fov_apply();
-    skyrim_present_tap_set_depth(menu_open() ? nullptr : d3d_scene_depth_target());
+    dxvk_present_tap_set_depth(menu_open() ? nullptr : d3d_scene_depth_target());
 #endif
     platform_present_begin();
     HRESULT hr = d->Present((const RECT *)GPTR(ARG(1)), dst, nullptr, (const RGNDATA *)GPTR(ARG(4)));
     platform_present_end();
 #if defined(__APPLE__)
-    skyrim_present_tap_set_depth(nullptr);
+    dxvk_present_tap_set_depth(nullptr);
     d3d_scene_depth_reset();
 #endif
     pace_present();

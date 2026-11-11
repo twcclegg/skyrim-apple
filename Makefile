@@ -1,7 +1,7 @@
 CC = clang
 CXX = clang++
 OPT ?= -O1
-DXVK ?= android/app/jni/dxvk
+DXVK ?= third_party/dxvk
 DXVK_LIB ?= desktop/build/dxvk
 GAME ?= -DGAME_SKYRIM
 CFLAGS = $(GAME) -std=gnu11 $(OPT) -g0 -fno-strict-aliasing -fwrapv -Iruntime -Igen -w
