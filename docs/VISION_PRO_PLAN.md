@@ -1,8 +1,13 @@
 # Vision Pro plan (working draft)
 
-Our scope in skyrim-apple: native Apple Vision Pro support for the AOT-recompiled 2011 Skyrim
-runtime. Upstream's own stated order is **windowed play → immersive (stereo + head tracking) →
-PSVR2 Sense**, each with its own device evidence. We follow the same gates.
+Native Apple Vision Pro support for the AOT-recompiled 2011 Skyrim runtime, developed in
+`twcclegg/skyrim-apple`. Upstream (`zschwendi/skyrim-apple`) is inactive, and nothing further is expected
+from it. The order is **windowed play → immersive (stereo + head tracking) → PSVR2 Sense**, each gated
+on its own device evidence.
+
+**Status:** windowed play (M1) works on the M2 Vision Pro (visionOS 27.3): about 60 fps at 1280×720
+on the Low preset, with audio, keyboard and saves. The trackpad can't keep the pointer in
+a Shared Space window, so mouse look stops at the window's edge.
 
 ## How the existing iPad runtime works (what we inherit)
 
@@ -62,12 +67,12 @@ have noticeably less GPU, and the system compositor and passthrough also take pa
 ## Milestones
 
 ### M0 — Bring-up (no game yet)
-- Fork workflow: our fork `twcclegg/skyrim-apple`, branches per milestone, PRs upstream.
+- Workflow: `twcclegg/skyrim-apple`, a branch and PR per milestone, merged there.
 - Build our own `gen/` from an owned 1.9.32.0.8 install; build + run the iPad target once as a
   baseline so we know the toolchain is healthy before touching it.
 - Entitlement probe on the headset (B5). Record device model (M2 vs M5 AVP) and visionOS version.
 
-### M1 — Windowed play (upstream's first Vision Pro gate)
+### M1 — Windowed play
 1. SDL visionOS overlay (B1); compile-only first, then window creation in a SwiftUI WindowGroup.
 2. Deps for xros (B2, B3); `ipad/build.py --platform visionos engine/app`.
 3. Launcher: `SkyrimVision` links the engine; `NativeRuntime` on visionOS; status.json/logs same.
@@ -96,8 +101,9 @@ have noticeably less GPU, and the system compositor and passthrough also take pa
   `predictTiming` → `wait(optimalInputTime)` → `queryDrawables` → `startSubmission` → encode →
   `encodePresent` → `endSubmission` (never end an abandoned frame). Head pose at
   `presentationTime`; `drawable.deviceAnchor` = display pose.
-- Handoff at `Present` (static review of the in-tree dxvk-native 1.9.2 + MoltenVK 1.4.2, untested):
-  there is no `ID3D9VkInteropDevice` in 1.9.2, but DXVK is vendored, so tap it directly. Add an
+- Handoff at `Present` (static review of dxvk-native 1.9.2 + MoltenVK 1.4.2, untested):
+  there is no `ID3D9VkInteropDevice` in 1.9.2, but we build our own DXVK (the fork
+  `twcclegg/dxvk-native`, branch `skyrim-apple`), so tap it directly there. Add an
   `extern "C"` present-tap in `d3d9_swapchain.cpp` `D3D9SwapChainEx::PresentImage`, inside the
   `SubmitPresent` CS lambda after `submitCommandList`, passing VkDevice/VkQueue and the D3D9 back
   buffer's VkImage (`m_backBuffers[0]->GetCommonTexture()->GetImage()->handle()`), extent and format.
@@ -169,22 +175,16 @@ have noticeably less GPU, and the system compositor and passthrough also take pa
 - Later upgrade if AER halves perceived rate too much: 117-vision's "centre-only stereo" (render
   only the forward view twice) — but Skyrim can't easily render a scene twice per frame, so AER first.
 
-### M4 — PSVR2 Sense
+### M4 — PSVR2 Sense (deferred: no Sense controllers to test with)
 - `GCProductCategorySpatialController` (visionOS 26+; launcher already detects it) →
   `Accessory(device:)` → `AccessoryTrackingProvider` on its **own** `ARKitSession`
   (a denied permission must not kill rendering); `predictAnchor(for:at:)` per frame.
   Info.plist: `NSWorldSensingUsageDescription`, `NSAccessoryTrackingUsageDescription`.
 - Buttons/sticks → XInput first; tracked aiming later. Cancel system trigger-pinch while active.
 
-## Validation conventions (match the maintainer's)
+## Validation conventions
 - Label every claim tested / untested / observed; Mac or simulator ≠ headset.
 - Per-build evidence: device, OS, build hash, frame counts, audio, logs (as the iPad README does).
 - Env-var knobs (`LB_*`) with an A/B for each risky setting; first-frame checkpoint trace.
 - Pure-logic fixtures for state machines (window↔immersive ownership, HUD pose, recenter).
-
-## Coordination
-- Upstream README says Vision Pro windowed and immersive implementations are "in development",
-  and the maintainer's Titanfall README mentions an unpublished native visionOS build.
-  **Ask the maintainer what exists unpublished before starting M1** to avoid duplicate work, and
-  agree on acceptance evidence (they track device, OS, build hash, frames, audio).
 - Never commit `gen/`, game files, provisioning, or team IDs; use `--team/--bundle-id` overrides.
