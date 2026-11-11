@@ -496,7 +496,12 @@ SHIM(SetThreadPriority) {
         uint32_t h = ARG(0);
         int32_t prio = (int32_t)ARG(1);
         GThread *t = h == 0xFFFFFFFEu ? t_gthread : h_get(h, H_THREAD);
-        if (h == 0xFFFFFFFEu || t == t_gthread) {
+        if (h != 0xFFFFFFFEu && !t) {
+            /* invalid or stale handle: ignore (on the main thread t_gthread is NULL too, so don't compare) */
+        } else if (pthread_main_np()) {
+            /* the main thread stays user-interactive (platform_init); the game asking for normal must not lower it */
+            if (h != 0xFFFFFFFEu && t != t_gthread && t) { t->qos_prio = prio; t->qos_set = 1; }
+        } else if (h == 0xFFFFFFFEu || t == t_gthread) {
             int r = pthread_set_qos_class_self_np(qos_of(prio), 0);
             LOG("qos: thread %u priority %d -> class %x (%d)", t ? t->tid : 0, prio, (unsigned)qos_of(prio), r);
         } else if (t) {

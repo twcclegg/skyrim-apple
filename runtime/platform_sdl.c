@@ -63,6 +63,9 @@ static void capture_mouse(void) {
 }
 #endif
 
+/* Mouse id of the motion events edge_turn synthesizes (SDL_TOUCH_MOUSEID is (Uint32)-1). */
+#define LB_EDGE_TURN_MOUSEID ((Uint32)-2)
+
 #if defined(LB_IOS_DEVICE) && TARGET_OS_VISION
 /* A spatial click on the immersive layer (an indirect pinch, which is also how a trackpad click can arrive):
  * a left button, unless GCMouse pressed a button within 0.25 s (the same click arriving both ways). A press that
@@ -107,6 +110,7 @@ static void edge_turn(void) {
     SDL_zero(e);
     e.type = SDL_MOUSEMOTION;
     e.motion.windowID = SDL_GetWindowID(g_window);
+    e.motion.which = LB_EDGE_TURN_MOUSEID;  /* synthetic: head steering must not read it as the player's mouse */
     e.motion.xrel = dx;
     SDL_PushEvent(&e);
 }
@@ -140,7 +144,7 @@ static atomic_int g_head_anchored;
 float skyrim_head_offset(int *valid) { *valid = atomic_load(&g_head_anchored); return atomic_load(&g_head_offset); }
 static void head_note_event(const SDL_Event *e) {
     if (e->type == SDL_MOUSEMOTION && e->motion.which != SDL_TOUCH_MOUSEID
-        && (e->motion.xrel || e->motion.yrel))
+        && e->motion.which != LB_EDGE_TURN_MOUSEID && (e->motion.xrel || e->motion.yrel))
         g_head_external = 15;
 }
 static float head_wrap(float a) { return a - 6.2831853f * floorf((a + 3.1415927f) / 6.2831853f); }
@@ -166,9 +170,16 @@ static void head_steer(void) {
     else if (atomic_load(&g_head_on)) { head_yaw = atomic_load(&g_head_yaw); head_pitch = atomic_load(&g_head_pitch); }
     else { if (anchored) { void input_head_stick(float, float); input_head_stick(0, 0); } anchored = 0; atomic_store(&g_head_anchored, 0); return; }
     float cam[18];
-    if (!g_window || !skyrim_frame_camera(cam)) return;
+    if (!g_window) return;
     void input_head_stick(float x, float y);
-    if (skyrim_menu_open()) { anchored = 0; atomic_store(&g_head_anchored, 0); input_head_stick(0, 0); return; }  /* menus get no synthetic mouse; re-anchor after */
+    /* Menus, loading screens and any frame without the world camera: let go of the stick (a held deflection would
+     * scroll the menu) and re-anchor once the world is back. A menu frame carries no camera either. */
+    if (skyrim_menu_open() || !skyrim_frame_camera(cam)) {
+        anchored = 0;
+        atomic_store(&g_head_anchored, 0);
+        input_head_stick(0, 0);
+        return;
+    }
     /* Columns of the camera rotation: forward (cam[0], cam[3], cam[6]); Skyrim heading is clockwise from +Y. */
     float game_yaw = atan2f(cam[0], cam[3]);
     float game_pitch = asinf(fmaxf(-1.0f, fminf(1.0f, cam[6])));
