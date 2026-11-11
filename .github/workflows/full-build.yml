@@ -1,4 +1,4 @@
-# Full game build on the private self-hosted runner (the M5, see docs/CI.md). It builds from privately generated
+# Full game build on a private self-hosted Mac runner (see docs/CI.md). It builds from privately generated
 # code that never leaves that machine: no artifacts are uploaded, only hashes go into the job summary.
 #
 # Only pushes to this repository and manual runs reach the runner. There is deliberately no pull_request
@@ -20,11 +20,12 @@ concurrency:
 jobs:
   full:
     name: Generated code, macOS game, visionOS engine and app
-    if: github.repository == 'twcclegg/skyrim-apple'
+    # Opt-in per repository: set the Actions variable SKYRIM_PRIVATE_RUNNER to true once a runner is registered.
+    if: vars.SKYRIM_PRIVATE_RUNNER == 'true'
     runs-on: [self-hosted, macOS, ARM64, skyrim-private]
     timeout-minutes: 240
     env:
-      # Set in the runner's .env by tools/ci/setup-m5-runner.sh:
+      # Set in the runner's .env (see docs/CI.md):
       #   SKYRIM_CI_GAME_DIR  your original installation (with TESV_unpacked.exe and the two DirectX DLLs)
       #   SKYRIM_CI_HOME      private cache root outside the workspace (generated code lives here)
       SKYRIM_BUILD_JOBS: 2
