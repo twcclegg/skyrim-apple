@@ -4,12 +4,100 @@
 #include "rt_table.h"
 /* indirect call through a per-site cache (see lift_terminator in tools/lift.py) */
 void rt_call_ic(CPU *c, uint32_t t, const FnEntry **cache);
+/* the table entry for a lifted function at t (remembered in *cache), or NULL for an import or unknown target */
+const FnEntry *rt_ic_lookup(uint32_t t, const FnEntry **cache);
 jmp_buf *rt_setjmp_slot(CPU *c, uint32_t guest_jb);
 void rt_setjmp3(CPU *c);
-#define SPILL() do { c->r[0] = eax; c->r[1] = ecx; c->r[2] = edx; c->r[3] = ebx; \
+/* Where the eight guest registers live while lifted code runs.
+ *
+ * Default: in locals of each lifted function, loaded from the CPU struct on entry (GUEST_REGS), written back
+ * before every call and return (SPILL) and reread after every call (RELOAD).
+ *
+ * LB_PINNED (arm64; the generated code is then built with -ffixed-x21 ... -ffixed-x28): in eight host
+ * registers that no compiled code in the generated files uses for anything else, so a call between lifted
+ * functions moves nothing. The CPU struct is brought up to date only where control leaves lifted code for
+ * code that reads it (SPILL_RT / RELOAD_RT: the runtime's dispatcher, imports, host replacements), and the
+ * runtime enters lifted code through rt_enter_guest (runtime/dispatch.c), which loads the registers and
+ * keeps the host's own values of x21-x28. x21-x28 are callee-saved, so runtime and library code called from
+ * lifted code preserves them; whole Darwin save pairs are reserved so no prologue saves and restores one. */
+#define REGS_TO_CPU() do { c->r[0] = eax; c->r[1] = ecx; c->r[2] = edx; c->r[3] = ebx; \
     c->r[4] = esp; c->r[5] = ebp; c->r[6] = esi; c->r[7] = edi; } while (0)
-#define RELOAD() do { eax = c->r[0]; ecx = c->r[1]; edx = c->r[2]; ebx = c->r[3]; \
+#define REGS_FROM_CPU() do { eax = c->r[0]; ecx = c->r[1]; edx = c->r[2]; ebx = c->r[3]; \
     esp = c->r[4]; ebp = c->r[5]; esi = c->r[6]; edi = c->r[7]; } while (0)
+/* LB_TRACE_ENTRY (debugging the two register models against each other): every lifted function logs its name
+ * and the registers on entry, per host thread, to $LB_TRACE_DIR/t<n>.txt, up to LB_TRACE_MAX lines a thread. */
+#ifdef LB_TRACE_ENTRY
+#include <stdio.h>
+#include <stdlib.h>
+__attribute__((weak)) int g_trace_threads;
+__attribute__((weak, noinline)) void rt_trace_entry(const char *fn, uint32_t a, uint32_t cx, uint32_t d, uint32_t b,
+                                                    uint32_t sp, uint32_t bp, uint32_t si, uint32_t di) {
+    static __thread FILE *out; static __thread long left = -1;
+    if (left < 0) {
+        const char *dir = getenv("LB_TRACE_DIR"), *max = getenv("LB_TRACE_MAX");
+        char path[512];
+        left = dir ? (max ? atol(max) : 2000000) : 0;
+        if (dir) { snprintf(path, sizeof path, "%s/t%d.txt", dir, __atomic_fetch_add(&g_trace_threads, 1, __ATOMIC_SEQ_CST));
+                   out = fopen(path, "w"); if (!out) left = 0; }
+    }
+    if (left <= 0) return;
+    if (--left == 0) { fprintf(out, "(limit)\n"); fclose(out); return; }
+    fprintf(out, "%s %x %x %x %x %x %x %x %x\n", fn, a, cx, d, b, sp, bp, si, di);
+    if ((left & 0xFF) == 0) fflush(out);
+}
+#define TRACE_ENTRY() rt_trace_entry(__func__, eax, ecx, edx, ebx, esp, ebp, esi, edi)
+#else
+#define TRACE_ENTRY() ((void)0)
+#endif
+#ifdef LB_PINNED
+#ifndef __aarch64__
+#error "LB_PINNED needs arm64"
+#endif
+register uint32_t eax __asm__("w21"); register uint32_t ecx __asm__("w22");
+register uint32_t edx __asm__("w23"); register uint32_t ebx __asm__("w24");
+register uint32_t esp __asm__("w25"); register uint32_t ebp __asm__("w26");
+register uint32_t esi __asm__("w27"); register uint32_t edi __asm__("w28");
+#define GUEST_REGS TRACE_ENTRY()
+/* x21-x28 are callee-saved in the host convention, so the compiler takes a call to leave them unchanged
+ * and, for one, drops a register write after a call that repeats the value written before it. A lifted
+ * callee does change them. The empty asm statement after each call says so; it emits no instruction. */
+#define REGS_CHANGED() __asm__ volatile("" : : : "x21", "x22", "x23", "x24", "x25", "x26", "x27", "x28")
+#ifdef LB_PINNED_CHECK
+/* Debugging: also keep the CPU struct current, and check at every function entry and after every call that
+ * the registers and the struct agree. A mismatch means lifted code was entered or left by a path that
+ * skipped the register hand-over. */
+#include <stdio.h>
+#include <stdlib.h>
+__attribute__((weak, noinline, noreturn)) void rt_pin_fail(CPU *c, const char *fn, const char *where,
+        uint32_t a, uint32_t cx, uint32_t d, uint32_t b, uint32_t sp, uint32_t bp, uint32_t si, uint32_t di) {
+    fprintf(stderr, "pinned-register mismatch in %s (%s)\n  regs %x %x %x %x %x %x %x %x\n  cpu  %x %x %x %x %x %x %x %x\n",
+            fn, where, a, cx, d, b, sp, bp, si, di,
+            c->r[0], c->r[1], c->r[2], c->r[3], c->r[4], c->r[5], c->r[6], c->r[7]);
+    abort();
+}
+#define PIN_CHECK(where) do { if (eax != c->r[0] || ecx != c->r[1] || edx != c->r[2] || ebx != c->r[3] || \
+    esp != c->r[4] || ebp != c->r[5] || esi != c->r[6] || edi != c->r[7]) \
+    rt_pin_fail(c, __func__, where, eax, ecx, edx, ebx, esp, ebp, esi, edi); } while (0)
+#undef GUEST_REGS
+#define GUEST_REGS PIN_CHECK("entry"); TRACE_ENTRY()
+#define SPILL() REGS_TO_CPU()
+#define RELOAD() do { REGS_CHANGED(); PIN_CHECK("after call"); } while (0)
+#else
+#define SPILL() ((void)0)
+#define RELOAD() REGS_CHANGED()
+#endif
+#define SPILL_RT() REGS_TO_CPU()
+#define RELOAD_RT() do { REGS_CHANGED(); REGS_FROM_CPU(); } while (0)
+#define HOST_ENTRY(fn) do { REGS_TO_CPU(); fn(c); REGS_CHANGED(); REGS_FROM_CPU(); } while (0)
+#else
+#define GUEST_REGS uint32_t eax = c->r[0], ecx = c->r[1], edx = c->r[2], ebx = c->r[3], \
+    esp = c->r[4], ebp = c->r[5], esi = c->r[6], edi = c->r[7]; TRACE_ENTRY()
+#define SPILL() REGS_TO_CPU()
+#define RELOAD() REGS_FROM_CPU()
+#define SPILL_RT() REGS_TO_CPU()
+#define RELOAD_RT() REGS_FROM_CPU()
+#define HOST_ENTRY(fn) fn(c)
+#endif
 /* Guest atomics (xchg with memory, lock-prefixed instructions, cmpxchg; see tools/lift.py). x86 allows them
  * at any address. ARM's atomic instructions fault when the address isn't a multiple of the operand size (SIGBUS
  * on Apple CPUs, where it kills the game), so those rare cases do the operation under one process-wide lock
@@ -41,6 +129,8 @@ static inline void ga_unlock(void) { __atomic_store_n(&g_ga_lock, 0, __ATOMIC_RE
 /* Functions that keep the x87 top index in the local `ft` (X87CACHE in tools/lift.py). */
 #define SPILLF() do { SPILL(); c->top = ft; } while (0)
 #define RELOADF() do { RELOAD(); ft = c->top; } while (0)
+#define SPILLF_RT() do { SPILL_RT(); c->top = ft; } while (0)
+#define RELOADF_RT() do { RELOAD_RT(); ft = c->top; } while (0)
 static inline void rt_movsd(uint32_t n, uint32_t dst, uint32_t src) {
     /* forward rep movsd; overlapping copies must behave like the dword loop */
     if (dst <= src || dst >= src + n * 4) memmove(MEM + dst, MEM + src, (size_t)n * 4);
