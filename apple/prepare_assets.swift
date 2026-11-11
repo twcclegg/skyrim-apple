@@ -5,8 +5,7 @@ import ImageIO
 import UniformTypeIdentifiers
 
 let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
-let sourceRoot = root.deletingLastPathComponent().appendingPathComponent("vision")
-let original = sourceRoot.appendingPathComponent("Artwork/SkyrimAdjacent-original.png")
+let original = root.appendingPathComponent("Artwork/SkyrimAdjacent-original.png")
 let files = FileManager.default
 let info: [String: Any] = ["author": "xcode", "version": 1]
 guard let input = CGImageSourceCreateWithURL(original as CFURL, nil),
@@ -64,7 +63,7 @@ for platform in ["iOS", "Mac"] {
 
 let vision = root.appendingPathComponent("Resources/Vision.xcassets")
 try writeJSON(["info": info], to: vision.appendingPathComponent("Contents.json"))
-let originalStack = sourceRoot.appendingPathComponent("Resources/Assets.xcassets/AppIcon.solidimagestack")
+let originalStack = root.appendingPathComponent("Artwork/AppIcon.solidimagestack")
 let visionStack = vision.appendingPathComponent("AppIcon.solidimagestack")
 if !files.fileExists(atPath: visionStack.path) {
     try files.copyItem(at: originalStack, to: visionStack)
