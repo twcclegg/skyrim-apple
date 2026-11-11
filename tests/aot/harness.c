@@ -5,6 +5,7 @@
 #include "rt.h"
 #include "rt_table.h"
 #include "fixture_addresses.h"
+#include <pthread.h>
 #include <stdarg.h>
 #include <sys/mman.h>
 
@@ -54,6 +55,34 @@ static CPU invoke(uint32_t fn) {
     return c;
 }
 
+/* Host code reached from lifted code, which itself runs lifted code before returning. */
+static _Atomic unsigned shim_bad;
+static void shim_host_roundtrip(CPU *c) {
+    if (c->r[3] != 0x11 || c->r[6] != 0x22) shim_bad++;
+    uint32_t value = 35;
+    uint32_t nested = rt_invoke(c, FIX_CDECL_CALLEE, 1, &value);
+    c->r[3] = 0x100;
+    RETC(nested);
+}
+void rt_longjmp(CPU *c, uint32_t jb, uint32_t val) __attribute__((noreturn));
+static void shim_longjmp(CPU *c) { rt_longjmp(c, ARG(0), ARG(1)); }
+
+/* Each host thread runs lifted code on its own CPU and guest stack. */
+static void *thread_body(void *arg) {
+    uintptr_t index = (uintptr_t)arg, bad = 0;
+    for (int i = 0; i < 20000; i++) {
+        CPU c = cpu();
+        c.r[4] = 0x200000 + 0x10000 * (uint32_t)index;
+        rt_invoke(&c, FIX_BRANCH_LOOP, 0, NULL);
+        bad += c.r[0] != 15 || c.r[1] != 0;
+        rt_invoke(&c, FIX_HOST_ROUNDTRIP, 0, NULL);
+        bad += c.r[0] != 42 + 0x100 + 0x22 || c.r[3] != 0x100 || c.r[6] != 0x22;
+        rt_invoke(&c, FIX_DIRECT_CALL, 0, NULL);
+        bad += c.r[0] != 49;
+    }
+    return (void *)bad;
+}
+
 int main(int argc, char **argv) {
     const size_t space = 1ull << 32;
     MEM = mmap(NULL, space, PROT_READ | PROT_WRITE,
@@ -67,6 +96,9 @@ int main(int argc, char **argv) {
         invoke(FIX_UNIMPLEMENTED_TRAP);
         rt_fatal("unimplemented instruction unexpectedly returned");
     }
+
+    M32(0x26000) = rt_thunk(shim_host_roundtrip, "host_roundtrip");
+    M32(0x26008) = rt_thunk(shim_longjmp, "longjmp");
 
     CPU c = invoke(FIX_ARITHMETIC_FLAGS);
     check("add wrap and carry/zero flags", c.r[0] == 0 && c.r[1] == 1 && c.r[2] == 1);
@@ -122,6 +154,18 @@ int main(int argc, char **argv) {
     c = cpu();
     value = 39;
     check("stdcall guest pops argument", rt_invoke(&c, FIX_STDCALL_CALLEE, 1, &value) == 42 && c.r[4] == 0x180000);
+
+    c = invoke(FIX_HOST_ROUNDTRIP);
+    check("lifted -> host -> lifted -> back keeps and passes registers",
+          shim_bad == 0 && c.r[0] == 42 + 0x100 + 0x22 && c.r[3] == 0x100 && c.r[6] == 0x22);
+    c = invoke(FIX_SETJMP_CALLER);
+    check("setjmp/longjmp across a lifted frame restores callee-saved registers",
+          c.r[0] == 7 && c.r[3] == 5 && c.r[7] == 6);
+    pthread_t threads[4];
+    uintptr_t thread_bad = 0;
+    for (uintptr_t i = 0; i < 4; i++) pthread_create(&threads[i], NULL, thread_body, (void *)i);
+    for (int i = 0; i < 4; i++) { void *r; pthread_join(threads[i], &r); thread_bad += (uintptr_t)r; }
+    check("four host threads running lifted code at once", thread_bad == 0 && shim_bad == 0);
 
     munmap(MEM, space);
     printf("{\"passed\":%u,\"total\":%u}\n", passed, total);

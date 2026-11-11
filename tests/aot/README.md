@@ -20,6 +20,17 @@ x87 addition and rounding, atomic compare/exchange, overlapping forward
 string copies, and Windows FS-relative access. Expected results are defined
 independently in `harness.c`.
 
+Three boundary cases cover the places where control crosses between lifted and host code: a host shim
+called from lifted code that itself runs lifted code before returning, `setjmp`/`longjmp` across a lifted
+frame, and four host threads running lifted code at once.
+
+`--pinned` builds the lifted code the way `LB_PINNED_REGS` builds the game (guest registers in x21–x28,
+the three unsafe LLVM passes off) and must give the same results:
+
+```sh
+macos/.venv/bin/python tests/aot/run.py --pinned --output-dir macos/build/aot-fixtures-pinned
+```
+
 Two additional subprocess checks execute generated functions containing an
 unknown indirect call and an unsupported software interrupt. Both must reach
 the production runtime's explicit fatal path; no translator fallback is used.

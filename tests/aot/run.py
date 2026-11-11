@@ -55,6 +55,13 @@ def cases() -> list[tuple[str, bytes, list[tuple[int, int]] | None]]:
         ("fs_relative", bytes.fromhex("64a124000000c3"), None),
         # Host-invoked stdcall function pops its one argument.
         ("stdcall_callee", bytes.fromhex("8b44240483c003c20400"), None),
+        # Lifted code -> host shim -> lifted code again -> back: registers set before the call must reach the
+        # shim, and a register the shim changes must be seen after it. mov ebx,0x11; mov esi,0x22;
+        # call [IAT_HOST]; add eax,ebx; add eax,esi; ret
+        ("host_roundtrip", bytes.fromhex("bb11000000be22000000ff1500600200" "01d801f0c3"), None),
+        ("setjmp_caller", b"", None),
+        # push 7; push jmp_buf; call [IAT_LONGJMP]; ret (never reached)
+        ("longjmp_thrower", bytes.fromhex("6a076800700200ff1508600200c3"), None),
         # There is intentionally no function at this dispatch target.
         ("unknown_call", bytes.fromhex("b8ff2f4000ffd0c3"), None),
         # A privileged instruction must become the upstream explicit trap.
@@ -65,6 +72,15 @@ def cases() -> list[tuple[str, bytes, list[tuple[int, int]] | None]]:
     direct = b"\x6a\x29\xe8" + struct.pack("<i", callee - (direct_address + 7))
     direct += bytes.fromhex("83c40483c001c3")
     indirect = b"\x6a\x09\xb8" + dword(callee) + bytes.fromhex("ffd083c40483c001c3")
+    # mov ebx,5; mov edi,6; push jmp_buf; call [IAT_SETJMP3]; add esp,4; test eax,eax; jnz done;
+    # mov ebx,0x77; mov edi,0x99; call longjmp_thrower; done: ret
+    names = [name for name, _, _ in result]
+    setjmp_address = BASE + TEXT_RVA + names.index("setjmp_caller") * STEP
+    thrower = BASE + TEXT_RVA + names.index("longjmp_thrower") * STEP
+    setjmp_code = bytes.fromhex("bb05000000bf060000006800700200ff150460020083c40485c0750f"
+                                "bb77000000bf99000000") + b"\xe8" + struct.pack("<i", thrower - (setjmp_address + 43))
+    setjmp_code += b"\xc3"
+    result[names.index("setjmp_caller")] = ("setjmp_caller", setjmp_code, [(0, 28), (28, 43), (43, 44)])
     result[4] = ("direct_call", direct, None)
     result[5] = ("indirect_call", indirect, None)
     return result
@@ -105,7 +121,9 @@ def write_pe(path: Path, definitions: list[tuple[str, bytes, list[tuple[int, int
                                    (blocks or [(0, len(code))])]
         symbols[name] = address
     path.write_bytes(image)
-    return {"functions": functions, "iat": {}, "jump_tables": {}, "symbols": symbols}
+    # Import slots live in guest memory outside the image; the harness fills them with host thunks.
+    iat = {"0x26000": "fixture.dll!host_roundtrip", "0x26004": "msvcrt.dll!_setjmp3", "0x26008": "msvcrt.dll!longjmp"}
+    return {"functions": functions, "iat": iat, "jump_tables": {}, "symbols": symbols}
 
 
 def command(argv: list[str], *, env: dict | None = None) -> subprocess.CompletedProcess:
@@ -125,6 +143,8 @@ def main() -> int:
     parser.add_argument("--output-dir", type=Path, default=ROOT / "macos/build/aot-fixtures")
     parser.add_argument("--cc", default=os.environ.get("CC", "clang"))
     parser.add_argument("--strict-order", action="store_true", help="Enable runtime acquire/release guest accesses")
+    parser.add_argument("--pinned", action="store_true",
+                        help="Build the lifted code as LB_PINNED_REGS does (guest registers in x21-x28)")
     parser.add_argument("--discover", action="store_true", help="Run the real recursive function discovery before lifting")
     args = parser.parse_args()
     if platform.system() != "Darwin" or platform.machine() != "arm64":
@@ -159,10 +179,25 @@ def main() -> int:
     argv = [args.cc, "-arch", "arm64", "-std=gnu11", "-O2", "-fno-strict-aliasing", "-fwrapv",
             "-fsigned-char", "-DGAME_SKYRIM", "-I", str(ROOT / "runtime"), "-I", str(generated),
             "-I", str(output), str(ROOT / "tests/aot/harness.c"),
-            str(ROOT / "runtime/dispatch.c"), str(ROOT / "runtime/fpu.c")]
+            str(ROOT / "runtime/dispatch.c"), str(ROOT / "runtime/fpu.c"), str(ROOT / "runtime/setjmp.c"), "-lpthread"]
     if args.strict_order:
         argv += ["-DLB_STRICT_ORDER"]
-    argv += [str(path) for path in sorted(generated.glob("*.c"))]
+    if args.pinned:
+        # As macos/CMakeLists.txt does: only the generated code reserves the registers and has the three
+        # unsafe passes off; the runtime only knows that the mode is on.
+        argv += ["-DLB_PINNED"]
+        pinned = ["-ffixed-x%d" % n for n in range(21, 29)] + [
+            "-mllvm", "-disable-postra-machine-licm", "-mllvm", "-disable-early-ifcvt",
+            "-mllvm", "-aarch64-enable-ccmp=false"]
+        common = [a for a in argv[1:] if a.startswith(("-D", "-f", "-O", "-std", "-arch")) or a == "arm64"]
+        include = ["-I", str(ROOT / "runtime"), "-I", str(generated), "-I", str(output)]
+        for path in sorted(generated.glob("*.c")):
+            obj = path.with_suffix(".o")
+            built = command([args.cc, *common, *include, *pinned, "-c", str(path), "-o", str(obj)])
+            (output / "compile.log").write_text(built.stdout + built.stderr)
+            argv.append(str(obj))
+    else:
+        argv += [str(path) for path in sorted(generated.glob("*.c"))]
     argv += ["-o", str(executable)]
     compiled = command(argv)
     (output / "compile.log").write_text(compiled.stdout + compiled.stderr)
@@ -186,7 +221,7 @@ def main() -> int:
     receipt = {
         "kind": "synthetic-x86-aot-to-arm64", "game_code": False, "runtime_cpu_jit": False,
         "scope": "Synthetic instruction and call fixtures only; not Skyrim boot or gameplay proof.",
-        "strict_order": args.strict_order, "host": platform.platform(), "architecture": platform.machine(),
+        "strict_order": args.strict_order, "pinned": args.pinned, "host": platform.platform(), "architecture": platform.machine(),
         "recursive_discovery": args.discover,
         "source_revision": command(["git", "rev-parse", "HEAD"]).stdout.strip(),
         "python": sys.version, "compiler_command": argv, "executable": str(executable),
