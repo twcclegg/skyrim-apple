@@ -36,8 +36,10 @@ INPUTS = [(0, 0), (1, 2), (5, 9), (17, 3), (255, 256), (0x7FFFFFFF, 1), (0x80000
 X86_FLAGS = ["--target=i686-unknown-linux-gnu", "-march=i686", "-ffreestanding", "-fno-builtin", "-fno-jump-tables",
              "-fno-pic", "-fno-common", "-fno-stack-protector", "-fno-asynchronous-unwind-tables", "-fwrapv",
              "-mno-sse", "-mno-mmx", "-fno-strict-aliasing", "-w", "-include", str(HERE / "x86prog.h")]
-PINNED = ["-ffixed-x%d" % n for n in range(21, 29)] + ["-mllvm", "-disable-postra-machine-licm", "-mllvm",
-                                                         "-disable-early-ifcvt", "-mllvm", "-aarch64-enable-ccmp=false"]
+# X86CORPUS_NO_PASS_FLAGS=1 leaves the three pass-disabling flags out of the pinned build: a control run that
+# should produce MISMATCH results and so shows the corpus can detect the known compiler bugs.
+PINNED = ["-ffixed-x%d" % n for n in range(21, 29)] + ([] if os.environ.get("X86CORPUS_NO_PASS_FLAGS") == "1" else [
+    "-mllvm", "-disable-postra-machine-licm", "-mllvm", "-disable-early-ifcvt", "-mllvm", "-aarch64-enable-ccmp=false"])
 
 
 def sh(argv, **kw):
