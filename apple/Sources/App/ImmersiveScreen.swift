@@ -3,6 +3,9 @@ import ARKit
 import CompositorServices
 import Foundation
 import Metal
+#if canImport(MetalFX)
+import MetalFX  // not in the visionOS Simulator SDK
+#endif
 import QuartzCore
 import simd
 import SwiftUI
@@ -88,6 +91,8 @@ private struct QuadUniforms {
     /// 0: the screen is a window (depth behind it, scaled). 1: head-tracked view, each pixel at its true distance
     /// (depthScale meters per game meter, up to maxBehind meters) from the eye, which is eyeBack in front.
     var trueDepth: Float
+    /// Strength of the sharpening pass on the game image (LB_IMMERSIVE_SHARPEN, 0 = off).
+    var sharpen: Float
 }
 
 /// Runs on its own thread for as long as the layer lives: presents at the display's rate, showing the newest finished
@@ -99,7 +104,7 @@ final class ImmersiveCompositor: @unchecked Sendable {
     struct Uniforms {
         float4x4 viewProjection; float4x4 model; float2 halfSize; uint decode; uint hasDepth;
         uint2 grid; float eyeBack; float nearUnits; float unitsPerMeter; float depthScale; float maxBehind; float backplate;
-        float tear; float trueDepth;
+        float tear; float trueDepth; float sharpen;
     };
     struct Out { float4 position [[position]]; float2 uv; };
     // A grid over the game image. With depth, each vertex moves along the ray from the game's camera (eyeBack in
@@ -188,6 +193,16 @@ final class ImmersiveCompositor: @unchecked Sendable {
                                     constant Uniforms &u [[buffer(0)]]) {
         constexpr sampler linear_clamp(address::clamp_to_edge, filter::linear);
         float3 c = image.sample(linear_clamp, in.uv).rgb;
+        if (u.sharpen > 0) {
+            // Unsharp mask over the four neighbouring texels, limited to their range so edges don't ring.
+            float2 t = 1.0 / float2(image.get_width(), image.get_height());
+            float3 n = image.sample(linear_clamp, in.uv + float2(0, -t.y)).rgb;
+            float3 s = image.sample(linear_clamp, in.uv + float2(0, t.y)).rgb;
+            float3 w = image.sample(linear_clamp, in.uv + float2(-t.x, 0)).rgb;
+            float3 e = image.sample(linear_clamp, in.uv + float2(t.x, 0)).rgb;
+            float3 lo = min(c, min(min(n, s), min(w, e))), hi = max(c, max(max(n, s), max(w, e)));
+            c = clamp(c + u.sharpen * (4.0 * c - n - s - w - e), lo, hi);
+        }
         if (u.decode) c = select(pow((c + 0.055) / 1.055, 2.4), c / 12.92, c <= 0.04045);
         return float4(c, 1);
     }
@@ -231,6 +246,89 @@ final class ImmersiveCompositor: @unchecked Sendable {
     private var headStartPosition = SIMD3<Float>(0, 0, 0)
     /// Distance of the plane the frame's grid is laid on before depth moves it (any value works in true depth).
     private static let viewPlane: Float = 2.0
+
+    /// LB_IMMERSIVE_UPSCALE=<factor> (1.25 to 3, for example 2): the game image goes through a MetalFX spatial
+    /// upscale to factor times its size before it is drawn, so the game can render small (LB_WINDOW) and still
+    /// be shown sharp. Unset, 0 or 1: off. LB_IMMERSIVE_SHARPEN=<0 to 1>: sharpening when the image is drawn,
+    /// with or without the upscale; off by default. Both are read once the game is presenting.
+    private var imageSettings: (upscale: Float, sharpen: Float)?
+    private func readImageSettings() -> (upscale: Float, sharpen: Float) {
+        if let imageSettings { return imageSettings }
+        func number(_ name: String) -> Float { getenv(name).flatMap { Float(String(cString: $0)) } ?? 0 }
+        var upscale = number("LB_IMMERSIVE_UPSCALE")
+        upscale = upscale > 1 ? min(max(upscale, 1.25), 3) : 0
+        let settings = (upscale: upscale, sharpen: min(max(number("LB_IMMERSIVE_SHARPEN"), 0), 1))
+        imageSettings = settings
+        log("image: upscale \(settings.upscale > 0 ? "x\(settings.upscale)" : "off"), sharpen \(settings.sharpen)")
+        return settings
+    }
+    #if canImport(MetalFX)
+    private var scaler: (any MTLFXSpatialScaler)?
+    #endif
+    private var upscaled: (any MTLTexture)?
+    private var upscaledFrom: (width: Int, height: Int, format: MTLPixelFormat)?
+    private var upscaleUnavailable = false
+
+    /// The game image after the MetalFX upscale, encoded into `commands` when the frame is new; nil when the
+    /// upscale is off or can't be made (logged once), and the caller draws the game image as it is.
+    private func upscale(_ texture: any MTLTexture, isNew: Bool, encoded: Bool, factor: Float,
+                         commands: any MTLCommandBuffer) -> (any MTLTexture)? {
+        guard factor > 1, !upscaleUnavailable else { return nil }
+        #if canImport(MetalFX)
+        var fresh = false
+        if scaler == nil || upscaled == nil || upscaledFrom?.width != texture.width
+            || upscaledFrom?.height != texture.height || upscaledFrom?.format != texture.pixelFormat {
+            scaler = nil
+            upscaled = nil
+            guard MTLFXSpatialScalerDescriptor.supportsDevice(device) else {
+                upscaleUnavailable = true
+                log("upscale: MetalFX spatial scaling is not supported on this device; drawing the game image as it is")
+                return nil
+            }
+            let description = MTLFXSpatialScalerDescriptor()
+            description.inputWidth = texture.width
+            description.inputHeight = texture.height
+            description.outputWidth = Int((Float(texture.width) * factor).rounded())
+            description.outputHeight = Int((Float(texture.height) * factor).rounded())
+            description.colorTextureFormat = texture.pixelFormat
+            description.outputTextureFormat = texture.pixelFormat
+            // Values the shader still has to decode from sRGB are perceptual; an sRGB texture reads as linear.
+            description.colorProcessingMode = encoded ? .perceptual : .linear
+            guard let made = description.makeSpatialScaler(device: device) else {
+                upscaleUnavailable = true
+                log("upscale: no MetalFX scaler for \(texture.width)x\(texture.height) format \(texture.pixelFormat.rawValue); drawing the game image as it is")
+                return nil
+            }
+            let target = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: texture.pixelFormat, width: description.outputWidth,
+                                                                  height: description.outputHeight, mipmapped: false)
+            target.usage = made.outputTextureUsage.union(.shaderRead)
+            target.storageMode = .private
+            guard let output = device.makeTexture(descriptor: target) else {
+                upscaleUnavailable = true
+                log("upscale: no \(description.outputWidth)x\(description.outputHeight) texture; drawing the game image as it is")
+                return nil
+            }
+            scaler = made
+            upscaled = output
+            upscaledFrom = (texture.width, texture.height, texture.pixelFormat)
+            fresh = true
+            log("upscale: MetalFX spatial \(texture.width)x\(texture.height) -> \(output.width)x\(output.height), format \(texture.pixelFormat.rawValue), \(encoded ? "perceptual" : "linear")")
+        }
+        guard let scaler, let upscaled else { return nil }
+        if isNew || fresh {
+            scaler.colorTexture = texture
+            scaler.outputTexture = upscaled
+            scaler.inputContentWidth = texture.width
+            scaler.inputContentHeight = texture.height
+            scaler.encode(commandBuffer: commands)
+        }
+        return upscaled
+        #else
+        upscaleUnavailable = true
+        log("upscale: MetalFX is not in this SDK (visionOS Simulator); drawing the game image as it is")
+        return nil
+        #endif
+    }
 
     init(layer: LayerRenderer) {
         self.layer = layer
@@ -413,6 +511,16 @@ final class ImmersiveCompositor: @unchecked Sendable {
             log("game texture \(texture.width)x\(texture.height), same Metal device as the layer: \(texture.device === device)")
         }
 
+        // The image the screen is drawn from: the game frame, or its MetalFX upscale.
+        var image = texture
+        var sharpen: Float = 0
+        if let texture {
+            let imageSettings = readImageSettings()
+            sharpen = imageSettings.sharpen
+            image = upscale(texture, isNew: game.is_new != 0, encoded: game.needs_srgb_decode != 0,
+                            factor: imageSettings.upscale, commands: commands) ?? texture
+        }
+
         var publishedHead = false
         for drawable in drawables {
             let shownAt = LayerRenderer.Clock.Instant.epoch.duration(to: drawable.frameTiming.presentationTime)
@@ -452,7 +560,7 @@ final class ImmersiveCompositor: @unchecked Sendable {
                 if !rateMaps.isEmpty { pass.rasterizationRateMap = rateMaps[min(index, rateMaps.count - 1)] }
                 guard let encoder = commands.makeRenderCommandEncoder(descriptor: pass) else { continue }
                 encoder.setViewport(view.textureMap.viewport)
-                if let texture, let model, let pipeline, let depth {
+                if let texture, let image, let model, let pipeline, let depth {
                     let viewMatrix = (head * view.transform).inverse
                     let aspect = game.height > 0 ? Float(game.width) / Float(game.height) : 16.0 / 9.0
                     let settings = depthTexture != nil ? readDepthSettings() : (scale: 0, maxBehind: 0, near: 15, units: 70, tear: 0.08, on: false)
@@ -472,13 +580,14 @@ final class ImmersiveCompositor: @unchecked Sendable {
                                                 eyeBack: eyeBack, nearUnits: settings.near, unitsPerMeter: settings.units,
                                                 depthScale: tracked ? headDepthScale : settings.scale,
                                                 maxBehind: tracked ? 300 : settings.maxBehind, backplate: 0,
-                                                tear: settings.tear, trueDepth: tracked && useDepth ? 1 : 0)
+                                                tear: settings.tear, trueDepth: tracked && useDepth ? 1 : 0,
+                                                sharpen: sharpen)
                     encoder.setRenderPipelineState(pipeline)
                     encoder.setDepthStencilState(depth)
                     encoder.setCullMode(.none)
                     encoder.setVertexBytes(&uniforms, length: MemoryLayout<QuadUniforms>.stride, index: 0)
                     encoder.setFragmentBytes(&uniforms, length: MemoryLayout<QuadUniforms>.stride, index: 0)
-                    encoder.setFragmentTexture(texture, index: 0)
+                    encoder.setFragmentTexture(image, index: 0)
                     encoder.setVertexTexture(useDepth ? depthTexture : texture, index: 1)
                     let vertexCount = Int((Self.gridColumns - 1) * (Self.gridRows - 1) * 6)
                     encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: vertexCount)
