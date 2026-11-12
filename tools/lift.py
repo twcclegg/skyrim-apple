@@ -17,6 +17,7 @@ import pefile
 from capstone import x86
 
 import peimg
+import stackslots
 
 EXE, FUNCS, OUT = sys.argv[1:4]
 MOD = sys.argv[4] if len(sys.argv) > 4 else "exe"
@@ -232,6 +233,19 @@ class Unsupported(Exception):
     pass
 
 
+# Stack slots as C locals (LIFT_SLOTS=1; off by default). In the plain translation every [esp+N] or [ebp-N]
+# operand, push and pop is a load or store in guest memory, which no later guest store lets the compiler
+# forward or drop. With this on, functions whose stack address never leaves them (tools/stackslots.py) keep
+# the slots they read back, and the registers they save, in locals: `sl_1C` is the cell 0x1C bytes below esp
+# on entry, `fb_` is that entry value. Outgoing arguments, return addresses and everything the function does
+# not read back stay in guest memory. See docs/STACK_SLOTS.md for what is proven and what is assumed.
+SLOTS = os.environ.get("LIFT_SLOTS") == "1"
+stackslots.decode_block = decode_block
+stackslots.jump_tables = jump_tables
+stackslots.iat = iat
+stackslots.is_setjmp = lambda t: import_via(t).endswith("!_setjmp3")
+
+
 # Guest functions implemented on the host instead (runtime defines f_X).
 HOST_OVERRIDES_BATMAN = {
     "exe": {0x51E280,   # IsXInputDevice via WMI -> runtime/input.c
@@ -263,7 +277,13 @@ HOST_OVERRIDES = {"marvel": HOST_OVERRIDES_MARVEL, "skyrim": HOST_OVERRIDES_SKYR
 
 
 class Lifter:
-    def __init__(self, fstart, blocks, all_funcs):
+    def __init__(self, fstart, blocks, all_funcs, frames=None, ext=None):
+        self.frames, self.ext = frames or {}, ext or {}
+        self.fr = None      # this function's frame analysis, while its slots are being promoted
+        self.rec = None     # first pass: the record of stack accesses that classify() works from
+        self.prom = {}      # frame offset of each promoted byte -> (cell offset, cell size, C name)
+        self.cur_block = None
+        self._simple = 0
         self.frame = False
         self.f = fstart
         self.blocks = blocks  # list of (start, end)
@@ -301,8 +321,92 @@ class Lifter:
             return "%s = (%s & 0xFFFF00FFu) | ((uint32_t)(uint8_t)(%s) << 8);" % (g, g, e)
         raise Unsupported("reg " + r)
 
+    # ---------------- stack slots ----------------
+    def slot(self, i, op):
+        """Offset of stack operand `op` from the entry esp, or None when it is not a plain stack operand."""
+        if self.fr is None:
+            return None
+        m = op.mem
+        if m.index or not m.base or (m.segment and i.reg_name(m.segment) not in ("ss", "ds", "es", "cs")):
+            return None
+        st = self.fr.at.get(i.address)
+        if st is None:
+            return None
+        b = i.reg_name(m.base)
+        if b == "esp" and st[0] is not None:
+            return st[0] + stackslots.s32(m.disp) + (4 if i.mnemonic == "pop" else 0)
+        if b == "ebp" and st[1] is not None:
+            return st[1] + stackslots.s32(m.disp)
+        return None
+
+    def note(self, i, off, size, kind, reg=None):
+        if self.rec is not None:
+            self.rec.append((self.cur_block, i.address, off, size, kind, reg))
+
+    def cell(self, off, size):
+        c = self.prom.get(off)
+        return c if c and off + size <= c[0] + c[1] else None
+
+    def slot_rd(self, c, off, size, a):
+        """Read `size` bytes at frame offset `off` of promoted cell `c`; `a` is the guest address (for checks)."""
+        lo, n, name = c
+        k = off - lo
+        whole = "SL_R(%d, %s, %d, %s)" % (n * 8, name, lo, a if not k else "%s - %d" % (a, k))
+        return whole if size == n else "((%s)(%s >> %d))" % (UT[size], whole, 8 * k)
+
+    def slot_wr(self, c, off, size, a, e):
+        lo, n, name = c
+        k = off - lo
+        a = a if not k else "%s - %d" % (a, k)
+        if size != n:
+            e = "(%s & ~0x%Xu) | ((uint32_t)(%s)(%s) << %d)" % (name, ((1 << 8 * size) - 1) << 8 * k, UT[size], e, 8 * k)
+        return "SL_W(%d, %s, %d, %s, (%s));" % (n * 8, name, lo, a, e)
+
+    def stk_wr(self, i, rel, e, kind, reg=None):
+        """The store of a push (esp already moved): to the cell's local if it is promoted."""
+        st = self.fr.at.get(i.address) if self.fr is not None else None
+        if st is None or st[0] is None:
+            return "M32(esp) = %s;" % e
+        self.note(i, st[0] + rel, 4, kind, reg)
+        c = self.cell(st[0] + rel, 4)
+        return self.slot_wr(c, st[0] + rel, 4, "esp", e) if c else "M32(esp) = %s;" % e
+
+    def stk_rd(self, i, off, reg):
+        """The load of a pop or leave from frame offset `off` (esp points at it)."""
+        if self.fr is None or off is None:
+            return "M32(esp)"
+        self.note(i, off, 4, "pop", reg)
+        c = self.cell(off, 4)
+        return self.slot_rd(c, off, 4, "esp") if c else "M32(esp)"
+
+    def stk_other(self, i, rel, size):
+        st = self.fr.at.get(i.address) if self.fr is not None else None
+        if st is not None and st[0] is not None:
+            self.note(i, st[0] + rel, size, "x")
+
+    def note_call(self, i, target=None):
+        st = self.fr.at.get(i.address) if self.fr is not None else None
+        if st is not None and st[0] is not None:
+            self.note(i, st[0] - 4, 4, "ret")
+            self.note(i, st[0], 0, "call", target)
+
+    def call_guard(self, i):
+        """After a call: esp and the frame pointer are where the analysis put them, unless that is proven."""
+        if not self.prom:
+            return []
+        _, after, unproven, fp = self.fr.calls[i.address]
+        # after is None: what the callee pops is not known, and the function only goes on through ebp
+        # (leave, or mov esp, ebp) before touching its stack again; ebp is then what has to be right
+        conds = (["esp == (uint32_t)(fb_ + %d)" % after] if unproven and after is not None else []) + \
+                (["ebp == (uint32_t)(fb_ + %d)" % fp] if fp is not None else [])
+        return ["SL_GUARD(%s, 0x%Xu);" % (" && ".join(conds), i.address)] if conds else []
+
     def addr(self, i, op):
         m = op.mem
+        if self.fr is not None and not self._simple and i.mnemonic != "lea":
+            off = self.slot(i, op)      # reached some other way than get/set: this stays in guest memory
+            if off is not None:
+                self.note(i, off, op.size if 0 < op.size <= 16 else 16, "x")
         parts = []
         for r in (m.base, m.index):
             if r and i.reg_name(r) in ("bx", "si", "di", "bp"):
@@ -334,6 +438,14 @@ class Lifter:
         if op.type == x86.X86_OP_MEM:
             if getattr(self, "_lk", False):
                 return "old_"
+            off = self.slot(i, op) if size in (1, 2, 4) else None
+            if off is not None:
+                self.note(i, off, size, "r")
+                c = self.cell(off, size)
+                self._simple += 1
+                a = self.addr(i, op)
+                self._simple -= 1
+                return self.slot_rd(c, off, size, a) if c else self.mem(size, a)
             if TSO and size in (1, 2, 4) and not stack_op(i, op, self.frame):
                 return "TL%d(%s)" % (size * 8, self.addr(i, op))
             return self.mem(size, self.addr(i, op))
@@ -345,6 +457,16 @@ class Lifter:
         if op.type == x86.X86_OP_MEM:
             if getattr(self, "_lk", False):
                 return "new_ = (%s)(%s);" % (UT[op.size], e)
+            off = self.slot(i, op) if op.size in (1, 2, 4) else None
+            if off is not None:
+                self.note(i, off, op.size, "w")
+                c = self.cell(off, op.size)
+                self._simple += 1
+                a = self.addr(i, op)
+                self._simple -= 1
+                if c:
+                    return self.slot_wr(c, off, op.size, a, e)
+                return "%s = (%s)(%s);" % (self.mem(op.size, a), UT[op.size], e)
             if TSO and op.size in (1, 2, 4) and not stack_op(i, op, self.frame):
                 return "TS%d(%s, (%s)(%s));" % (op.size * 8, self.addr(i, op), UT[op.size], e)
             return "%s = (%s)(%s);" % (self.mem(op.size, self.addr(i, op)), UT[op.size], e)
@@ -454,18 +576,24 @@ class Lifter:
         elif mn == "push":
             v = self.get(i, ops[0], 4 if ops[0].type == x86.X86_OP_IMM else ops[0].size)
             if ops[0].type == x86.X86_OP_REG and i.reg_name(ops[0].reg) in ("cs", "ds", "es", "fs", "gs", "ss"):
+                self.stk_other(i, -4, 4)
                 e("esp -= 4; M16(esp) = %s;" % v)  # a segment push moves esp by 4
             elif ops[0].size == 2 and ops[0].type != x86.X86_OP_IMM:
+                self.stk_other(i, -2, 2)
                 e("{ uint16_t v_ = %s; esp -= 2; M16(esp) = v_; }" % v)
             else:
                 if ops[0].type == x86.X86_OP_IMM:
                     v = "0x%Xu" % (ops[0].imm & 0xFFFFFFFF)
-                e("{ uint32_t v_ = %s; esp -= 4; M32(esp) = v_; }" % v)
+                reg = i.reg_name(ops[0].reg) if ops[0].type == x86.X86_OP_REG else None
+                e("{ uint32_t v_ = %s; esp -= 4; %s }" % (v, self.stk_wr(i, -4, "v_", "push", reg)))
         elif mn == "pop":
             if ops[0].type == x86.X86_OP_REG and i.reg_name(ops[0].reg) == "esp":
                 e("esp = M32(esp);")
             else:
-                e("{ uint32_t v_ = M32(esp); esp += 4; %s }" % self.set(i, ops[0], "v_"))
+                st = self.fr.at.get(i.address) if self.fr is not None else None
+                reg = i.reg_name(ops[0].reg) if ops[0].type == x86.X86_OP_REG else None
+                e("{ uint32_t v_ = %s; esp += 4; %s }" % (self.stk_rd(i, st[0] if st else None, reg),
+                                                         self.set(i, ops[0], "v_")))
         elif mn in ("add", "sub", "adc", "sbb", "cmp"):
             n = BITS[ops[0].size]
             fn = {"cmp": "sub"}.get(mn, mn)
@@ -630,7 +758,8 @@ class Lifter:
         elif mn == "xlatb":
             e(self.reg_set("al", "M8(ebx + (uint8_t)eax)"))
         elif mn == "leave":
-            e("esp = ebp; ebp = M32(esp); esp += 4;")
+            st = self.fr.at.get(i.address) if self.fr is not None else None
+            e("esp = ebp; ebp = %s; esp += 4;" % self.stk_rd(i, st[1] if st else None, "ebp"))
         elif mn == "clc":
             e("f.cf = 0;")
         elif mn == "stc":
@@ -1225,6 +1354,19 @@ class Lifter:
 
     # ---------------- function ----------------
     def emit(self):
+        fr = self.frames.get(self.f)
+        if fr is not None and fr.ok:
+            # Translate once to learn how each stack byte is used, choose the cells, translate again.
+            self.fr, self.rec = fr, []
+            self._emit()
+            self.prom = stackslots.classify(fr, self.rec, self.ext, self.f)
+            self.rec = None
+            if not self.prom:
+                self.fr = None
+            self.out, self.calls, self.need_dispatch = [], set(), False
+        return self._emit()
+
+    def _emit(self):
         o = self.out
         # A function replaced by host code keeps its guest body as f_X_guest.
         o.append("void f_%X%s(CPU *c) {" % (self.f, "_guest" if self.f in HOST_OVERRIDES.get(MOD, ()) else ""))
@@ -1240,6 +1382,7 @@ class Lifter:
         self.frame = frame
         xc = X87Cache() if X87CACHE else None
         for bi, (a, b) in enumerate(order):
+            self.cur_block = a
             o.append("L_%X:" % a)
             insns = decode_block(a, b)
             if not insns or insns[-1].address + insns[-1].size != b:
@@ -1292,6 +1435,9 @@ class Lifter:
             o[:] = [l.replace(SPILL, "SPILLF();").replace(RELOAD, "RELOADF();")
                      .replace(SPILL_RT, "SPILLF_RT();").replace(RELOAD_RT, "RELOADF_RT();") for l in o]
             o.insert(5, X87_LOCALS)
+        if self.prom:
+            o.insert(5, "    const uint32_t fb_ = esp; (void)fb_; " + " ".join(
+                "SL_INIT(%d, %s, %d);" % (n * 8, name, lo) for lo, n, name in sorted(set(self.prom.values()))))
         if self.f in HOST_OVERRIDES.get(MOD, ()):
             # the table's entry for a host replacement: callable like a lifted function
             o.append("")
@@ -1314,15 +1460,18 @@ class Lifter:
                 return ["{ esp -= 4; M32(esp) = 0x%Xu; %s if (setjmp(*rt_setjmp_slot(c, M32(esp + 4)))) { %s } "
                         "else { rt_setjmp3(c); %s } }" % (nxt, SPILL_RT, RELOAD_RT, RELOAD_RT)]
             if direct:
-                return [self.call_direct(op.imm & 0xFFFFFFFF, nxt)]
+                t = op.imm & 0xFFFFFFFF
+                self.note_call(i, t if t in self.all_funcs and t not in HOST_OVERRIDES.get(MOD, ()) else None)
+                return [self.call_direct(t, nxt)] + self.call_guard(i)
             t = self.get(i, op, 4)
+            self.note_call(i)
             # per-site cache of the last target's table entry (entries are
             # immutable, so one pointer is a consistent (addr, fn) pair)
             return ["{ uint32_t t_ = %s; esp -= 4; M32(esp) = 0x%Xu; %s { static const FnEntry *ic_; "
                     "const FnEntry *e_ = __atomic_load_n(&ic_, __ATOMIC_RELAXED); "
                     "if (!(e_ && e_->addr == t_)) e_ = rt_ic_lookup(t_, &ic_); "
                     "if (e_) { e_->fn(c); %s } else { %s rt_call(c, t_); %s } } }" % (
-                t, nxt, SPILL, RELOAD, SPILL_RT, RELOAD_RT)]
+                t, nxt, SPILL, RELOAD, SPILL_RT, RELOAD_RT)] + self.call_guard(i)
         if x86.X86_GRP_RET in i.groups:
             n = op.imm if op else 0
             return ["esp += %d; %s return;" % (4 + n, SPILL)]
@@ -1361,14 +1510,21 @@ def main():
     good = {}
     failed = {}
     all_funcs = set(funcs)
+    irs, frames, slot_stats = {}, {}, {}
     for rnd in range(3):
         good.clear()
+        ext = {}
+        if SLOTS:
+            # heights depend on which callees are lifted functions, so this is redone when that set shrinks
+            frames, ext = stackslots.analyze_all({fa: b for fa, b in funcs.items() if fa not in failed},
+                                                 all_funcs, HOST_OVERRIDES.get(MOD, ()), irs)
         for fa, blocks in sorted(funcs.items()):
             if fa in failed:
                 continue
             try:
-                L = Lifter(fa, blocks, all_funcs)
+                L = Lifter(fa, blocks, all_funcs, frames, ext)
                 good[fa] = (L.emit(), L.calls)
+                slot_stats[fa] = frames[fa].stats if L.prom else None
             except Unsupported as ex:
                 failed[fa] = str(ex)
         new_all = set(good)
@@ -1380,6 +1536,25 @@ def main():
         k = v.split()[0] + " " + v.split()[1] if len(v.split()) > 1 else v
         reasons[k] = reasons.get(k, 0) + 1
     print("lifted", len(good), "rejected", len(failed))
+    if SLOTS:
+        why, kept = {}, {}
+        done = [fa for fa in good if slot_stats.get(fa)]
+        for fa in good:
+            if not slot_stats.get(fa):
+                k = frames[fa].why or "no slot qualifies"
+                why[k] = why.get(k, 0) + 1
+        for fa in done:
+            for k, n in slot_stats[fa]["kept"].items():
+                kept[k] = kept.get(k, 0) + n
+        summary = {"functions": len(good), "promoted_functions": len(done),
+                   "cells": sum(slot_stats[fa]["cells"] for fa in done),
+                   "accesses_promoted": sum(slot_stats[fa]["accesses"] for fa in done),
+                   "accesses_kept_in_promoted_functions": kept, "functions_not_promoted": why}
+        print("stack slots:", json.dumps(summary))
+        json.dump(dict(summary, per_function={hex(fa): slot_stats[fa] for fa in done},
+                       not_promoted={hex(fa): frames[fa].why or "no slot qualifies" for fa in good
+                                     if not slot_stats.get(fa)}),
+                  open(os.path.join(OUT, "%s_slots.json" % MOD), "w"), indent=0)
     print(sorted(reasons.items(), key=lambda x: -x[1])[:30])
 
     names = sorted(good)
