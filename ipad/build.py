@@ -289,7 +289,9 @@ def engine(args):
          *(["--archive", args.moltenvk_archive] if args.moltenvk_archive else [])], f"moltenvk-{sdk}")
     run(["cmake", "-S", IPAD, "-B", BUILD, "-G", "Ninja", f"-DCMAKE_TOOLCHAIN_FILE={target['toolchain']}",
          "-DCMAKE_BUILD_TYPE=Release", f"-DSKYRIM_PYTHON={sys.executable}", f"-DSKYRIM_GEN_DIR={gen}",
-         f"-DSKYRIM_GAME_DIR={game}"], "engine-configure")
+         f"-DSKYRIM_GAME_DIR={game}",
+         # SKYRIM_PINNED_REGS=1 builds the lifted code with pinned guest registers (docs/perf/LOG.md).
+         f"-DLB_PINNED_REGS={'ON' if environ('SKYRIM_PINNED_REGS') == '1' else 'OFF'}"], "engine-configure")
     commands = json.loads((BUILD / "compile_commands.json").read_text())
     sources = {Path(c["file"]).resolve() for c in commands}
     sources = {p for p in sources if not p.is_relative_to(gen)}
