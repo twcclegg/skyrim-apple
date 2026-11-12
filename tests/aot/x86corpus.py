@@ -46,6 +46,13 @@ def sh(argv, **kw):
     return subprocess.run([str(a) for a in argv], capture_output=True, text=True, **kw)
 
 
+# The generated code is built for the machine this runs on: arm64 on a Mac (as the game is), the native
+# architecture elsewhere. Pinned registers exist on arm64 only, so other hosts skip that run.
+HOST_ARCH = ["-arch", "arm64"] if sys.platform == "darwin" else []
+HOST_LIBS = [] if sys.platform == "darwin" else ["-lm", "-lpthread"]
+HAVE_PINNED = sys.platform == "darwin" or os.uname().machine in ("aarch64", "arm64")
+
+
 class LinkError(Exception):
     pass
 
@@ -218,6 +225,7 @@ HARNESS = r'''
 #include "rt.h"
 #include "rt_table.h"
 #include <stdarg.h>
+#include <stdlib.h>
 #include <sys/mman.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -232,17 +240,21 @@ static uint32_t fnv(const uint8_t *p, uint32_t n) { uint32_t h = 2166136261u; fo
 int main(int argc, char **argv) {
     MEM = mmap(NULL, 1ull << 32, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
     FILE *f = fopen(argv[1], "rb"); static uint8_t img[IMG_SIZE]; if (fread(img, 1, IMG_SIZE, f) != IMG_SIZE) return 2; fclose(f);
+    /* X86CORPUS_REPS=n calls each program n times per input without resetting its data in between: a load
+     * for timing the builds against each other (the printed values then differ from the reference's). */
+    int reps = getenv("X86CORPUS_REPS") ? atoi(getenv("X86CORPUS_REPS")) : 1;
     for (unsigned p = 0; p < NPROG; p++) {
         fflush(stdout);
         pid_t pid = fork();
         if (pid == 0) {
-            alarm(20);
+            alarm(reps > 1 ? 600 : 20);
             for (unsigned i = 0; i < NINPUT; i++) {
                 memcpy(MEM + IMG_BASE, img, IMG_SIZE);
                 memset(MEM + 0x80000, 0, 0x101000);
                 CPU c = {0}; c.r[4] = 0x180000; c.fs_base = 0x25000; c.fpu_cw = 0x37F; c.mxcsr = 0x1F80;
                 uint32_t args[2] = {inputs[i][0], inputs[i][1]};
-                uint32_t r = rt_invoke(&c, progs[p].entry, 2, args);
+                uint32_t r = 0;
+                for (int k = 0; k < reps; k++) { c.r[4] = 0x180000; r = rt_invoke(&c, progs[p].entry, 2, args); }
                 printf("P %u %08x %08x\n", p, r, fnv(MEM + progs[p].data_lo, progs[p].data_hi - progs[p].data_lo));
             }
             fflush(stdout); _exit(0);
@@ -255,30 +267,27 @@ int main(int argc, char **argv) {
 '''
 
 
-def run_lifted(work, text, data, data_rva, infos, cc):
-    """Returns ({index: results or error string} for plain, same for pinned, error or None)."""
-    pe, fmap, gen = work / "prog.exe", work / "functions.json", work / "generated"
-    gen.mkdir(exist_ok=True)
+# name: (lifter environment, extra compiler flags, arm64 only). "slots" is the lifter's stack-slot promotion
+# (LIFT_SLOTS=1); "slots-check" builds the same code with LB_SLOT_CHECK, where every promoted slot is mirrored
+# in guest memory under a key and compared on each read, so a slot that something else reads or writes shows.
+MODES = {
+    "plain": ({"LIFT_SLOTS": "0"}, [], False),
+    "pinned": ({"LIFT_SLOTS": "0"}, ["-DLB_PINNED"] + PINNED, True),
+    "slots": ({"LIFT_SLOTS": "1"}, [], False),
+    "slots-check": ({"LIFT_SLOTS": "1"}, ["-DLB_SLOT_CHECK"], False),
+    "slots-pinned": ({"LIFT_SLOTS": "1"}, ["-DLB_PINNED"] + PINNED, True),
+}
+
+
+def run_lifted(work, text, data, data_rva, infos, cc, modes):
+    """Returns ({mode: {index: results or error string}}, error or None)."""
+    pe, fmap = work / "prog.exe", work / "functions.json"
     write_pe(pe, text, data, data_rva, infos[0]["entry"])
     env = dict(os.environ, LIFT_GAME="skyrim", LIFT_FILES="2", LIFT_TSO="1")
     p = sh([sys.executable, ROOT / "tools/discover.py", pe, fmap], env=env, cwd=ROOT)
     if p.returncode:
-        return None, None, "discovery failed: " + (p.stderr.strip().split("\n") or ["?"])[-1][:200]
+        return None, "discovery failed: " + (p.stderr.strip().split("\n") or ["?"])[-1][:200]
     found = {int(a, 16) for a in json.loads(fmap.read_text())["functions"]}
-    p = sh([sys.executable, ROOT / "tools/lift.py", pe, fmap, gen, "fixture"], env=env, cwd=ROOT)
-    if p.returncode:
-        return None, None, "lifter failed: " + (p.stderr.strip().split("\n") or ["?"])[-1][:200]
-    rejected = json.loads((gen / "fixture_rejected.json").read_text())
-    rej_addrs = [int(a, 16) if isinstance(a, str) else a for a in (rejected if isinstance(rejected, list) else rejected.keys())]
-    unlifted = {}
-    for k, info in enumerate(infos):
-        lo, hi = info["text_abs"]
-        bad = [a for a in rej_addrs if lo <= a < hi]
-        if bad:
-            why = rejected.get(hex(bad[0]), rejected.get("%x" % bad[0], "")) if isinstance(rejected, dict) else ""
-            unlifted[k] = "lifter rejected a function at %08x %s" % (bad[0], str(why)[:120])
-        elif info["entry"] not in found:
-            unlifted[k] = "discovery did not find test_main"
     img = bytes(TEXT_RVA) + text + data
     (work / "image.bin").write_bytes(img)
     (work / "layout.h").write_text(
@@ -287,22 +296,43 @@ def run_lifted(work, text, data, data_rva, infos, cc):
         + "".join("  {0x%Xu, 0x%Xu, 0x%Xu},\n" % (i["entry"], *i["data_abs"]) for i in infos) + "};\n"
         + "static const uint32_t inputs[][2] = {" + ", ".join("{0x%Xu, 0x%Xu}" % ab for ab in INPUTS) + "};\n")
     (work / "harness.c").write_text(HARNESS)
-    common = ["-arch", "arm64", "-std=gnu11", "-O2", "-fno-strict-aliasing", "-fwrapv", "-fsigned-char", "-w",
-              "-DGAME_SKYRIM", "-I", ROOT / "runtime", "-I", gen, "-I", work]
-    results = []
-    for mode in ("plain", "pinned"):
+    lifted, results = {}, {}
+    for mode in modes:
+        lift_env, flags, _ = MODES[mode]
+        key = "-".join("%s%s" % kv for kv in sorted(lift_env.items()))
+        gen = work / ("generated-" + key)
+        if key not in lifted:
+            gen.mkdir(exist_ok=True)
+            p = sh([sys.executable, ROOT / "tools/lift.py", pe, fmap, gen, "fixture"], env=dict(env, **lift_env), cwd=ROOT)
+            if p.returncode:
+                return None, "lifter failed (%s): %s" % (mode, (p.stderr.strip().split("\n") or ["?"])[-1][:200])
+            rejected = json.loads((gen / "fixture_rejected.json").read_text())
+            rej_addrs = [int(a, 16) for a in rejected]
+            unlifted = {}
+            for k, info in enumerate(infos):
+                lo, hi = info["text_abs"]
+                bad = [a for a in rej_addrs if lo <= a < hi]
+                if bad:
+                    unlifted[k] = "lifter rejected a function at %08x %s" % (bad[0], str(rejected.get(hex(bad[0]), ""))[:120])
+                elif info["entry"] not in found:
+                    unlifted[k] = "discovery did not find test_main"
+            lifted[key] = unlifted
+        unlifted = lifted[key]
+        common = HOST_ARCH + ["-std=gnu11", "-O2", "-fno-strict-aliasing", "-fwrapv", "-fsigned-char", "-w",
+                              "-DGAME_SKYRIM", "-I", ROOT / "runtime", "-I", gen, "-I", work]
         exe = work / ("run-" + mode)
         objs = []
         for src in sorted(gen.glob("*.c")):
             obj = work / (src.stem + "-" + mode + ".o")
-            p = sh(cc + common + (["-DLB_PINNED"] + PINNED if mode == "pinned" else []) + ["-c", src, "-o", obj])
+            p = sh(cc + common + flags + ["-c", src, "-o", obj])
             if p.returncode:
-                return None, None, "generated code does not compile (%s): %s" % (mode, p.stderr.strip().split("\n")[0][:200])
+                return None, "generated code does not compile (%s): %s" % (mode, p.stderr.strip().split("\n")[0][:200])
             objs.append(obj)
-        p = sh(cc + common + (["-DLB_PINNED"] if mode == "pinned" else []) +
-               [work / "harness.c", ROOT / "runtime/dispatch.c", ROOT / "runtime/fpu.c", ROOT / "runtime/setjmp.c"] + objs + ["-o", exe])
+        p = sh(cc + common + [f for f in flags if f.startswith("-D")] +
+               [work / "harness.c", ROOT / "runtime/dispatch.c", ROOT / "runtime/fpu.c", ROOT / "runtime/setjmp.c"] + objs
+               + HOST_LIBS + ["-o", exe])
         if p.returncode:
-            return None, None, "link failed (%s): %s" % (mode, p.stderr.strip().split("\n")[0][:200])
+            return None, "link failed (%s): %s" % (mode, p.stderr.strip().split("\n")[0][:200])
         p = sh([exe, work / "image.bin"], timeout=600)
         got = {k: [] for k in range(len(infos))}
         for line in p.stdout.splitlines():
@@ -313,8 +343,8 @@ def run_lifted(work, text, data, data_rva, infos, cc):
                 got[int(w[1])] = "run failed with status %s" % w[2]
         for k, why in unlifted.items():
             got[k] = why
-        results.append(got)
-    return results[0], results[1], None
+        results[mode] = got
+    return results, None
 
 
 NATIVE_MAIN = r'''
@@ -361,9 +391,18 @@ def main():
     ap.add_argument("--work")
     ap.add_argument("--json")
     ap.add_argument("--levels", default="O0,O1,O2,Os")
+    ap.add_argument("--modes", default=",".join(m for m, v in MODES.items() if HAVE_PINNED or not v[2]),
+                    help="which lifted builds to run and compare: " + ", ".join(MODES))
+    ap.add_argument("--native-cc", help="compiler for the sanitiser build of each program (default: --cc)")
+    ap.add_argument("--x86-cc", help="compiler for the 32-bit x86 programs (default: --cc); gcc works too")
+    ap.add_argument("--x86-flags", default="", help="extra flags for the x86 build, e.g. -mrtd or -fno-omit-frame-pointer")
     ap.add_argument("paths", nargs="+")
     a = ap.parse_args()
     cc = a.cc.split()
+    modes = a.modes.split(",")
+    x86_cc = a.x86_cc.split() if a.x86_cc else cc
+    # gcc takes -m32 where clang takes a target triple; everything else in X86_FLAGS is common to both
+    x86_flags = (["-m32"] + X86_FLAGS[1:] if "gcc" in x86_cc[0] else X86_FLAGS) + a.x86_flags.split()
     files = []
     for p in a.paths:
         files += sorted(Path(p).rglob("*.c")) if Path(p).is_dir() else [Path(p)]
@@ -378,7 +417,7 @@ def main():
             status[f] = [s, why]
     native = {}
     for f in files:
-        native[f], err = native_check(cc, f, top)
+        native[f], err = native_check(a.native_cc.split() if a.native_cc else cc, f, top)
         if err:
             mark(f, "REJECT", err)
     for level in a.levels.split(","):
@@ -389,7 +428,7 @@ def main():
             if status[f][0] == "REJECT":
                 continue
             obj = work / ("p%04d.o" % n)
-            p = sh(cc + X86_FLAGS + ["-" + level, "-c", f, "-o", obj])
+            p = sh(x86_cc + x86_flags + ["-" + level, "-c", f, "-o", obj])
             if p.returncode:
                 mark(f, "REJECT", "x86 build -%s: %s" % (level, (p.stderr.strip().split("\n") or ["?"])[0][:200]))
                 continue
@@ -404,7 +443,7 @@ def main():
             continue
         text, data, infos, data_rva = link(objs)
         ref = run_reference(text, data, data_rva, infos)
-        plain, pinned, err = run_lifted(work, text, data, data_rva, infos, cc)
+        runs, err = run_lifted(work, text, data, data_rva, infos, cc, modes)
         for k, f in enumerate(live):
             if isinstance(ref[k], str):
                 mark(f, "REJECT", "-%s reference: %s" % (level, ref[k]))
@@ -416,7 +455,7 @@ def main():
             if err:
                 mark(f, "UNLIFTED", "-%s: %s" % (level, err))
                 continue
-            for mode, got in (("plain", plain[k]), ("pinned", pinned[k])):
+            for mode, got in ((m, runs[m][k]) for m in modes):
                 if isinstance(got, str):
                     mark(f, "UNLIFTED" if "lifter" in got or "discovery" in got else "MISMATCH", "-%s %s: %s" % (level, mode, got))
                 elif got != ref[k]:

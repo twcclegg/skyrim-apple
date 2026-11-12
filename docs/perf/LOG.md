@@ -510,3 +510,22 @@ but the ranges overlap and both builds drift by 2 ms between runs, so read it as
 Boss fight and Riverwood are within noise. All ten pinned runs ran to their exit frame, the first full-length
 runs of this build. Not tested: the headset, long play sessions, saves made under one build and loaded under
 the other, and pinned together with PGO.
+
+## 2026-11-12 — stack slots as C locals (`LIFT_SLOTS=1`), first version, corpus only
+
+- **Hypothesis:** 70% of guest memory accesses are stack accesses (entry above), and every one is a load or
+  store through `MEM` that no later guest store lets the compiler forward or drop. In functions whose stack
+  address never leaves them, the slots they read back can be C locals.
+- **Change:** `tools/stackslots.py` (stack heights, escapes, cells), `LIFT_SLOTS=1` in `tools/lift.py`,
+  `SL_*` macros in `runtime/lift_prelude.h`. Off by default; with it off the lifter's output is byte for byte
+  what it was. Design, proofs and assumptions: `docs/STACK_SLOTS.md`.
+- **Correctness (x86 corpus, x86-64 Linux host):** 300 generated programs × 4 levels plus the hand-written
+  `tests/aot/x86stack/` set, clang and gcc, push-args, `-mrtd` and frame-pointer variants: all agree with
+  the emulator in the plain, promoted and checking builds. Removing a safety rule makes programs fail
+  (table in the doc). **Pinned builds not run** (arm64 only).
+- **Effect on the corpus:** −5% arm64 instructions, −10% loads, −9% stores (static, `-O2`); −10% run time
+  of the lifted code on the x86-64 host. Not measured on the game or on Apple hardware.
+- **Next:** run the lifter over the game with `LIFT_SLOTS=1` and read `exe_slots.json` (how many functions
+  qualify, and why the rest don't); boot the `-DLB_SLOT_CHECK` build and play through the Whiterun and
+  boss-fight scenarios; then A/B the normal build. The two biggest reasons a function might not qualify in
+  MSVC code are listed in the doc with what would recover them.
