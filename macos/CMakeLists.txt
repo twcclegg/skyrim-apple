@@ -107,6 +107,16 @@ add_executable(audio_device_recovery tests/audio_device_recovery.c tests/fixture
 target_link_libraries(audio_device_recovery PRIVATE skyrim_runtime)
 add_test(NAME audio_device_recovery COMMAND audio_device_recovery)
 set_tests_properties(audio_device_recovery PROPERTIES TIMEOUT 30 ENVIRONMENT "SDL_AUDIODRIVER=dummy")
+# XAudio2 output layout: stereo by default, 5.1 with LB_AUDIO_CHANNELS=6.
+add_executable(audio_surround tests/audio_surround.c tests/fixture_modules.c
+  $<TARGET_OBJECTS:skyrim_entry>)
+target_link_libraries(audio_surround PRIVATE skyrim_runtime)
+add_test(NAME audio_layout_stereo COMMAND audio_surround stereo)
+set_tests_properties(audio_layout_stereo PROPERTIES TIMEOUT 30
+  ENVIRONMENT "SDL_AUDIODRIVER=dummy;LB_AUDIO_METER=1")
+add_test(NAME audio_layout_surround COMMAND audio_surround surround)
+set_tests_properties(audio_layout_surround PROPERTIES TIMEOUT 30
+  ENVIRONMENT "SDL_AUDIODRIVER=dummy;LB_AUDIO_METER=1;LB_AUDIO_CHANNELS=6")
 if(SKYRIM_FFMPEG_AUDIO)
   add_executable(audio_voice_probe audio/voice_probe.c tests/fixture_modules.c
     $<TARGET_OBJECTS:skyrim_entry>)

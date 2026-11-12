@@ -7,6 +7,7 @@
  * translator, JIT or executable guest memory is involved. */
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
+#import <AVFAudio/AVFAudio.h>
 #include <CommonCrypto/CommonDigest.h>
 #include <SDL2/SDL.h>
 #include <os/proc.h>
@@ -32,6 +33,42 @@ void platform_native_request_quit(void);
 }
 
 static std::atomic<int> g_state{0};  /* 0 idle, 1 running */
+
+#if TARGET_OS_VISION
+/* LB_AUDIO_CHANNELS=6 (runtime/xaudio2.c) makes SDL open a 5.1 audio queue (L R C LFE Ls Rs). Tell the
+ * audio session that the app plays multichannel content and how the system should spatialise it, before
+ * SDL opens the device. LB_AUDIO_SPATIAL: "head" (default; the bed stays put in the room as the head
+ * turns), "fixed" (follows the head) or "bypass" (no spatialisation). LB_AUDIO_STAGE: "small", "medium",
+ * "large" (default) or "auto". SDL sets the session category later, when it opens the device. */
+static void prepareSurroundSession(void) {
+    const char *channels = getenv("LB_AUDIO_CHANNELS");
+    if (!channels || strcmp(channels, "6")) return;
+    const char *mode = getenv("LB_AUDIO_SPATIAL"), *stage = getenv("LB_AUDIO_STAGE");
+    AVAudioSessionSpatialExperience experience = AVAudioSessionSpatialExperienceHeadTracked;
+    if (mode && !strcmp(mode, "fixed")) experience = AVAudioSessionSpatialExperienceFixed;
+    else if (mode && !strcmp(mode, "bypass")) experience = AVAudioSessionSpatialExperienceBypassed;
+    AVAudioSessionSoundStageSize size = AVAudioSessionSoundStageSizeLarge;
+    if (stage && !strcmp(stage, "small")) size = AVAudioSessionSoundStageSizeSmall;
+    else if (stage && !strcmp(stage, "medium")) size = AVAudioSessionSoundStageSizeMedium;
+    else if (stage && !strcmp(stage, "auto")) size = AVAudioSessionSoundStageSizeAutomatic;
+    AVAudioSession *session = AVAudioSession.sharedInstance;
+    NSError *problem = nil;
+    BOOL multichannel = [session setSupportsMultichannelContent:YES error:&problem];
+    if (!multichannel) fprintf(stderr, "native: audio: multichannel content refused: %s\n", problem.localizedDescription.UTF8String);
+    NSDictionary<AVAudioSessionSpatialExperienceOption, id> *options = nil;
+    if (experience == AVAudioSessionSpatialExperienceHeadTracked)
+        options = @{AVAudioSessionSpatialExperienceOptionSoundStageSize: @(size),
+                    AVAudioSessionSpatialExperienceOptionAnchoringStrategy: @(AVAudioSessionAnchoringStrategyAutomatic)};
+    else if (experience == AVAudioSessionSpatialExperienceFixed)
+        options = @{AVAudioSessionSpatialExperienceOptionSoundStageSize: @(size)};
+    problem = nil;
+    BOOL spatial = [session setIntendedSpatialExperience:experience options:options error:&problem];
+    if (!spatial) fprintf(stderr, "native: audio: spatial experience refused: %s\n", problem.localizedDescription.UTF8String);
+    fprintf(stderr, "native: audio: 5.1 session: multichannel %d, spatial experience %ld (set %d), stage %ld; "
+            "output channels %ld, maximum %ld\n", multichannel, (long)experience, spatial, (long)size,
+            (long)session.outputNumberOfChannels, (long)session.maximumOutputNumberOfChannels);
+}
+#endif
 
 static NSString *uniqueItem(NSString *directory, NSString *name) {
     NSArray<NSString *> *items = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:directory error:nil];
@@ -285,6 +322,9 @@ extern "C" int skyrim_native_run(const char *save_root, char *error, size_t erro
         /* SDL applies its idle-timer hint only from its own app delegate, which this app doesn't
          * use: keep the screen awake directly while the game runs. */
         UIApplication.sharedApplication.idleTimerDisabled = YES;
+#if TARGET_OS_VISION
+        prepareSurroundSession();
+#endif
         SDL_SetHint(SDL_HINT_ACCELEROMETER_AS_JOYSTICK, "0");
         SDL_SetHint(SDL_HINT_ORIENTATIONS, "LandscapeLeft LandscapeRight");
         SDL_SetMainReady();
