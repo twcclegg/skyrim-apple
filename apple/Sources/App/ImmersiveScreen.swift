@@ -88,6 +88,9 @@ private struct QuadUniforms {
     /// 0: the screen is a window (depth behind it, scaled). 1: head-tracked view, each pixel at its true distance
     /// (depthScale meters per game meter, up to maxBehind meters) from the eye, which is eyeBack in front.
     var trueDepth: Float
+    /// xyz: this view's eye in the screen's own space. w: per-pixel depth search steps in the fragment shader
+    /// (LB_IMMERSIVE_REFINE); 0 = off.
+    var eyeRefine: SIMD4<Float>
 }
 
 /// Runs on its own thread for as long as the layer lives: presents at the display's rate, showing the newest finished
@@ -99,9 +102,9 @@ final class ImmersiveCompositor: @unchecked Sendable {
     struct Uniforms {
         float4x4 viewProjection; float4x4 model; float2 halfSize; uint decode; uint hasDepth;
         uint2 grid; float eyeBack; float nearUnits; float unitsPerMeter; float depthScale; float maxBehind; float backplate;
-        float tear; float trueDepth;
+        float tear; float trueDepth; float4 eyeRefine;
     };
-    struct Out { float4 position [[position]]; float2 uv; };
+    struct Out { float4 position [[position]]; float2 uv; float3 local; };
     // A grid over the game image. With depth, each vertex moves along the ray from the game's camera (eyeBack in
     // front of the screen's centre, on the viewer's side) through its point on the screen, by how far that pixel is
     // in the game: the screen
@@ -111,27 +114,29 @@ final class ImmersiveCompositor: @unchecked Sendable {
     // everything is behind it, at depthScale meters per game meter, up to maxBehind. A consistent geometry (unlike a
     // relief pushed out of the screen), so the eyes converge where the picture is.
     // The game pixel's view depth in game meters.
-    float behind_screen_raw(float2 uv, constant Uniforms &u, texture2d<float> depth) {
+    float behind_screen_raw(float2 uv, constant Uniforms &u, texture2d<float> depth, bool dilate) {
         constexpr sampler nearest(address::clamp_to_edge, filter::nearest);
-        // The nearest depth around the point (half a grid cell each way), so a thin foreground edge keeps its depth
-        // instead of a vertex landing beside it in the background.
-        float2 cell = 0.5 / float2(u.grid - 1);
         float d = depth.sample(nearest, uv, level(0)).r;
-        d = min(d, depth.sample(nearest, uv + float2(-cell.x, 0), level(0)).r);
-        d = min(d, depth.sample(nearest, uv + float2(cell.x, 0), level(0)).r);
-        d = min(d, depth.sample(nearest, uv + float2(0, -cell.y), level(0)).r);
-        d = min(d, depth.sample(nearest, uv + float2(0, cell.y), level(0)).r);
+        if (dilate) {
+            // The nearest depth around the point (half a grid cell each way), so a thin foreground edge keeps its
+            // depth instead of a vertex landing beside it in the background.
+            float2 cell = 0.5 / float2(u.grid - 1);
+            d = min(d, depth.sample(nearest, uv + float2(-cell.x, 0), level(0)).r);
+            d = min(d, depth.sample(nearest, uv + float2(cell.x, 0), level(0)).r);
+            d = min(d, depth.sample(nearest, uv + float2(0, -cell.y), level(0)).r);
+            d = min(d, depth.sample(nearest, uv + float2(0, cell.y), level(0)).r);
+        }
         // D3D depth with a far plane much farther than the near one: view distance ~ near / (1 - d).
         return (u.nearUnits / max(1.0 - d, 1e-6)) / u.unitsPerMeter;
     }
-    float behind_screen(float2 uv, constant Uniforms &u, texture2d<float> depth) {
-        return min(u.depthScale * behind_screen_raw(uv, u, depth), u.maxBehind);
+    float behind_screen(float2 uv, constant Uniforms &u, texture2d<float> depth, bool dilate) {
+        return min(u.depthScale * behind_screen_raw(uv, u, depth, dilate), u.maxBehind);
     }
     // Distance from the eye of the game pixel at uv. Window mode: the screen distance plus how far behind it.
     // True-depth mode: its view depth in meters, along the ray (view depth z sits at z / cos = |ray| * z / eyeBack).
-    float radial(float2 uv, float toScreen, constant Uniforms &u, texture2d<float> depth) {
-        if (u.trueDepth == 0) return toScreen + behind_screen(uv, u, depth);
-        return toScreen * min(behind_screen_raw(uv, u, depth) * u.depthScale, u.maxBehind) / u.eyeBack;
+    float radial(float2 uv, float toScreen, constant Uniforms &u, texture2d<float> depth, bool dilate) {
+        if (u.trueDepth == 0) return toScreen + behind_screen(uv, u, depth, dilate);
+        return toScreen * min(behind_screen_raw(uv, u, depth, dilate) * u.depthScale, u.maxBehind) / u.eyeBack;
     }
     float3 screen_point(float2 uv, constant Uniforms &u) {
         return float3((uv.x * 2 - 1) * u.halfSize.x, (1 - uv.y * 2) * u.halfSize.y, 0);
@@ -168,26 +173,56 @@ final class ImmersiveCompositor: @unchecked Sendable {
             // times as far as its near one spans an object's edge.
             float2 c0 = float2(cell + corners[first]) * step, c1 = float2(cell + corners[first + 1]) * step,
                    c2 = float2(cell + corners[first + 2]) * step;
-            float r0 = radial(c0, length(screen_point(c0, u) - eye), u, depth);
-            float r1 = radial(c1, length(screen_point(c1, u) - eye), u, depth);
-            float r2 = radial(c2, length(screen_point(c2, u) - eye), u, depth);
+            float r0 = radial(c0, length(screen_point(c0, u) - eye), u, depth, true);
+            float r1 = radial(c1, length(screen_point(c1, u) - eye), u, depth, true);
+            float r2 = radial(c2, length(screen_point(c2, u) - eye), u, depth, true);
             float r = corner == first ? r0 : (corner == first + 1 ? r1 : r2);
             // A triangle spanning a depth edge is laid flat at its farthest corner's distance instead of being
             // stretched across the gap: the gap shows at most one cell of the edge at the background's depth. (A
             // far backplate behind dropped triangles showed whole second copies of near objects - "two heads" -
             // once the head moved away from where the rays start.)
+            // With the per-pixel search (eyeRefine.w) the mesh stays whole instead: a flat triangle leaves a gap
+            // beside the near surface, as wide as the parallax between them, and the search settles each pixel there.
             float rFar = max(r0, max(r1, r2));
-            if (rFar > min(r0, min(r1, r2)) * (1.0 + u.tear)) r = rFar;
+            if (u.eyeRefine.w == 0 && rFar > min(r0, min(r1, r2)) * (1.0 + u.tear)) r = rFar;
             float fade = u.trueDepth != 0 ? 1.0 : edge_fade(uv);
             p = eye + ray * (1.0 + (r - toScreen) * fade / toScreen);
         }
+        out.local = p;
         out.position = u.viewProjection * u.model * float4(p, 1);
         return out;
     }
+    // Distance from the rays' origin of the one game pixel at uv, as the mesh would place it with a vertex there.
+    float pixel_radial(float2 uv, constant Uniforms &u, texture2d<float> depth) {
+        float toScreen = length(screen_point(uv, u) - float3(0, 0, u.eyeBack));
+        float r = radial(uv, toScreen, u, depth, false);
+        return u.trueDepth != 0 ? r : toScreen + (r - toScreen) * edge_fade(uv);
+    }
+    // The per-pixel depth search (LB_IMMERSIVE_REFINE steps). The mesh has a vertex every few game pixels, so on
+    // its own it gives an object's outline, and anything thinner than a cell, the wrong depth. Starting from the
+    // mesh, each step takes the depth of the game pixel the eye's ray is currently thought to show, moves to where
+    // the ray reaches that distance, and looks up which game pixel is there. On a surface this settles at once.
+    float2 refined_uv(Out in, constant Uniforms &u, texture2d<float> depth) {
+        float3 origin = float3(0, 0, u.eyeBack), eye = u.eyeRefine.xyz;
+        float3 a = eye - origin, d = normalize(in.local - eye);
+        float ad = dot(a, d), aa = dot(a, a), rBefore = 0;
+        float2 uv = in.uv, before = uv;
+        for (int i = 0; i < int(u.eyeRefine.w); i++) {
+            before = uv;
+            rBefore = pixel_radial(uv, u, depth);
+            float3 fromOrigin = eye + d * (-ad + sqrt(max(ad * ad - aa + rBefore * rBefore, 0.0))) - origin;
+            float3 on = fromOrigin * (u.eyeBack / max(-fromOrigin.z, 1e-6));
+            uv = saturate(float2((on.x / u.halfSize.x + 1) * 0.5, (1 - on.y / u.halfSize.y) * 0.5));
+        }
+        // A ray that keeps jumping between a near and a far surface sees neither's own pixel: it looks past the
+        // near surface's edge at something the game's camera did not see. Show the far one there.
+        return rBefore > pixel_radial(uv, u, depth) * (1.0 + u.tear) ? before : uv;
+    }
     fragment float4 screen_fragment(Out in [[stage_in]], texture2d<float> image [[texture(0)]],
-                                    constant Uniforms &u [[buffer(0)]]) {
+                                    texture2d<float> depth [[texture(1)]], constant Uniforms &u [[buffer(0)]]) {
         constexpr sampler linear_clamp(address::clamp_to_edge, filter::linear);
-        float3 c = image.sample(linear_clamp, in.uv).rgb;
+        float2 uv = u.eyeRefine.w > 0 && u.hasDepth != 0 ? refined_uv(in, u, depth) : in.uv;
+        float3 c = image.sample(linear_clamp, uv).rgb;
         if (u.decode) c = select(pow((c + 0.055) / 1.055, 2.4), c / 12.92, c <= 0.04045);
         return float4(c, 1);
     }
@@ -311,6 +346,20 @@ final class ImmersiveCompositor: @unchecked Sendable {
 
     /// Meters in the headset per game meter in head-tracking mode (LB_IMMERSIVE_HEAD_SCALE; 1 = true scale).
     private lazy var headDepthScale: Float = getenv("LB_IMMERSIVE_HEAD_SCALE").flatMap { Float(String(cString: $0)) } ?? 1.0
+
+    /// Per-pixel depth search steps (LB_IMMERSIVE_REFINE; 0 = off, 2 is enough) and the eye separation used for
+    /// drawing as a multiple of the wearer's (LB_IMMERSIVE_IPD_SCALE; above 1 gives stronger depth and a smaller
+    /// looking world). Both read when the first game frame is drawn, like the depth settings.
+    private lazy var refineSteps: Float = {
+        let steps = getenv("LB_IMMERSIVE_REFINE").flatMap { Float(String(cString: $0)) } ?? 0
+        log("per-pixel depth search: \(Int(steps)) steps")
+        return max(0, min(steps.rounded(), 8))
+    }()
+    private lazy var eyeSeparationScale: Float = {
+        let scale = getenv("LB_IMMERSIVE_IPD_SCALE").flatMap { Float(String(cString: $0)) } ?? 1
+        log("eye separation x\(scale)")
+        return max(0, min(scale, 4))
+    }()
 
     private func finish() {
         skyrim_sdl_set_window_ghost(0)
@@ -438,6 +487,8 @@ final class ImmersiveCompositor: @unchecked Sendable {
                 if halfSize == nil, lastTracked { screen = nil; model = place(head: head) }
                 lastTracked = halfSize != nil
             }
+            // The point between the eyes, in the device's space: the eye separation is scaled about it.
+            let eyesCentre = drawable.views.reduce(SIMD4<Float>(0, 0, 0, 0)) { $0 + $1.transform.columns.3 } / Float(max(drawable.views.count, 1))
             for (index, view) in drawable.views.enumerated() {
                 let pass = MTLRenderPassDescriptor()
                 pass.colorAttachments[0].texture = drawable.colorTextures[view.textureMap.textureIndex]
@@ -453,7 +504,10 @@ final class ImmersiveCompositor: @unchecked Sendable {
                 guard let encoder = commands.makeRenderCommandEncoder(descriptor: pass) else { continue }
                 encoder.setViewport(view.textureMap.viewport)
                 if let texture, let model, let pipeline, let depth {
-                    let viewMatrix = (head * view.transform).inverse
+                    var eyeFromDevice = view.transform
+                    eyeFromDevice.columns.3 = eyesCentre + (eyeFromDevice.columns.3 - eyesCentre) * eyeSeparationScale
+                    let originFromEye = head * eyeFromDevice
+                    let viewMatrix = originFromEye.inverse
                     let aspect = game.height > 0 ? Float(game.width) / Float(game.height) : 16.0 / 9.0
                     let settings = depthTexture != nil ? readDepthSettings() : (scale: 0, maxBehind: 0, near: 15, units: 70, tear: 0.08, on: false)
                     let useDepth = settings.on && depthTexture != nil
@@ -472,7 +526,8 @@ final class ImmersiveCompositor: @unchecked Sendable {
                                                 eyeBack: eyeBack, nearUnits: settings.near, unitsPerMeter: settings.units,
                                                 depthScale: tracked ? headDepthScale : settings.scale,
                                                 maxBehind: tracked ? 300 : settings.maxBehind, backplate: 0,
-                                                tear: settings.tear, trueDepth: tracked && useDepth ? 1 : 0)
+                                                tear: settings.tear, trueDepth: tracked && useDepth ? 1 : 0,
+                                                eyeRefine: SIMD4(simd_make_float3(model.inverse * originFromEye.columns.3), useDepth ? refineSteps : 0))
                     encoder.setRenderPipelineState(pipeline)
                     encoder.setDepthStencilState(depth)
                     encoder.setCullMode(.none)
@@ -480,6 +535,7 @@ final class ImmersiveCompositor: @unchecked Sendable {
                     encoder.setFragmentBytes(&uniforms, length: MemoryLayout<QuadUniforms>.stride, index: 0)
                     encoder.setFragmentTexture(texture, index: 0)
                     encoder.setVertexTexture(useDepth ? depthTexture : texture, index: 1)
+                    encoder.setFragmentTexture(useDepth ? depthTexture : texture, index: 1)
                     let vertexCount = Int((Self.gridColumns - 1) * (Self.gridRows - 1) * 6)
                     encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: vertexCount)
                 }
