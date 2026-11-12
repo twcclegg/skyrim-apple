@@ -100,6 +100,27 @@ static int g_rate = 48000, g_running, g_thread_started;
 static SDL_AudioDeviceID g_dev;  /* written only by engine_main once it runs */
 static unsigned g_dev_stalls, g_dev_reopens;
 static uint64_t g_passes;
+/* Output layout. 2 (the default) is stereo. LB_AUDIO_CHANNELS=6 reports a 5.1
+ * device to the game (FL FR FC LFE BL BR, mask 0x3F) and carries six channels
+ * from the mastering voice to the output device. Read once, before the game
+ * can ask for the device details. */
+static int g_out_ch = 2;
+static double g_ch_sum2[MAX_CH];   /* per output channel, while metering */
+static uint64_t g_ch_frames;
+/* What the game asks of SetOutputMatrix, for the meter: calls by source and
+ * destination width, and how many 6-wide matrices put anything on the centre,
+ * LFE and back channels. */
+static uint64_t g_mx_calls[MAX_CH + 1][MAX_CH + 1], g_mx_centre, g_mx_lfe, g_mx_back;
+
+static void output_layout_init(void) {
+    static int done;
+    if (done) return;
+    done = 1;
+    const char *e = getenv("LB_AUDIO_CHANNELS");
+    if (!e || !*e || !strcmp(e, "2")) return;
+    if (!strcmp(e, "6")) { g_out_ch = 6; LOG("xaudio2: LB_AUDIO_CHANNELS=6: reporting and mixing 5.1"); }
+    else LOG("xaudio2: LB_AUDIO_CHANNELS=%s is not 2 or 6; staying stereo", e);
+}
 
 /* Output device state for tests (atomic reads; engine_main writes). */
 void xaudio2_output_stats(uint32_t *dev, unsigned *stalls, unsigned *reopens, uint64_t *passes) {
@@ -107,6 +128,15 @@ void xaudio2_output_stats(uint32_t *dev, unsigned *stalls, unsigned *reopens, ui
     if (stalls) *stalls = __atomic_load_n(&g_dev_stalls, __ATOMIC_ACQUIRE);
     if (reopens) *reopens = __atomic_load_n(&g_dev_reopens, __ATOMIC_ACQUIRE);
     if (passes) *passes = __atomic_load_n(&g_passes, __ATOMIC_ACQUIRE);
+}
+
+/* Output channel count, and with LB_AUDIO_METER=1 the sum of squares per
+ * output channel and the frames counted since launch (for tests; read while
+ * the engine is stopped). */
+int xaudio2_output_levels(double *sum2, int max, uint64_t *frames) {
+    for (int i = 0; sum2 && i < max; i++) sum2[i] = i < MAX_CH ? g_ch_sum2[i] : 0;
+    if (frames) *frames = g_ch_frames;
+    return g_out_ch;
 }
 
 static const uint8_t CLSID_XAudio2[16] = {0x85, 0x86, 0x50, 0x5a, 0x54, 0xa2, 0xba, 0x4f, 0x9b, 0x82, 0x9a, 0x24, 0xb0, 0x03, 0x06, 0xaf};
@@ -284,7 +314,7 @@ static void default_matrix(int sc, int dc, float *m) {
     for (int d = 0; d < dc; d++)
         for (int s = 0; s < sc; s++) {
             float g = 0;
-            if (sc == 1) g = 1.0f;
+            if (sc == 1) g = g_out_ch > 2 && dc > 2 ? (d < 2 ? 1.0f : 0.0f) : 1.0f;
             else if (sc == dc) g = s == d ? 1.0f : 0.0f;
             else if (dc == 2) g = s == 0 ? (d == 0) : s == 1 ? (d == 1) : (s == 2 || s == 3) ? 0.707f : (s % 2 == d) ? 0.707f : 0.0f;
             else if (dc == 1) g = 1.0f / (float)sc;
@@ -457,7 +487,25 @@ static void engine_pass(CPU *c, int frames, float *out) {
             if (!v || v->dead || v->kind != V_SUBMIX || v->stage != stage) continue;
             route(v, v->acc, frames);
         }
-    if (g_master && g_master->acc) {
+    if (g_master && g_master->acc && g_out_ch == 6) {
+        /* 5.1 out. A 6-channel master passes straight through; other widths
+         * are placed by speaker: mono and stereo on the front pair, quad on
+         * front and back, and 7.1's side pair folded into the back pair. */
+        Voice *m = g_master;
+        static const signed char k_place[MAX_CH + 1][MAX_CH] = {
+            {0}, {-1}, {0, 1}, {0, 1, 2}, {0, 1, 4, 5}, {0, 1, 2, 4, 5}, {0, 1, 2, 3, 4, 5},
+            {0, 1, 2, 3, 4, 5, 2}, {0, 1, 2, 3, 4, 5, 4, 5}};
+        const signed char *place = k_place[m->in_ch];
+        for (int f = 0; f < frames; f++) {
+            float o[6] = {0};
+            for (int ch = 0; ch < m->in_ch; ch++) {
+                float s = m->acc[f * m->in_ch + ch] * m->volume * m->chvol[ch];
+                if (place[ch] < 0) { o[0] += s; o[1] += s; }
+                else o[place[ch]] += s;
+            }
+            for (int k = 0; k < 6; k++) out[6 * f + k] = o[k] > 1 ? 1 : o[k] < -1 ? -1 : o[k];
+        }
+    } else if (g_master && g_master->acc) {
         Voice *m = g_master;
         for (int f = 0; f < frames; f++) {
             float l = 0, r = 0;
@@ -472,7 +520,7 @@ static void engine_pass(CPU *c, int frames, float *out) {
             out[2 * f] = l > 1 ? 1 : l < -1 ? -1 : l;
             out[2 * f + 1] = r > 1 ? 1 : r < -1 ? -1 : r;
         }
-    } else memset(out, 0, sizeof(float) * 2 * (size_t)frames);
+    } else memset(out, 0, sizeof(float) * (size_t)g_out_ch * (size_t)frames);
     int nev = g_nev;
     static Event ev[MAX_EVENTS];
     memcpy(ev, g_ev, sizeof(Event) * (size_t)nev);
@@ -506,14 +554,16 @@ static uint64_t now_us(void) {
     return (uint64_t)ts.tv_sec * 1000000 + (uint64_t)ts.tv_nsec / 1000;
 }
 
-/* Stereo float output at the engine rate, playing; 0 if none can be opened
- * (SDL audio is initialised here, so a failed init is retried too). */
+/* Float output at the engine rate in the output layout (stereo or 5.1),
+ * playing; 0 if none can be opened (SDL audio is initialised here, so a
+ * failed init is retried too). SDL converts to what the hardware has, so a
+ * 5.1 stream on a stereo device is folded down by SDL. */
 static SDL_AudioDeviceID output_open(void) {
     if (!SDL_WasInit(SDL_INIT_AUDIO) && SDL_InitSubSystem(SDL_INIT_AUDIO) != 0) return 0;
     SDL_AudioSpec want = {0}, have;
     want.freq = g_rate;
     want.format = AUDIO_F32SYS;
-    want.channels = 2;
+    want.channels = (Uint8)g_out_ch;
     want.samples = 1024;
     rt_host_affinity_begin();  /* SDL's audio thread runs no guest code */
     SDL_AudioDeviceID d = SDL_OpenAudioDevice(NULL, 0, &want, &have, 0);
@@ -527,7 +577,8 @@ static void *engine_main(void *arg) {
     CPU *c = rt_new_cpu();
     rt_thread_init(c);
     int frames = g_rate * PASS_FRAMES_MS / 1000;
-    float *out = malloc(sizeof(float) * 2 * (size_t)frames);
+    const int oc = g_out_ch;
+    float *out = malloc(sizeof(float) * (size_t)oc * (size_t)frames);
     uint64_t next = now_us(), reopen_wait = REOPEN_US, opened_at = now_us();
     uint64_t reopen_at = g_dev ? 0 : next + reopen_wait;  /* none at launch: keep trying */
     for (;;) {
@@ -535,7 +586,7 @@ static void *engine_main(void *arg) {
             /* keep about 40 ms queued while the device drains it */
             Uint32 q0 = SDL_GetQueuedAudioSize(g_dev), q;
             uint64_t last = now_us(), waited = 0;
-            while ((q = SDL_GetQueuedAudioSize(g_dev)) > (Uint32)(4 * frames * 2 * sizeof(float))) {
+            while ((q = SDL_GetQueuedAudioSize(g_dev)) > (Uint32)(4 * frames * oc * sizeof(float))) {
                 uint64_t t = now_us(), gap = t - last;
                 last = t;
                 if (q < q0) { q0 = q; waited = 0; }
@@ -581,28 +632,53 @@ static void *engine_main(void *arg) {
         if (!g_running) { usleep(PASS_FRAMES_MS * 1000); continue; }
         engine_pass(c, frames, out);
         __atomic_fetch_add(&g_passes, 1, __ATOMIC_RELEASE);
-        {   /* LB_AUDIO_METER=1: log the mixed stereo output level every ~5 s
-             * (objective evidence that music/voices reach the device). */
+        {   /* LB_AUDIO_METER=1: log the mixed output level every ~5 s
+             * (objective evidence that music/voices reach the device). In 5.1
+             * a second line gives the RMS of each channel. */
             static int meter = -1;
-            static double sum2, peak;
+            static double sum2, peak, ch2[MAX_CH];
             static uint64_t count;
             if (meter < 0) meter = getenv("LB_AUDIO_METER") && *getenv("LB_AUDIO_METER") == '1';
             if (meter) {
-                for (int i = 0; i < 2 * frames; i++) {
+                for (int i = 0; i < oc * frames; i++) {
                     double s = out[i] < 0 ? -out[i] : out[i];
                     sum2 += s * s;
+                    ch2[i % oc] += s * s;
+                    g_ch_sum2[i % oc] += s * s;
                     if (s > peak) peak = s;
                 }
-                count += 2 * (uint64_t)frames;
-                if (count >= 2ull * (uint64_t)g_rate * 5) {
+                g_ch_frames += (uint64_t)frames;
+                count += (uint64_t)oc * (uint64_t)frames;
+                if (count >= (uint64_t)oc * (uint64_t)g_rate * 5) {
+                    double n = (double)count / oc;  /* frames in the window */
                     LOG("audio meter: peak %.3f rms %.4f over %.1f s (%s)", peak, sqrt(sum2 / (double)count),
-                        (double)count / (2.0 * g_rate), g_dev ? "device open" : "no device");
+                        n / g_rate, g_dev ? "device open" : "no device");
+                    if (oc == 6)
+                        LOG("audio meter 5.1: rms FL %.4f FR %.4f FC %.4f LFE %.4f BL %.4f BR %.4f",
+                            sqrt(ch2[0] / n), sqrt(ch2[1] / n), sqrt(ch2[2] / n), sqrt(ch2[3] / n),
+                            sqrt(ch2[4] / n), sqrt(ch2[5] / n));
+                    {   /* SetOutputMatrix calls since launch, by shape */
+                        char shapes[256];
+                        int at = 0;
+                        shapes[0] = 0;
+                        pthread_mutex_lock(&g_lock);
+                        for (int a = 1; a <= MAX_CH; a++)
+                            for (int b = 1; b <= MAX_CH; b++)
+                                if (g_mx_calls[a][b] && at < (int)sizeof shapes - 32)
+                                    at += snprintf(shapes + at, sizeof shapes - (size_t)at, " %dx%d %llu", a, b,
+                                                   (unsigned long long)g_mx_calls[a][b]);
+                        unsigned long long c = g_mx_centre, l = g_mx_lfe, b = g_mx_back;
+                        pthread_mutex_unlock(&g_lock);
+                        LOG("audio matrices (source x destination, calls):%s; 6-wide with centre %llu, LFE %llu, back %llu",
+                            at ? shapes : " none", c, l, b);
+                    }
                     sum2 = peak = 0;
                     count = 0;
+                    memset(ch2, 0, sizeof ch2);
                 }
             }
         }
-        if (g_dev) SDL_QueueAudio(g_dev, out, (Uint32)(sizeof(float) * 2 * (size_t)frames));
+        if (g_dev) SDL_QueueAudio(g_dev, out, (Uint32)(sizeof(float) * (size_t)oc * (size_t)frames));
     }
     return NULL;
 }
@@ -716,6 +792,18 @@ SHIM(xv_SetOutputMatrix) {
         memset(v->matrix[idx], 0, sizeof v->matrix[idx]);
         for (uint32_t k = 0; k < sc * dc; k++) v->matrix[idx][k] = MF32(m + 4 * k);
         v->matrix_set[idx] = 1;
+        g_mx_calls[sc][dc]++;
+        if (dc == 6) {
+            int centre = 0, lfe = 0, back = 0;
+            for (uint32_t k = 0; k < sc; k++) {
+                centre |= v->matrix[idx][2 * sc + k] != 0;
+                lfe |= v->matrix[idx][3 * sc + k] != 0;
+                back |= v->matrix[idx][4 * sc + k] != 0 || v->matrix[idx][5 * sc + k] != 0;
+            }
+            g_mx_centre += (uint64_t)centre;
+            g_mx_lfe += (uint64_t)lfe;
+            g_mx_back += (uint64_t)back;
+        }
     }
     pthread_mutex_unlock(&g_lock);
     RET(0, 6);
@@ -952,14 +1040,14 @@ SHIM(xa_GetDeviceDetails) {
     M32(d + 1024) = 0xF;  /* GlobalDefaultDevice */
     uint32_t f = d + 1028;
     M16(f) = 0xFFFE;
-    M16(f + 2) = 2;
+    M16(f + 2) = (uint16_t)g_out_ch;
     M32(f + 4) = (uint32_t)g_rate;
-    M32(f + 8) = (uint32_t)g_rate * 8;
-    M16(f + 12) = 8;
+    M32(f + 8) = (uint32_t)g_rate * 4 * (uint32_t)g_out_ch;
+    M16(f + 12) = (uint16_t)(4 * g_out_ch);
     M16(f + 14) = 32;
     M16(f + 16) = 22;
     M16(f + 18) = 32;
-    M32(f + 20) = 3;  /* SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT */
+    M32(f + 20) = g_out_ch == 6 ? 0x3F : 3;  /* SPEAKER_5POINT1, or front left | front right */
     static const uint8_t k_float_guid[16] = {3, 0, 0, 0, 0, 0, 0x10, 0, 0x80, 0, 0, 0xaa, 0, 0x38, 0x9b, 0x71};
     memcpy(MEM + f + 24, k_float_guid, 16);
     RET(0, 3);
@@ -1004,17 +1092,18 @@ SHIM(xa_CreateSubmixVoice) {
     pthread_mutex_unlock(&g_lock);
     v->guest = hcom_new(&k_sub, v);
     M32(ARG(1)) = v->guest;
+    TRACE("xaudio2: submix voice %d ch %d Hz stage %d", v->in_ch, v->rate, v->stage);
     RET(0, 8);
 }
 /* CreateMasteringVoice(this, ppVoice, InputChannels, InputSampleRate, Flags, DeviceIndex, pEffectChain) */
 SHIM(xa_CreateMasteringVoice) {
-    int ch = ARG(2) ? (int)ARG(2) : 2;
+    int ch = ARG(2) ? (int)ARG(2) : g_out_ch;  /* XAUDIO2_DEFAULT_CHANNELS: the device's */
     if (ARG(3)) g_rate = (int)ARG(3);
     Voice *v = voice_new(V_MASTER, ch, g_rate, ARG(4));
     g_master = v;
     v->guest = hcom_new(&k_mst, v);
     M32(ARG(1)) = v->guest;
-    LOG("xaudio2: mastering voice %d ch at %d Hz", v->in_ch, g_rate);
+    LOG("xaudio2: mastering voice %d ch at %d Hz (asked %u ch, output %d ch)", v->in_ch, g_rate, ARG(2), g_out_ch);
     engine_start_thread();  /* real XAudio2 processes from creation; StartEngine is optional */
     RET(0, 7);
 }
@@ -1055,6 +1144,7 @@ int xaudio2_create(uint32_t clsid, uint32_t *out) {
     if (!guid_eq(clsid, CLSID_XAudio2) && !guid_eq(clsid, CLSID_XAudio2_Debug) &&
         !guid_eq(clsid, CLSID_XAudio2_26) && !guid_eq(clsid, CLSID_XAudio2_26_Debug)) return 0;
     classes_init();
+    output_layout_init();
     *out = hcom_new(&k_xa, NULL);
     g_running = 1;
     LOG("xaudio2: created IXAudio2 %08x", *out);
