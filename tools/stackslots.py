@@ -608,11 +608,11 @@ def classify(fr, acc, ext, entry):
             # the saved frame pointer: kept in memory so the ebp chain stays walkable
             c["bad"] = "saved frame pointer"
             continue
+        c["save"] = (not c["explicit"] and len(c["pushes"]) == 1 and c["pushes"] == c["pops"]
+                     and next(iter(c["pushes"])) in CALLEE_SAVED)
         if c["reads"]:
             continue    # a local: the function reads it back by name
-        save = (not c["explicit"] and len(c["pushes"]) == 1 and c["pushes"] == c["pops"]
-                and next(iter(c["pushes"])) in CALLEE_SAVED)
-        if not save:
+        if not c["save"]:
             c["bad"] = "never read here"    # outgoing arguments and dead stores stay in memory
     # A lifted callee whose reach above its return address is known must not reach a promoted cell.
     for _, _, o, _, k, t in acc:
@@ -621,6 +621,32 @@ def classify(fr, acc, ext, entry):
             for c in info.values():
                 if not c["bad"] and c["lo"] < whi and wlo < c["hi"]:
                     c["bad"] = "callee reads it"
+    # A cell can be a local at one time and an outgoing argument at another, once the frame above it has been
+    # released (a tail-merged epilogue that pushes arguments for a last call does this). The callee reads the
+    # argument from memory, so such a cell stays there. Arguments are the bytes a callee pops, when that is
+    # known and not zero; otherwise the unbroken run of cells pushed in the call's own block, from the top of
+    # the stack up to the first register save.
+    pushed = {}
+    for blk, A, o, n, k, t in acc:
+        if k != "call":
+            c = cell_of(o)
+            if k == "push":
+                pushed[c["lo"]] = blk
+            else:
+                pushed.pop(c["lo"], None)
+            continue
+        after = fr.calls.get(A, (None, None))[1]
+        pop = after - o if after is not None else 0
+        at = o
+        while at in info:
+            c = info[at]
+            arg = at < o + pop if pop > 0 else (pushed.get(at) == blk and not c.get("save"))
+            if not arg:
+                break
+            if not c["bad"]:
+                c["bad"] = "callee reads it"
+            at = c["hi"]
+        pushed.clear() if pop <= 0 else [pushed.pop(x, None) for x in list(pushed) if x < o + pop]
     # Every read must follow a write of the whole cell on every path, so that nothing depends on what the
     # memory held before; a call ends the life of whatever lies below esp at that point.
     cand = {c["lo"] for c in info.values() if not c["bad"]}

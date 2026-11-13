@@ -6,7 +6,7 @@ uint32_t gtab[8];
 #define ASMFN __attribute__((cdecl)) uint32_t     /* the assembly below is cdecl whatever the build's default */
 ASMFN p1(uint32_t a, uint32_t b); ASMFN p2(uint32_t a, uint32_t b); ASMFN p3(uint32_t a, uint32_t b);
 ASMFN p4(uint32_t a, uint32_t b); ASMFN p5(uint32_t a, uint32_t b); ASMFN p6(uint32_t a, uint32_t b);
-ASMFN p7(uint32_t a, uint32_t b);
+ASMFN p7(uint32_t a, uint32_t b); ASMFN p8(uint32_t a, uint32_t b); ASMFN p9(uint32_t a, uint32_t b);
 #ifdef __i386__
 __asm__(".intel_syntax noprefix\n"
 ".data\n"
@@ -47,6 +47,14 @@ __asm__(".intel_syntax noprefix\n"
  * its argument must be what comes back */
 ".globl p7\np7:\n push esi\n mov esi, [esp+8]\n add esi, [esp+12]\n push esi\n call helper1\n pop esi\n add eax, esi\n"
 " pop esi\n ret\n"
+/* locals read back, the frame released, then arguments for a last call pushed into the cells the locals
+ * had (a merged epilogue that ends in a call does this): callee-popped, then caller-cleaned */
+".globl p8\np8:\n sub esp, 12\n mov eax, [esp+16]\n mov [esp+8], eax\n mov ecx, [esp+20]\n mov [esp], ecx\n"
+" mov eax, [esp+8]\n add eax, [esp]\n mov dword ptr [gtab+16], eax\n mov ecx, [esp]\n add esp, 12\n push eax\n"
+" push ecx\n call dword ptr [vt]\n ret\n"
+".globl p9\np9:\n sub esp, 12\n mov eax, [esp+16]\n mov [esp+8], eax\n mov ecx, [esp+20]\n mov [esp], ecx\n"
+" mov eax, [esp+8]\n add eax, [esp]\n mov dword ptr [gtab+20], eax\n mov ecx, [esp]\n add esp, 12\n push eax\n"
+" push ecx\n call dword ptr [vc]\n add esp, 8\n ret\n"
 ".att_syntax\n");
 #else
 ASMFN p1(uint32_t a, uint32_t b) { uint32_t local = a, t = b * 3 + 1 + local; gtab[1] = t; local += b; return local; }
@@ -60,6 +68,8 @@ ASMFN p4(uint32_t a, uint32_t b) { return (a + b) + a * 4 + a - b; }
 ASMFN p5(uint32_t a, uint32_t b) { return a * b; }
 ASMFN p6(uint32_t a, uint32_t b) { return ~b + (a - b); }
 ASMFN p7(uint32_t a, uint32_t b) { return (a + b) * 3 + 1 + 0xDEAD; }
+ASMFN p8(uint32_t a, uint32_t b) { gtab[4] = a + b; return b + (a + b); }
+ASMFN p9(uint32_t a, uint32_t b) { gtab[5] = a + b; return b - (a + b); }
 #endif
 
 __attribute__((noinline)) static uint32_t fold(uint32_t h, uint32_t v) { return (h ^ v) * 16777619u; }
@@ -67,11 +77,12 @@ __attribute__((noinline)) static uint32_t all(uint32_t a, uint32_t b) {
     uint32_t h = 2166136261u;
     h = fold(h, p1(a, b)); h = fold(h, p2(a, b)); h = fold(h, p3(a, b)); h = fold(h, p4(a, b));
     h = fold(h, p5(a, b)); h = fold(h, p6(a, b)); h = fold(h, p7(a, b));
+    h = fold(h, p8(a, b)); h = fold(h, p9(a, b));
     return h;
 }
 
 uint32_t test_main(uint32_t a, uint32_t b) {
     uint32_t r = all(a, b);
     r = fold(r, all(b + 1, r));
-    return r + gtab[1] + gtab[2] + gtab[3];
+    return r + gtab[1] + gtab[2] + gtab[3] + gtab[4] + gtab[5];
 }
