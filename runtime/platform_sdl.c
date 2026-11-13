@@ -312,6 +312,8 @@ static void bench_frame(double took) {
 static void pace_frame(void) {
     static double last, sum, worst;
     static int n, over33, over50;
+    extern void hitch_frame(void);  /* runtime/hitch.c: LB_HITCH_MS samples the stacks of long frames */
+    hitch_frame();
     double now = pace_now_ms();
     if (last > 0) {
         double took = now - last;
