@@ -180,18 +180,18 @@ has no `cvtss2sd`, so SSE2 doubles are not tested; the game evidently does not u
 ## On the game
 
 M1 MacBook Air, macOS build with pinned registers, slots off against on, alternating order, work ms per
-frame (mean of the runs, with the range). The machine was not quiet (system daemons used one to two cores).
+frame (mean of the runs, with the range).
 
 | Scenario, phase | Off | On | Change | Runs each |
 |---|---|---|---|---|
-| Whiterun, overall | 9.08 (8.98-9.19) | 9.09 (8.89-9.38) | +0.1% | 4 |
-| Whiterun, run | 7.08 (6.96-7.22) | 6.98 (6.87-7.28) | -1.5% | 4 |
-| Boss fight, overall | 12.70 (12.37-13.27) | 11.75 (11.12-12.09) | -7.5% | 3 |
-| Boss fight, calm (before combat) | 9.36 (9.06-9.89) | 8.47 (8.29-8.61) | -9.5% | 3 |
+| Whiterun, overall | 8.95 (8.94-8.95) | 8.90 (8.83-8.97) | -0.5% | 2 |
+| Boss fight, overall | 11.55 (11.06-12.14) | 11.45 (11.19-11.71) | -0.9% | 6 |
+| Boss fight, calm (before combat) | 8.57 (8.48-8.83) | 8.70 (8.36-9.37) | +1.5% | 6 |
 
-Whiterun is within run-to-run noise. The boss-fight ranges do not overlap, but it is three runs each and
-boss-fight runs diverge once combat starts; the calm phase is the more trustworthy row. Not run on a headset.
+**No measurable gain.** Every difference is smaller than the spread between runs of the same build. An
+earlier, shorter comparison (three boss-fight runs each) showed 7.5% less work with slots on; six runs each
+did not reproduce it, so that was run-to-run variation. Not run on a headset.
 
 Two faults showed only on the game and are fixed: a local's cell reused as an outgoing argument after the
-frame was released, and a jump table that leaves the function with the frame up (the CRT's `memmove`). The
-second has no corpus test.
+frame was released, and a jump table that leaves the function with the frame up (the CRT's `memmove`). Both
+have shapes in `tests/aot/x86stack/msvc_shapes.c`.
