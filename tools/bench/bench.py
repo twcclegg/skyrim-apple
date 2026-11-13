@@ -10,6 +10,8 @@ A scenario (scenarios/*.json) is frame-timed scripted input for the runtime's LB
 the main menu (`coc` into a cell gives the default character in the same place every run, without anyone's save),
 keys held for a route, screenshots (LB_SHOT) to check the run went where intended, and named phases whose frame
 times are summarized separately. The runtime logs each frame (LB_FRAMETIMES=1) and quits at LB_EXIT_FRAME.
+Taking a screenshot stalls its frame for 50-300 ms (a GPU readback and two files written), so those frames are left
+out of the statistics and listed in the summary's meta as screenshot_frames.
 
 The app must already be installed with the game files in place; this tool never installs anything. On a device the
 headset has to be worn and awake, because visionOS suspends apps when it isn't. Results go to bench-results/
@@ -48,6 +50,7 @@ BUNDLE = _bundle_id()
 FRAME_MS = 1000.0 / 60.0
 FT = re.compile(r"^ft (\d+) ([\d.]+) ([\d.]+)(?: ([\d.]+))?$")
 SHOT = re.compile(r"^LB_SHOT frame (\d+) \d+x\d+ -> (.+)$")
+SHOT_ANY = re.compile(r"^LB_SHOT frame \d+ ")  # any screenshot line: the next frame time logged includes its stall
 CONTAINER = re.compile(r"/Containers/Data/Application/[0-9A-F-]+/(.+)$")
 NOTABLE = ("native: thermal", "bench:", "immersive:", "pointer:", "fatal", "device lost", "rt_unimpl", "quit requested")
 
@@ -289,21 +292,41 @@ def stats(frames):
     }
 
 
+def paging_counters():
+    """macOS swap-ins, swap-outs and page-outs since boot, in MB; None where vm_stat isn't available."""
+    try:
+        out = subprocess.run(["vm_stat"], capture_output=True, text=True, timeout=10).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    page = re.search(r"page size of (\d+) bytes", out)
+    counts = {k: re.search(rf"^{k}:\s+(\d+)", out, re.M) for k in ("Swapins", "Swapouts", "Pageouts")}
+    if not page or not all(counts.values()):
+        return None
+    return {k.lower(): int(m[1]) * int(page[1]) / 2**20 for k, m in counts.items()}
+
+
 def parse_log(text, scenario=None):
-    frames, shots, notes = [], {}, []
+    frames, shots, notes, stalled, pending = [], {}, [], {}, False
     for line in text.splitlines():
         m = FT.match(line)
         if m:
             frames.append((int(m[1]), float(m[2]), float(m[3]), float(m[4]) if m[4] else None))
+            if pending:
+                stalled[int(m[1])] = float(m[2])
+                pending = False
             continue
+        if SHOT_ANY.match(line):
+            pending = True
         m = SHOT.match(line)
         if m:
             shots[int(m[1])] = m[2]
         if line.startswith(NOTABLE) or any(n in line for n in NOTABLE[3:]):
             notes.append(line)
-    summary = {"overall": stats(frames)}
+    timed = [f for f in frames if f[0] not in stalled]
+    summary = {"overall": stats(timed)}
     for name, (start, end) in (scenario or {}).get("phases", {}).items():
-        summary[name] = stats([f for f in frames if start <= f[0] < end])
+        summary[name] = stats([f for f in timed if start <= f[0] < end])
+    summary["meta"] = {"screenshot_frames": stalled}
     exited = any("exit frame" in n and "reached" in n for n in notes)
     return frames, shots, notes, summary, exited
 
@@ -344,7 +367,11 @@ def execute(scenario, args):
     timeout = scenario["exit_frame"] / 20 + 240  # a third of real time, plus loading
     started = datetime.now(timezone.utc)
     print(f"bench: running {scenario['name']} to frame {scenario['exit_frame']} (timeout {timeout:.0f} s)")
+    paging = paging_counters() if isinstance(target, Mac) else None
     console = target.launch(env, timeout)
+    if paging:
+        after = paging_counters()
+        paging = {k: round(after[k] - v) for k, v in paging.items()} if after else None
     logs = sorted(set(target.list_files("Documents/SkyrimLogs")) - before)
     if not logs:
         fail(f"the run wrote no new log. Console:\n{console[-2000:]}")
@@ -367,13 +394,18 @@ def execute(scenario, args):
         csv.write("frame,frame_ms,present_ms,work_ms\n")
         for frame, ms, present, work in frames:
             csv.write(f"{frame},{ms},{present},{'' if work is None else work}\n")
-    summary["meta"] = {"scenario": scenario["name"], "label": label, "started_utc": started.isoformat(),
+    if paging:
+        summary["meta"]["paging_mb"] = paging
+    summary["meta"] = {**summary["meta"], "scenario": scenario["name"], "label": label, "started_utc": started.isoformat(),
                        "exited_cleanly": exited, "notes": notes[-40:], "log": logs[-1]}
     (out / "summary.json").write_text(json.dumps(summary, indent=2))
     print_summary(summary)
     print(f"bench: results in {out}")
     if not exited:
         print("bench: WARNING the run didn't reach its exit frame; don't compare it", file=sys.stderr)
+    if paging and paging["swapins"] + paging["swapouts"] > 1024:
+        print(f"bench: WARNING the Mac swapped {paging['swapins']} MB in and {paging['swapouts']} MB out during the "
+              "run; memory pressure slows everything, so check this run before comparing it", file=sys.stderr)
     if args.baseline:
         compare(Path(args.baseline), out)
     return out
