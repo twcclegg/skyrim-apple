@@ -67,6 +67,17 @@ static void shim_host_roundtrip(CPU *c) {
 void rt_longjmp(CPU *c, uint32_t jb, uint32_t val) __attribute__((noreturn));
 static void shim_longjmp(CPU *c) { rt_longjmp(c, ARG(0), ARG(1)); }
 
+/* A host replacement for a lifted function, which calls the guest body it replaced. */
+void FIX_OVR_TARGET_GUEST(CPU *c);
+static _Atomic unsigned ovr_calls, ovr_bad;
+void FIX_OVR_TARGET_FN(CPU *c) {
+    uint32_t arg = M32(c->r[4] + 4), sp = c->r[4];
+    ovr_calls++;
+    FIX_OVR_TARGET_GUEST(c);
+    if (c->r[0] != arg + 7 || c->r[3] != 0x55 || c->r[4] != sp + 4) ovr_bad++;
+    c->r[0] += 100;
+}
+
 /* Each host thread runs lifted code on its own CPU and guest stack. */
 static void *thread_body(void *arg) {
     uintptr_t index = (uintptr_t)arg, bad = 0;
@@ -161,6 +172,12 @@ int main(int argc, char **argv) {
     c = invoke(FIX_SETJMP_CALLER);
     check("setjmp/longjmp across a lifted frame restores callee-saved registers",
           c.r[0] == 7 && c.r[3] == 5 && c.r[7] == 6);
+    value = 35;
+    c = cpu();
+    check("host replacement reached through the table, calling its guest body",
+          rt_invoke(&c, FIX_OVR_TARGET, 1, &value) == 142 && c.r[3] == 0x55 && ovr_bad == 0 && ovr_calls == 1);
+    c = invoke(FIX_OVR_CALLER);
+    check("lifted code calling a host replacement directly", c.r[0] == 35 + 7 + 100 + 1 + 0x55 && ovr_bad == 0 && ovr_calls == 2);
     pthread_t threads[4];
     uintptr_t thread_bad = 0;
     for (uintptr_t i = 0; i < 4; i++) pthread_create(&threads[i], NULL, thread_body, (void *)i);

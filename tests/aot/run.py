@@ -62,6 +62,11 @@ def cases() -> list[tuple[str, bytes, list[tuple[int, int]] | None]]:
         ("setjmp_caller", b"", None),
         # push 7; push jmp_buf; call [IAT_LONGJMP]; ret (never reached)
         ("longjmp_thrower", bytes.fromhex("6a076800700200ff1508600200c3"), None),
+        # A function the harness replaces with host code (LIFT_HOST_OVERRIDES). The replacement calls this
+        # guest body: mov eax,[esp+4]; add eax,7; mov ebx,0x55; ret
+        ("ovr_target", bytes.fromhex("8b44240483c007bb55000000c3"), None),
+        # Lifted code calling the replaced function directly.
+        ("ovr_caller", b"", None),
         # There is intentionally no function at this dispatch target.
         ("unknown_call", bytes.fromhex("b8ff2f4000ffd0c3"), None),
         # A privileged instruction must become the upstream explicit trap.
@@ -81,6 +86,11 @@ def cases() -> list[tuple[str, bytes, list[tuple[int, int]] | None]]:
                                 "bb77000000bf99000000") + b"\xe8" + struct.pack("<i", thrower - (setjmp_address + 43))
     setjmp_code += b"\xc3"
     result[names.index("setjmp_caller")] = ("setjmp_caller", setjmp_code, [(0, 28), (28, 43), (43, 44)])
+    # push 0x23; call ovr_target; add esp,4; add eax,1; add eax,ebx; ret
+    ovr_caller = BASE + TEXT_RVA + names.index("ovr_caller") * STEP
+    ovr_target = BASE + TEXT_RVA + names.index("ovr_target") * STEP
+    result[names.index("ovr_caller")] = ("ovr_caller", b"\x6a\x23\xe8" + struct.pack(
+        "<i", ovr_target - (ovr_caller + 7)) + bytes.fromhex("83c40483c00101d8c3"), None)
     result[4] = ("direct_call", direct, None)
     result[5] = ("indirect_call", indirect, None)
     return result
@@ -159,9 +169,12 @@ def main() -> int:
     function_map.write_text(json.dumps(data, indent=2) + "\n")
     header = output / "fixture_addresses.h"
     header.write_text("/* Authored synthetic functions; no game code. */\n#pragma once\n" +
-                      "".join(f"#define FIX_{name.upper()} 0x{address:X}u\n" for name, address in symbols.items()))
+                      "".join(f"#define FIX_{name.upper()} 0x{address:X}u\n" for name, address in symbols.items()) +
+                      f"#define FIX_OVR_TARGET_FN f_{symbols['ovr_target']:X}\n"
+                      f"#define FIX_OVR_TARGET_GUEST f_{symbols['ovr_target']:X}_guest\n")
     env = os.environ.copy()
-    env.update({"LIFT_GAME": "skyrim", "LIFT_FILES": "2", "LIFT_TSO": "1"})
+    env.update({"LIFT_GAME": "skyrim", "LIFT_FILES": "2", "LIFT_TSO": "1",
+                "LIFT_HOST_OVERRIDES": f"{symbols['ovr_target']:X}"})
     if args.discover:
         discovered = command([sys.executable, str(ROOT / "tools/discover.py"), str(pe), str(function_map)], env=env)
         (output / "discovery.log").write_text(discovered.stdout + discovered.stderr)

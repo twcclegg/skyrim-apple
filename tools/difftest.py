@@ -434,8 +434,13 @@ def main():
         flags = ["-O2", "-DLB_PINNED"] + ["-ffixed-x%d" % n for n in range(21, 29)] + [
             "-mllvm", "-disable-postra-machine-licm", "-mllvm", "-disable-early-ifcvt",
             "-mllvm", "-aarch64-enable-ccmp=false"]
+    # The runtime is built the way the game builds it: without the reserved registers and the
+    # pass-disabling flags, which belong to the lifted code only.
+    fpu = os.path.join(WORK, "fpu.o")
+    rt_flags = ["-O2", "-DLB_PINNED"] if "-DLB_PINNED" in flags else ["-O1"]
+    subprocess.check_call(["gcc", *rt_flags, "-w", "-I", rt, "-c", os.path.join(rt, "fpu.c"), "-o", fpu])
     subprocess.check_call(["gcc", *flags, "-w", "-I", rt, "-I", WORK, "-o", exe,
-                           os.path.join(WORK, "harness.c"), os.path.join(rt, "fpu.c"), "-lm"])
+                           os.path.join(WORK, "harness.c"), fpu, "-lm"])
     with open(os.path.join(WORK, "input.bin"), "wb") as f:
         f.write(struct.pack("<II", len(ok), len(pages)))
         f.write(scr)
