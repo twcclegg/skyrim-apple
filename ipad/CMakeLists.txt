@@ -129,6 +129,18 @@ if(LB_CONST_MEM)
   target_compile_definitions(skyrim_ipad_generated PRIVATE LB_CONST_MEM)
 endif()
 target_compile_options(skyrim_ipad_generated PRIVATE -O2 -g0 -fno-strict-aliasing -fwrapv -fsigned-char)
+# Guest registers in x21-x28 (runtime/lift_prelude.h), as in macos/CMakeLists.txt: the generated code
+# reserves the registers and has the three LLVM passes that move writes to reserved registers turned
+# off; the runtime only needs to know the mode is on, for its entry trampoline.
+option(LB_PINNED_REGS "Keep the guest registers in fixed host registers in lifted code" OFF)
+if(LB_PINNED_REGS)
+  target_compile_definitions(skyrim_ipad_runtime PUBLIC LB_PINNED)
+  target_compile_definitions(skyrim_ipad_generated PRIVATE LB_PINNED)
+  target_compile_options(skyrim_ipad_generated PRIVATE -ffixed-x21 -ffixed-x22 -ffixed-x23 -ffixed-x24
+    -ffixed-x25 -ffixed-x26 -ffixed-x27 -ffixed-x28
+    "SHELL:-mllvm -disable-postra-machine-licm" "SHELL:-mllvm -disable-early-ifcvt"
+    "SHELL:-mllvm -aarch64-enable-ccmp=false")
+endif()
 set_property(GLOBAL PROPERTY JOB_POOLS generated_compile=2)
 set_property(TARGET skyrim_ipad_generated PROPERTY JOB_POOL_COMPILE generated_compile)
 
