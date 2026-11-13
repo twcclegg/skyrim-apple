@@ -15,8 +15,7 @@ import sys
 from pathlib import Path
 
 T32, T16, T8, T64 = "uint32_t", "uint16_t", "uint8_t", "uint64_t"
-CONV = ["", "", "", "__attribute__((stdcall)) ", "__attribute__((fastcall)) ", "__attribute__((regparm(3))) ",
-        "__attribute__((regparm(1))) "]
+CONV = ["", "", "", "X86_STDCALL ", "X86_FASTCALL ", "X86_REGPARM(3) ", "X86_REGPARM(1) "]   # x86prog.h
 
 
 class Gen:
@@ -168,7 +167,7 @@ class Gen:
         params = [self.pick([T32] * 5 + [T16, T8, T64, "ptr", "arr", "pair"]) for _ in range(nparams)]
         if kind == "rec":
             params = [T32] + params[:4]
-        if "regparm" in conv or "fastcall" in conv:
+        if "REGPARM" in conv or "FASTCALL" in conv:
             params = [p for p in params if p != T64 or r.random() < 0.5]
         vs, decl = [], []
         for n, t in enumerate(params):
@@ -319,7 +318,7 @@ class FGen:
     def function(self, k):
         r = self.r
         name = "g%d" % k
-        conv = self.pick(["", "", "", "__attribute__((stdcall)) ", "__attribute__((fastcall)) "])
+        conv = self.pick(["", "", "", "X86_STDCALL ", "X86_FASTCALL "])
         params = [self.pick(["float", "float", "double", "uint32_t"]) for _ in range(r.randrange(1, 6))]
         rett = self.pick(["float", "double", "uint32_t"])
         fv = [("p%d" % n, t) for n, t in enumerate(params) if t != "uint32_t"]

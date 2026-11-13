@@ -1,17 +1,17 @@
 /* Models virtual dispatch: calls through tables of function pointers with different conventions and
  * argument counts, several in a row, with locals and saved registers live across them. */
 typedef uint32_t (*op2)(uint32_t, uint32_t);
-typedef uint32_t (__attribute__((stdcall)) *sop3)(uint32_t, uint32_t, uint32_t);
-typedef uint32_t (__attribute__((fastcall)) *fop4)(uint32_t, uint32_t, uint32_t, uint32_t);
+typedef uint32_t (X86_STDCALL *sop3)(uint32_t, uint32_t, uint32_t);
+typedef uint32_t (X86_FASTCALL *fop4)(uint32_t, uint32_t, uint32_t, uint32_t);
 static uint32_t trace[8];
 
 __attribute__((noinline)) static uint32_t add2(uint32_t a, uint32_t b) { return a + b; }
 __attribute__((noinline)) static uint32_t mix2(uint32_t a, uint32_t b) { trace[a & 7] += b; return a * 31 ^ b; }
 __attribute__((noinline)) static uint32_t rot2(uint32_t a, uint32_t b) { return a << (b & 31) | a >> ((32 - (b & 31)) & 31); }
-__attribute__((noinline, stdcall)) static uint32_t s_sel(uint32_t a, uint32_t b, uint32_t c) { return a & 1 ? b : c; }
-__attribute__((noinline, stdcall)) static uint32_t s_mad(uint32_t a, uint32_t b, uint32_t c) { trace[c & 7] ^= a; return a * b + c; }
-__attribute__((noinline, fastcall)) static uint32_t f_fold(uint32_t a, uint32_t b, uint32_t c, uint32_t d) { return ((a ^ b) + c) * (d | 1); }
-__attribute__((noinline, fastcall)) static uint32_t f_pick(uint32_t a, uint32_t b, uint32_t c, uint32_t d) { trace[d & 7] -= b; return a > b ? c : d; }
+__attribute__((noinline)) X86_STDCALL static uint32_t s_sel(uint32_t a, uint32_t b, uint32_t c) { return a & 1 ? b : c; }
+__attribute__((noinline)) X86_STDCALL static uint32_t s_mad(uint32_t a, uint32_t b, uint32_t c) { trace[c & 7] ^= a; return a * b + c; }
+__attribute__((noinline)) X86_FASTCALL static uint32_t f_fold(uint32_t a, uint32_t b, uint32_t c, uint32_t d) { return ((a ^ b) + c) * (d | 1); }
+__attribute__((noinline)) X86_FASTCALL static uint32_t f_pick(uint32_t a, uint32_t b, uint32_t c, uint32_t d) { trace[d & 7] -= b; return a > b ? c : d; }
 
 static const op2 ops2[4] = {add2, mix2, rot2, mix2};
 static const sop3 ops3[2] = {s_sel, s_mad};

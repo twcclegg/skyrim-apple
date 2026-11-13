@@ -4,9 +4,12 @@ static int32_t ints[16];
 static uint32_t halves[8];
 static double acc;
 
-__attribute__((noinline)) static int32_t trunc_i(float f) { return (int32_t)f; }
-__attribute__((noinline)) static uint32_t trunc_u(double d) { return d < 0 ? 0u : d > 4e9 ? 0xFFFFFFFFu : (uint32_t)d; }
-__attribute__((noinline)) static int64_t wide(double d) { return d < -9e18 || d > 9e18 ? 0 : (int64_t)d; }
+/* every conversion to an integer is range-checked first: out of range is undefined in C (X86SPEC rule 1) */
+__attribute__((noinline)) static int32_t trunc_i(float f) {
+    return f != f ? 0 : f >= 2147483648.0f ? 0x7FFFFFFF : f < -2147483648.0f ? (int32_t)0x80000000u : (int32_t)f;
+}
+__attribute__((noinline)) static uint32_t trunc_u(double d) { return d != d || d < 0 ? 0u : d > 4e9 ? 0xFFFFFFFFu : (uint32_t)d; }
+__attribute__((noinline)) static int64_t wide(double d) { return d != d || d < -9e18 || d > 9e18 ? 0 : (int64_t)d; }
 __attribute__((noinline)) static double mix(double a, float b, int32_t c, double d) { return a * b + (double)c - d / (b + 2.5); }
 
 __attribute__((noinline)) static uint32_t classify(float x, float lo, float hi) {
@@ -42,5 +45,5 @@ uint32_t test_main(uint32_t a, uint32_t b) {
         acc += d;
         if (d > 1e12 || d < -1e12) d = 3.0;
     }
-    return h ^ halves[h & 7] ^ (uint32_t)ints[a & 15] ^ (uint32_t)(int32_t)acc;
+    return h ^ halves[h & 7] ^ (uint32_t)ints[a & 15] ^ (uint32_t)wide(acc);
 }
