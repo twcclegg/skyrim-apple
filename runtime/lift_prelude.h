@@ -134,6 +134,51 @@ static inline void ga_unlock(void) { __atomic_store_n(&g_ga_lock, 0, __ATOMIC_RE
     else { ga_lock(); memcpy(&c_, p_, sizeof c_); ok_ = c_ == *e_; \
            if (ok_) memcpy(p_, &d_, sizeof d_); else *e_ = c_; ga_unlock(); } ok_; })
 
+/* Stack slots kept in locals (LIFT_SLOTS=1 in tools/lift.py; docs/STACK_SLOTS.md). `v` is the local for the
+ * cell `o` bytes from `fb_`, the function's esp on entry; `a` is the guest address the x86 operand names,
+ * which the normal build ignores.
+ *
+ * SL_GUARD follows a call whose effect on esp is solved or assumed rather than proven, and every call made
+ * while ebp is the frame pointer: if the callee left either somewhere else, the slot numbering after the
+ * call would be wrong, so stop there instead of running on.
+ *
+ * -DLB_SLOT_CHECK (debugging) also keeps every promoted cell in guest memory, XORed with a key, and on
+ * each read compares the two and compares `a` with the cell's address. A callee or a stray pointer that
+ * writes a promoted cell, a wrong stack height, and (through the key) code that reads a promoted cell
+ * from memory all show up, the first two here and the last as a wrong result. */
+/* x87, SSE and MMX values in promoted cells: the local holds the bytes guest memory would hold */
+static inline float sl_f32(uint32_t u) { float f; __builtin_memcpy(&f, &u, 4); return f; }
+static inline double sl_f64(uint64_t u) { double d; __builtin_memcpy(&d, &u, 8); return d; }
+static inline uint32_t sl_u32(float f) { uint32_t u; __builtin_memcpy(&u, &f, 4); return u; }
+static inline uint64_t sl_u64(double d) { uint64_t u; __builtin_memcpy(&u, &d, 8); return u; }
+#define SL_GUARD(ok, at) do { if (__builtin_expect(!(ok), 0)) { SPILL_RT(); \
+    rt_unimpl(c, at, "stack-slot guard: esp or ebp is not where the lifter expects it after this call"); } } while (0)
+#ifndef LB_SLOT_CHECK
+#define SL_INIT(n, v, o) uint##n##_t v = 0
+#define SL_R(n, v, o, a) (v)
+#define SL_W(n, v, o, a, x) (v = (uint##n##_t)(x))
+#else
+#include <stdio.h>
+#include <stdlib.h>
+#define SL_KEY 0x5AC3965Au
+__attribute__((weak, noinline, noreturn)) void rt_slot_fail(const char *fn, const char *what, uint32_t cell,
+                                                            uint32_t addr, uint32_t local, uint32_t mem) {
+    fprintf(stderr, "stack-slot check failed in %s: %s (cell at %08x, operand address %08x, local %08x, memory %08x)\n",
+            fn, what, cell, addr, local, mem);
+    abort();
+}
+#define SL_INIT(n, v, o) uint##n##_t v = 0; M##n(fb_ + (uint32_t)(o)) = (uint##n##_t)SL_KEY
+#define SL_R(n, v, o, a) __extension__({ uint32_t p_ = fb_ + (uint32_t)(o), a_ = (uint32_t)(a); \
+    if (a_ != p_) rt_slot_fail(__func__, "a read is not where the lifter placed it", p_, a_, v, 0); \
+    if (M##n(p_) != (uint##n##_t)(v ^ SL_KEY)) \
+        rt_slot_fail(__func__, "guest memory changed under a promoted cell", p_, a_, v, M##n(p_) ^ (uint##n##_t)SL_KEY); \
+    v; })
+#define SL_W(n, v, o, a, x) __extension__({ uint##n##_t x_ = (uint##n##_t)(x); \
+    uint32_t p_ = fb_ + (uint32_t)(o), a_ = (uint32_t)(a); \
+    if (a_ != p_) rt_slot_fail(__func__, "a write is not where the lifter placed it", p_, a_, x_, 0); \
+    v = x_; M##n(p_) = (uint##n##_t)(x_ ^ SL_KEY); })
+#endif
+
 /* Functions that keep the x87 top index in the local `ft` (X87CACHE in tools/lift.py). */
 #define SPILLF() do { SPILL(); c->top = ft; } while (0)
 #define RELOADF() do { RELOAD(); ft = c->top; } while (0)
