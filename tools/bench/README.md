@@ -14,11 +14,12 @@ come from private game files).
 
 1. Launches the installed app with `-SkyrimBenchAutoPlay YES`. The launcher presses Play once the files verify,
    without its input gate. It never installs anything.
-2. The launch environment turns on `LB_FRAMETIMES=1` (one `ft <frame> <ms> <Present ms>` log line per frame) and
+2. The launch environment turns on `LB_FRAMETIMES=1` (one `ft <frame> <ms> <Present ms> <work ms> <draw calls>`
+   log line per frame) and
    `LB_EXIT_FRAME` (a clean quit), and passes the scenario's input as `LB_KEYS` and its screenshot frames as
    `LB_SHOT`.
 3. Pulls the new log and screenshots, then writes `frametimes.csv`, `summary.json` (per phase: fps, mean, median,
-   p95, p99, max, frames over 33/50/250 ms, Present time), `env.json` and the device console. A screenshot
+   p95, p99, max, frames over 33/50/250 ms, Present time, work time, draw calls per frame), `env.json` and the device console. A screenshot
    stalls its frame for 50-300 ms (a GPU readback and two files written), so those frames are left out of the
    statistics; `summary.json` lists them under `meta.screenshot_frames`. On a Mac it also records how much the
    system swapped during the run (`meta.paging_mb`) and warns past 1 GB: with little memory, swapping can make

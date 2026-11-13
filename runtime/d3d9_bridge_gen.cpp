@@ -521,6 +521,7 @@ static void B_IDirect3DDevice9_SetNPatchMode(CPU *c) {
 static void B_IDirect3DDevice9_DrawPrimitive(CPU *c) {
     IDirect3DDevice9 *self = (IDirect3DDevice9 *)com_host(ARG(0));
     if (g_d3d_trace) d3d_trace(c, "IDirect3DDevice9::DrawPrimitive", 3);
+    g_d3d_draws++;
     if (g_bisect && d3d_skip_draw()) { RET(0, 4); return; }
     auto r = bridge_call(self, &IDirect3DDevice9::DrawPrimitive, ARG(1), ARG(2), ARG(3));
     RET((uint32_t)r, 4);
@@ -529,6 +530,7 @@ static void B_IDirect3DDevice9_DrawPrimitive(CPU *c) {
 static void B_IDirect3DDevice9_DrawIndexedPrimitive(CPU *c) {
     IDirect3DDevice9 *self = (IDirect3DDevice9 *)com_host(ARG(0));
     if (g_d3d_trace) d3d_trace(c, "IDirect3DDevice9::DrawIndexedPrimitive", 6);
+    g_d3d_draws++;
     if (g_bisect && d3d_skip_draw()) { RET(0, 7); return; }
     auto r = bridge_call(self, &IDirect3DDevice9::DrawIndexedPrimitive, ARG(1), (INT)ARG(2), ARG(3), ARG(4), ARG(5), ARG(6));
     RET((uint32_t)r, 7);
@@ -537,6 +539,7 @@ static void B_IDirect3DDevice9_DrawIndexedPrimitive(CPU *c) {
 static void B_IDirect3DDevice9_DrawPrimitiveUP(CPU *c) {
     IDirect3DDevice9 *self = (IDirect3DDevice9 *)com_host(ARG(0));
     if (g_d3d_trace) d3d_trace(c, "IDirect3DDevice9::DrawPrimitiveUP", 4);
+    g_d3d_draws++;
     if (g_bisect && d3d_skip_draw()) { RET(0, 5); return; }
     auto r = bridge_call(self, &IDirect3DDevice9::DrawPrimitiveUP, ARG(1), ARG(2), GPTR(ARG(3)), ARG(4));
     RET((uint32_t)r, 5);
@@ -545,6 +548,7 @@ static void B_IDirect3DDevice9_DrawPrimitiveUP(CPU *c) {
 static void B_IDirect3DDevice9_DrawIndexedPrimitiveUP(CPU *c) {
     IDirect3DDevice9 *self = (IDirect3DDevice9 *)com_host(ARG(0));
     if (g_d3d_trace) d3d_trace(c, "IDirect3DDevice9::DrawIndexedPrimitiveUP", 8);
+    g_d3d_draws++;
     if (g_bisect && d3d_skip_draw()) { RET(0, 9); return; }
     auto r = bridge_call(self, &IDirect3DDevice9::DrawIndexedPrimitiveUP, ARG(1), ARG(2), ARG(3), ARG(4), GPTR(ARG(5)), ARG(6), GPTR(ARG(7)), ARG(8));
     RET((uint32_t)r, 9);

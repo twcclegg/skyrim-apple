@@ -435,7 +435,7 @@ void d3d_trace(CPU *c, const char *name, int nargs) {
 
 // LB_BISECT=F: on frame F+2k, skip the k-th draw call of the frame and save
 // a screenshot after presenting it (finds which draw produces an artefact).
-int g_bisect;
+int g_bisect, g_d3d_draws;
 static int g_bisect_from = -1, g_draw_no;
 
 bool d3d_skip_draw(void) {
@@ -693,6 +693,8 @@ void B_IDirect3DDevice9_Present(CPU *c) {
     game_fov_apply();
     skyrim_present_tap_set_depth(menu_open() ? nullptr : d3d_scene_depth_target());
 #endif
+    platform_present_draws(g_d3d_draws);
+    g_d3d_draws = 0;
     platform_present_begin();
     HRESULT hr = d->Present((const RECT *)GPTR(ARG(1)), dst, nullptr, (const RGNDATA *)GPTR(ARG(4)));
     platform_present_end();
