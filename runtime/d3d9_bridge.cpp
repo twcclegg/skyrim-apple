@@ -11,6 +11,7 @@
 void shadow_flush(void *obj);
 void shadow_forget(void *obj);
 #include "d3d9_bridge.h"
+#include "motion_path.h"
 void bc_forget(void *obj);
 bool bc_lock(void *tex, uint32_t sub, uint32_t w, uint32_t h, const RECT *r, DWORD flags, uint32_t out,
              const std::function<HRESULT(D3DLOCKED_RECT *, const RECT *)> &lock, HRESULT *hr);
@@ -690,6 +691,8 @@ void B_IDirect3DDevice9_Present(CPU *c) {
     /* With a menu up the world camera isn't what's on screen (the journal, for one, renders through another
      * camera), so the frame carries none and the compositor shows it on its fixed screen. */
     g_frame_camera_valid = !menu_open() && game_camera_read(&g_frame_camera);
+    // Where the camera was when, so the compositor can keep the player's movement going between frames.
+    motion_camera(motion_now(), g_frame_camera_valid ? g_frame_camera.pos : nullptr);
     game_fov_apply();
     skyrim_present_tap_set_depth(menu_open() ? nullptr : d3d_scene_depth_target());
 #endif

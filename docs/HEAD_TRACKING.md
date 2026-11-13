@@ -19,6 +19,10 @@ head tracking without hooking the game's render code.
    world, and depth gives the eyes their parallax and covers small head movements.
 4. **A wider game FOV than the headset shows**, so turning the head finds picture already rendered.
 5. **HUD and menus**: menus already go flat; with head tracking they become a head-following panel.
+6. **The frame follows the player between game frames** (`LB_IMMERSIVE_MOTION=1`,
+   `docs/handoff/camera-motion.md`). Step 3 covers the head. Walking, strafing and turning with the stick moved
+   the world only once per game frame; the runtime now keeps the camera's recent positions and the steering
+   offset, and the compositor shifts and turns the frame it is showing to where they are for each display frame.
 
 ## Why not hook the camera
 
@@ -52,4 +56,9 @@ game turns a frame or two after the head) is hidden by step 3. The hook stays th
 
 Headset test settings (Documents/SkyrimNative/launch-env.json): `LB_IMMERSIVE_HEAD=1`, `LB_FOV=100`, and
 `LB_ANY_PAD=1` for the Xbox controller. Then Play Immersive.
+- [x] Player movement between game frames (`runtime/motion_path.c`, `tests/motion/run.py`,
+      `tools/motion_sim.py`). Linux, 2026-11-13: at 45 game fps on a 90 Hz display the error in each display
+      frame's movement falls from 5.6 cm to 0.24 cm on a made-up run. The compositor side is written but has
+      never been compiled.
+- [ ] Mac and simulator: build it, check the clock, hands and weapon (`docs/handoff/camera-motion.md`).
 - [ ] Headset: comfort, latency, frame rate.

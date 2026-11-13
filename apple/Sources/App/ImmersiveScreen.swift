@@ -66,6 +66,8 @@ enum SpatialEventLog {
 private struct QuadUniforms {
     var viewProjection: simd_float4x4
     var model: simd_float4x4
+    /// Where the frame goes without the player's movement since it was rendered (see heldWithin).
+    var heldModel: simd_float4x4
     var halfSize: SIMD2<Float>
     var decode: UInt32
     var hasDepth: UInt32
@@ -88,6 +90,10 @@ private struct QuadUniforms {
     /// 0: the screen is a window (depth behind it, scaled). 1: head-tracked view, each pixel at its true distance
     /// (depthScale meters per game meter, up to maxBehind meters) from the eye, which is eyeBack in front.
     var trueDepth: Float
+    /// Following the player between game frames (LB_IMMERSIVE_MOTION): whatever is nearer the eye than this many
+    /// meters travels with the camera (the player's own hands and weapon) and is placed by heldModel, not model;
+    /// the change is spread over the next half as far again. 0: everything is placed by model.
+    var heldWithin: Float
 }
 
 /// Runs on its own thread for as long as the layer lives: presents at the display's rate, showing the newest finished
@@ -97,9 +103,9 @@ final class ImmersiveCompositor: @unchecked Sendable {
     #include <metal_stdlib>
     using namespace metal;
     struct Uniforms {
-        float4x4 viewProjection; float4x4 model; float2 halfSize; uint decode; uint hasDepth;
+        float4x4 viewProjection; float4x4 model; float4x4 heldModel; float2 halfSize; uint decode; uint hasDepth;
         uint2 grid; float eyeBack; float nearUnits; float unitsPerMeter; float depthScale; float maxBehind; float backplate;
-        float tear; float trueDepth;
+        float tear; float trueDepth; float heldWithin;
     };
     struct Out { float4 position [[position]]; float2 uv; };
     // A grid over the game image. With depth, each vertex moves along the ray from the game's camera (eyeBack in
@@ -181,7 +187,14 @@ final class ImmersiveCompositor: @unchecked Sendable {
             float fade = u.trueDepth != 0 ? 1.0 : edge_fade(uv);
             p = eye + ray * (1.0 + (r - toScreen) * fade / toScreen);
         }
-        out.position = u.viewProjection * u.model * float4(p, 1);
+        float4 placed = u.model * float4(p, 1);
+        if (u.heldWithin > 0) {
+            // The world is shifted against the player's movement since the frame was rendered. The player's own
+            // hands and weapon moved with the camera, so they stay where the frame has them.
+            float world = smoothstep(u.heldWithin, u.heldWithin * 1.5, length(p - eye));
+            placed = mix(u.heldModel * float4(p, 1), placed, world);
+        }
+        out.position = u.viewProjection * placed;
         return out;
     }
     fragment float4 screen_fragment(Out in [[stage_in]], texture2d<float> image [[texture(0)]],
@@ -311,6 +324,9 @@ final class ImmersiveCompositor: @unchecked Sendable {
 
     /// Meters in the headset per game meter in head-tracking mode (LB_IMMERSIVE_HEAD_SCALE; 1 = true scale).
     private lazy var headDepthScale: Float = getenv("LB_IMMERSIVE_HEAD_SCALE").flatMap { Float(String(cString: $0)) } ?? 1.0
+    /// With LB_IMMERSIVE_MOTION=1: how near the eye (meters) something must be to count as the player's own hands
+    /// and weapon, which travel with the camera (LB_IMMERSIVE_MOTION_NEAR_M; 0 moves everything with the world).
+    private lazy var motionNear: Float = getenv("LB_IMMERSIVE_MOTION_NEAR_M").flatMap { Float(String(cString: $0)) } ?? 1.0
 
     private func finish() {
         skyrim_sdl_set_window_ghost(0)
@@ -351,19 +367,40 @@ final class ImmersiveCompositor: @unchecked Sendable {
 
     /// Where a frame goes in head-tracking mode: a plane facing back along the direction its game camera looked,
     /// viewPlane meters from the starting head position, so the eye sits eyeBack = viewPlane in front of it.
-    private func framePose(camera c: [Float]) -> simd_float4x4? {
-        var valid: Int32 = 0
-        let offset = skyrim_head_offset(&valid)
-        guard valid != 0, let startYaw = headStartYaw else { return nil }
+    /// turn = the headset heading that game north maps to; shift moves the whole frame (meters).
+    private func framePose(camera c: [Float], turn: Float, shift: SIMD3<Float>) -> simd_float4x4 {
         // Game camera forward is the rotation's first column; Skyrim heading is clockwise from +Y (north).
         let gameYaw = atan2(c[0], c[3]), gamePitch = asin(max(-1, min(1, c[6])))
-        let yaw = startYaw + (gameYaw - offset)
+        let yaw = gameYaw + turn
         let forward = SIMD3<Float>(sin(yaw) * cos(gamePitch), sin(gamePitch), -cos(yaw) * cos(gamePitch))
         let back = -forward
         let right = normalize(cross(SIMD3<Float>(0, 1, 0), back))
         let up = cross(back, right)
-        let center = headStartPosition + forward * Self.viewPlane
+        let center = headStartPosition + forward * Self.viewPlane + shift
         return simd_float4x4(SIMD4<Float>(right, 0), SIMD4<Float>(up, 0), SIMD4<Float>(back, 0), SIMD4<Float>(center, 1))
+    }
+
+    /// The frame's place in head-tracking mode, or nil until steering is anchored. With LB_IMMERSIVE_MOTION=1 it
+    /// also follows the player between game frames (runtime/motion_path.h): it turns with the steering offset as
+    /// the right stick turns the view, and shifts against the distance the game camera has travelled since it
+    /// rendered the frame. held is the place without either, for what travels with the camera; nil when the frame
+    /// isn't being moved. metersPerUnit is nil when the frame has no depth: a flat picture can't be walked through.
+    private func framePoses(camera c: [Float], shownAt seconds: Double, metersPerUnit: Float?)
+        -> (model: simd_float4x4, held: simd_float4x4?)? {
+        var valid: Int32 = 0
+        let offset = skyrim_head_offset(&valid)
+        guard valid != 0, let startYaw = headStartYaw else { return nil }
+        let held = framePose(camera: c, turn: startYaw - offset, shift: SIMD3<Float>(0, 0, 0))
+        var motion = skyrim_motion()
+        guard skyrim_immersive_motion(seconds, c[9], c[10], c[11], &motion) != 0 else { return (model: held, held: nil) }
+        let turn = startYaw - (motion.has_offset != 0 ? motion.offset : offset)
+        var shift = SIMD3<Float>(0, 0, 0)
+        if motion.has_moved != 0, let metersPerUnit {
+            // The camera has gone on by this much, so everything in the frame is that much the other way.
+            let moved = skyrim_motion_in_headset(motion.moved.0, motion.moved.1, motion.moved.2, turn, metersPerUnit)
+            shift = -SIMD3<Float>(moved.x, moved.y, moved.z)
+        }
+        return (model: framePose(camera: c, turn: turn, shift: shift), held: held)
     }
 
     private func draw() {
@@ -422,13 +459,20 @@ final class ImmersiveCompositor: @unchecked Sendable {
             let head = anchor?.originFromAnchorTransform ?? matrix_identity_float4x4
             var model = anchor != nil ? place(head: head) : screen
             var halfSize: SIMD2<Float>? = nil
+            var heldModel: simd_float4x4? = nil
             if headMode, anchor != nil {
                 let angles = headAngles(head)
                 if !publishedHead { skyrim_head_set(angles.yaw, angles.pitch, 1); publishedHead = true }
                 if game.has_camera != 0 {
                     let c = withUnsafeBytes(of: game.camera) { Array($0.bindMemory(to: Float.self)) }
-                    if let pose = framePose(camera: c) {
-                        model = pose
+                    var metersPerUnit: Float? = nil
+                    if depthTexture != nil {
+                        let settings = readDepthSettings()
+                        if settings.on, settings.units > 0 { metersPerUnit = headDepthScale / settings.units }
+                    }
+                    if let poses = framePoses(camera: c, shownAt: seconds, metersPerUnit: metersPerUnit) {
+                        model = poses.model
+                        heldModel = poses.held
                         // Frustum tangents right and top: the frame covers exactly the angles it was rendered for.
                         halfSize = SIMD2(Self.viewPlane * c[13], Self.viewPlane * c[14])
                     }
@@ -464,7 +508,7 @@ final class ImmersiveCompositor: @unchecked Sendable {
                     let tracked = halfSize != nil
                     let eyeBack = tracked ? Self.viewPlane : Self.distance
                     var uniforms = QuadUniforms(viewProjection: drawable.computeProjection(convention: .rightUpBack, viewIndex: index) * viewMatrix,
-                                                model: model,
+                                                model: model, heldModel: heldModel ?? model,
                                                 halfSize: halfSize ?? SIMD2(Self.width / 2, Self.width / 2 / aspect),
                                                 decode: game.needs_srgb_decode != 0 ? 1 : 0,
                                                 hasDepth: useDepth ? 1 : 0,
@@ -472,7 +516,8 @@ final class ImmersiveCompositor: @unchecked Sendable {
                                                 eyeBack: eyeBack, nearUnits: settings.near, unitsPerMeter: settings.units,
                                                 depthScale: tracked ? headDepthScale : settings.scale,
                                                 maxBehind: tracked ? 300 : settings.maxBehind, backplate: 0,
-                                                tear: settings.tear, trueDepth: tracked && useDepth ? 1 : 0)
+                                                tear: settings.tear, trueDepth: tracked && useDepth ? 1 : 0,
+                                                heldWithin: heldModel != nil && useDepth ? motionNear : 0)
                     encoder.setRenderPipelineState(pipeline)
                     encoder.setDepthStencilState(depth)
                     encoder.setCullMode(.none)

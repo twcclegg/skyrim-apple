@@ -51,6 +51,23 @@ void skyrim_immersive_release(void *state, uint32_t slot);
 void skyrim_head_set(float yaw, float pitch, int on);
 /* The game heading (radians, clockwise from north) that head yaw 0 maps to; *valid = 0 until steering anchors. */
 float skyrim_head_offset(int *valid);
+/* runtime/motion_path.h (LB_IMMERSIVE_MOTION=1): for a frame whose game camera was at (east, north, up), how far
+ * the camera has moved since (game units, game axes) and the steering offset, at the time the display shows what
+ * is being drawn (shown_at, seconds on CACurrentMediaTime's clock). Returns 0 when off or nothing is known. */
+#ifndef SKYRIM_MOTION_DEFINED
+#define SKYRIM_MOTION_DEFINED
+typedef struct skyrim_motion {
+    float moved[3];
+    float offset;
+    int has_moved;
+    int has_offset;
+} skyrim_motion;
+typedef struct skyrim_motion_vector { float x, y, z; } skyrim_motion_vector;
+#endif
+int skyrim_immersive_motion(double shown_at, float east, float north, float up, skyrim_motion *out);
+/* A movement in game axes as the headset sees it (x right, y up, z back), in metres. turn = the headset heading
+ * that game north maps to (the head's starting heading minus the steering offset), radians clockwise. */
+skyrim_motion_vector skyrim_motion_in_headset(float east, float north, float up, float turn, float metres_per_unit);
 #endif
 
 #endif
