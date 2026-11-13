@@ -2,6 +2,7 @@
 #pragma once
 #include <setjmp.h>
 #include "rt_table.h"
+#include "import_inline.h"
 /* indirect call through a per-site cache (see lift_terminator in tools/lift.py) */
 void rt_call_ic(CPU *c, uint32_t t, const FnEntry **cache);
 jmp_buf *rt_setjmp_slot(CPU *c, uint32_t guest_jb);
