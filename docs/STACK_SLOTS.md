@@ -31,7 +31,14 @@ depend on it.
 
 What stays in guest memory, in every function: return addresses, outgoing arguments, incoming arguments,
 the saved `ebp` of a frame-pointer function (so the guest's `ebp` chain stays walkable), anything touched
-by x87, SSE, 64-bit or locked instructions, and any slot the function writes but never reads back.
+by locked instructions or by a use of its address other than a plain load or store (`memcpy` of a 16-byte
+SSE value, an 80-bit x87 load), and any slot the function writes but never reads back.
+
+Float locals are promoted too. An x87, SSE or MMX load or store of a stack slot (`fld dword [esp+10h]`,
+`fstp qword [esp+8]`, `fnstcw`, `fistp`, `movss`, `movq`) reads or writes the cell's local, which holds
+exactly the bytes guest memory would hold: `fr0 = (double)sl_f32(SL_R(32, sl_28, -40, ...))` and
+`SL_W(32, sl_2C, -44, ..., sl_u32((float)fr0))`. The `sl_f32`/`sl_u32` bit casts compile to register
+moves or nothing, so a float that x87 code spills and reloads can stay in a register.
 
 ## How a function qualifies (`tools/stackslots.py`)
 
@@ -51,8 +58,11 @@ by x87, SSE, 64-bit or locked instructions, and any slot the function writes but
      sides of a join. Callee pops are non-negative, so a sum of them that must be zero makes each zero.
      A solved value also gets a guard. If the unknowns cannot be solved, the function is not promoted.
 3. **Each cell is used simply.** Accesses are grouped into cells of bytes that are used together. A cell is
-   promoted if it is 1, 2 or 4 bytes; every access is a plain integer operand, a push or a pop (the lifter
-   records this while translating the function once, then translates it again); it is read back by name
+   promoted if it is 1, 2, 4 or 8 bytes; every access is a plain integer operand, a push or a pop, or a
+   plain load or store by an x87, SSE or MMX instruction (the lifter records this while translating the
+   function once, then translates it again; for instructions other than integer operands it looks at the
+   text the instruction produced, and any use of the address other than `M8`..`M64`/`MF32`/`MF64` loads
+   and plain assignments keeps the cell in memory); it is read back by name
    somewhere in the function, or is a register save (pushed from and popped into the same one of `ebx`,
    `esi`, `edi`, `ebp`); and on every path each read follows a write of the whole cell. A call ends the
    life of anything below `esp` at that moment.
@@ -117,6 +127,10 @@ also lifts with `LIFT_SLOTS=1` and runs that as `slots`, `slots-check` and, on a
 `tests/aot/x86stack/` holds hand-written programs aimed at the stack, including MSVC-style shapes in
 assembly; `tests/aot/x86gen.py` generates any number of stack-heavy programs. See `tests/aot/README.md`.
 
+Float programs (`tests/aot/x86float/`, `x86gen.py --float`) cannot be compared with the emulator, which
+evaluates x87 in 80 bits where the lifter uses 64. `x86corpus.py --reference plain` compares every other
+build with the plain lifted build instead, bit for bit.
+
 ## Results so far (x86 corpus on an x86-64 Linux host, 2026-11-12)
 
 Correctness: every program agrees with the Unicorn reference in the `plain`, `slots` and `slots-check`
@@ -148,9 +162,16 @@ the rest take a stack address. These are compiler-generated
 test programs, not MSVC output and not the game: the share of the game's functions that qualify is not
 known until the lifter runs over it (see `exe_slots.json`).
 
+Floats: 60 generated float programs plus the three in `x86float/`, built with clang using x87, clang
+using SSE for floats (`-msse -mfpmath=sse`) and gcc, all match the plain lifted build in the `slots` and
+`slots-check` builds. Storing a float local by value conversion instead of its bits makes all 63 fail.
+At clang `-O2` the promoted code has about 18% fewer arm64 instructions, 17–18% fewer loads and 21–24%
+fewer stores (x87 and SSE alike; gcc's code 10–12%), and runs 19% faster on the x86-64 host. (The lifter
+has no `cvtss2sd`, so SSE2 doubles are not tested; the game evidently does not use it.)
+
 ## Not done
 
 - Incoming arguments (`[esp+4]` and up) stay in memory.
-- Slots used by x87 or SSE instructions stay in memory, so float locals gain nothing yet.
+- 80-bit x87 values (`fld tbyte`) and 16-byte SSE values stay in memory.
 - Functions rejected for the reasons above.
 - No measurement on the game or on arm64 hardware.

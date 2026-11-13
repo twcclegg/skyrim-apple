@@ -577,7 +577,7 @@ def classify(fr, acc, ext, entry):
             cells.append([lo, hi])
     info = {}
     for lo, hi in cells:
-        info[lo] = {"lo": lo, "hi": hi, "bad": "" if hi <= 0 and hi - lo in (1, 2, 4) else "shape", "reads": 0,
+        info[lo] = {"lo": lo, "hi": hi, "bad": "" if hi <= 0 and hi - lo in (1, 2, 4, 8) else "shape", "reads": 0,
                     "pushes": set(), "pops": set(), "explicit": 0, "n": 0}
     starts = [c[0] for c in cells]
 

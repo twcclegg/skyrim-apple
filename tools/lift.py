@@ -62,6 +62,7 @@ REG16 = {"ax": "eax", "cx": "ecx", "dx": "edx", "bx": "ebx", "sp": "esp", "bp": 
 REG8L = {"al": "eax", "cl": "ecx", "dl": "edx", "bl": "ebx"}
 REG8H = {"ah": "eax", "ch": "ecx", "dh": "edx", "bh": "ebx"}
 UT = {1: "uint8_t", 2: "uint16_t", 4: "uint32_t", 8: "uint64_t"}
+MSIZE = {"M8": 1, "M16": 2, "M32": 4, "M64": 8, "MF32": 4, "MF64": 8}
 ST_ = {1: "int8_t", 2: "int16_t", 4: "int32_t", 8: "int64_t"}
 BITS = {1: 8, 2: 16, 4: 32}
 SPILL = "SPILL();"
@@ -284,6 +285,7 @@ class Lifter:
         self.prom = {}      # frame offset of each promoted byte -> (cell offset, cell size, C name)
         self.cur_block = None
         self._simple = 0
+        self._pend = []     # stack operands addr() handed out for this instruction outside get/set
         self.frame = False
         self.f = fstart
         self.blocks = blocks  # list of (start, end)
@@ -359,7 +361,8 @@ class Lifter:
         k = off - lo
         a = a if not k else "%s - %d" % (a, k)
         if size != n:
-            e = "(%s & ~0x%Xu) | ((uint32_t)(%s)(%s) << %d)" % (name, ((1 << 8 * size) - 1) << 8 * k, UT[size], e, 8 * k)
+            e = "(%s & ~0x%X%s) | ((%s)(%s)(%s) << %d)" % (name, ((1 << 8 * size) - 1) << 8 * k, "ull" if n == 8 else "u",
+                                                         UT[n], UT[size], e, 8 * k)
         return "SL_W(%d, %s, %d, %s, (%s));" % (n * 8, name, lo, a, e)
 
     def stk_wr(self, i, rel, e, kind, reg=None):
@@ -403,10 +406,11 @@ class Lifter:
 
     def addr(self, i, op):
         m = op.mem
+        pend = None
         if self.fr is not None and not self._simple and i.mnemonic != "lea":
-            off = self.slot(i, op)      # reached some other way than get/set: this stays in guest memory
+            off = self.slot(i, op)      # reached some other way than get/set: stack_rewrite decides
             if off is not None:
-                self.note(i, off, op.size if 0 < op.size <= 16 else 16, "x")
+                pend = (off, op.size if 0 < op.size <= 16 else 16)
         parts = []
         for r in (m.base, m.index):
             if r and i.reg_name(r) in ("bx", "si", "di", "bp"):
@@ -423,7 +427,82 @@ class Lifter:
             parts.append("c->fs_base")
         elif m.segment and i.reg_name(m.segment) not in ("ds", "ss", "es", "cs"):
             raise Unsupported("segment")
-        return "(uint32_t)(%s)" % " + ".join(parts)
+        a = "(uint32_t)(%s)" % " + ".join(parts)
+        if pend is not None:
+            self._pend.append(pend + (a,))
+        return a
+
+    def stack_rewrite(self, i, lines):
+        """Stack operands that reached guest memory outside get/set (x87, SSE, MMX and the like). Where the
+        instruction's text uses one only as a plain M8..M64/MF32/MF64 read, or as the target of a plain
+        assignment, those uses are recorded (first pass) or turned into uses of the cell's local (second
+        pass, when it is promoted). Any other use of the address keeps the cell in memory."""
+        pend, self._pend = self._pend, []
+        if not pend or self.fr is None:
+            return lines
+        done = set()
+        for off, osize, a in pend:
+            if a in done:
+                continue
+            done.add(a)
+            pat = re.compile(r"(?<![\w])(MF32|MF64|M8|M16|M32|M64)\(" + re.escape(a) + r"\)")
+            events, bad, out = [], False, []
+            for li, line in enumerate(lines):
+                pieces, pos = [], 0
+                for m in pat.finditer(line):
+                    if m.start() < pos:     # inside a write already taken apart
+                        continue
+                    name, size = m.group(1), MSIZE[m.group(1)]
+                    flt = name.startswith("MF")
+                    before = line[:m.start()].rstrip()
+                    rest = line[m.end():]
+                    tail = rest.lstrip()
+                    if before.endswith("&") or before.endswith("++") or before.endswith("--") or \
+                            re.match(r"(\+\+|--|[-+*/%&|^]=|<<=|>>=)", tail):
+                        bad = True
+                        break
+                    if tail.startswith("=") and not tail.startswith("=="):
+                        start = m.end() + (len(rest) - len(tail)) + 1
+                        end, depth = start, 0
+                        while end < len(line) and not (line[end] == ";" and depth == 0):
+                            depth += {"(": 1, "[": 1, "{": 1, ")": -1, "]": -1, "}": -1}.get(line[end], 0)
+                            end += 1
+                        if end >= len(line) or a in line[start:end]:
+                            bad = True
+                            break
+                        expr = line[start:end].strip()
+                        events.append(((li, end), "w", size, flt))
+                        c = self.cell(off, size)
+                        if c:
+                            val = ("sl_u%d(%s)" % (size * 8, expr)) if flt else expr
+                            pieces += [line[pos:m.start()], self.slot_wr(c, off, size, a, val)]
+                        else:
+                            pieces.append(line[pos:end + 1])
+                        pos = end + 1
+                    else:
+                        events.append(((li, m.start()), "r", size, flt))
+                        c = self.cell(off, size)
+                        if c:
+                            rd = self.slot_rd(c, off, size, a)
+                            pieces += [line[pos:m.start()], ("sl_f%d(%s)" % (size * 8, rd)) if flt else rd]
+                        else:
+                            pieces.append(line[pos:m.end()])
+                        pos = m.end()
+                if bad:
+                    break
+                pieces.append(line[pos:])
+                out.append("".join(pieces))
+            # anything left that names the address (memcpy, a pointer, an offset from it) is not a plain use
+            if not bad:
+                left = "".join(pat.sub("", l) for l in lines)
+                bad = a in left or not events
+            if bad:
+                self.note(i, off, osize, "x")
+                continue
+            for _, kind, size, _ in sorted(events):
+                self.note(i, off, size, kind)
+            lines = out
+        return lines
 
     def mem(self, size, a):
         return {1: "M8", 2: "M16", 4: "M32", 8: "M64"}[size] + "(" + a + ")"
@@ -1393,6 +1472,7 @@ class Lifter:
                 nxt = i.address + i.size
                 lines = self.lift_terminator(i, nxt) if self.is_term(i) else None
                 if lines is not None:
+                    lines = self.stack_rewrite(i, lines)
                     # x86 never lets a later load pass an earlier one; ARM
                     # does, so a flag test followed by reads of the data it
                     # guards needs a load fence where control leaves the block.
@@ -1400,7 +1480,7 @@ class Lifter:
                         lines = ["LD_FENCE();"] + lines
                         ld_pending = False
                 else:
-                    lines = self.lift(i)
+                    lines = self.stack_rewrite(i, self.lift(i))
                     if shared_load(i, frame):
                         ld_pending = True
                     lines = mem_order(i, lines, frame)
