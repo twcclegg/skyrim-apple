@@ -152,6 +152,7 @@ def gen():
             o.append("    %s *self = (%s *)com_host(ARG(0));" % (iface, iface))
             o.append("    if (g_d3d_trace) d3d_trace(c, \"%s::%s\", %d);" % (iface, name, len(args)))
             if name.startswith("Draw") and not name.endswith("Patch"):
+                o.append("    g_d3d_draws++;")
                 o.append("    if (g_bisect && d3d_skip_draw()) { RET(0, %d); return; }" % (len(args) + 1))
             call = []
             post = []

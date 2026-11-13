@@ -48,7 +48,7 @@ def _bundle_id():
 
 BUNDLE = _bundle_id()
 FRAME_MS = 1000.0 / 60.0
-FT = re.compile(r"^ft (\d+) ([\d.]+) ([\d.]+)(?: ([\d.]+))?$")
+FT = re.compile(r"^ft (\d+) ([\d.]+) ([\d.]+)(?: ([\d.]+))?(?: (\d+))?$")
 SHOT = re.compile(r"^LB_SHOT frame (\d+) \d+x\d+ -> (.+)$")
 SHOT_ANY = re.compile(r"^LB_SHOT frame \d+ ")  # any screenshot line: the next frame time logged includes its stall
 CONTAINER = re.compile(r"/Containers/Data/Application/[0-9A-F-]+/(.+)$")
@@ -265,10 +265,11 @@ def percentile(values, p):
 
 
 def stats(frames):
-    """frames: list of (frame, ms, present_ms, work_ms or None)."""
+    """frames: list of (frame, ms, present_ms, work_ms or None, draw calls or None)."""
     times = [f[1] for f in frames if f[1] > 0]
     presents = [f[2] for f in frames]
     work = [f[3] for f in frames if f[1] > 0 and f[3] is not None]
+    draws = [f[4] for f in frames if f[1] > 0 and f[4] is not None]
     if not times:
         return {"frames": 0}
     total = sum(times)
@@ -289,6 +290,8 @@ def stats(frames):
         **({"work_mean_ms": round(sum(work) / len(work), 3), "work_median_ms": round(statistics.median(work), 3),
             "work_p95_ms": round(percentile(work, 95), 2), "work_p99_ms": round(percentile(work, 99), 2)}
            if work else {}),
+        **({"draws_mean": round(sum(draws) / len(draws), 1), "draws_p95": round(percentile(draws, 95))}
+           if draws else {}),
     }
 
 
@@ -310,7 +313,8 @@ def parse_log(text, scenario=None):
     for line in text.splitlines():
         m = FT.match(line)
         if m:
-            frames.append((int(m[1]), float(m[2]), float(m[3]), float(m[4]) if m[4] else None))
+            frames.append((int(m[1]), float(m[2]), float(m[3]), float(m[4]) if m[4] else None,
+                           int(m[5]) if m[5] else None))
             if pending:
                 stalled[int(m[1])] = float(m[2])
                 pending = False
@@ -391,9 +395,9 @@ def execute(scenario, args):
         elif isinstance(target, Mac):
             target.pull(path, out / f"shot-{frame:05d}.bmp")
     with open(out / "frametimes.csv", "w") as csv:
-        csv.write("frame,frame_ms,present_ms,work_ms\n")
-        for frame, ms, present, work in frames:
-            csv.write(f"{frame},{ms},{present},{'' if work is None else work}\n")
+        csv.write("frame,frame_ms,present_ms,work_ms,draws\n")
+        for frame, ms, present, work, draws in frames:
+            csv.write(f"{frame},{ms},{present},{'' if work is None else work},{'' if draws is None else draws}\n")
     if paging:
         summary["meta"]["paging_mb"] = paging
     summary["meta"] = {**summary["meta"], "scenario": scenario["name"], "label": label, "started_utc": started.isoformat(),
@@ -418,7 +422,8 @@ def print_summary(summary):
             continue
         print(f"{name:<12}{s['frames']:>8}{s['fps']:>8.1f}{s['mean_ms']:>8.1f}{s['p95_ms']:>8.1f}{s['p99_ms']:>8.1f}"
               f"{s['max_ms']:>9.1f}{s['over_33ms']:>7}{s['over_250ms']:>6}"
-              + (f"   work {s['work_mean_ms']:.2f} / p95 {s['work_p95_ms']:.1f}" if "work_mean_ms" in s else ""))
+              + (f"   work {s['work_mean_ms']:.2f} / p95 {s['work_p95_ms']:.1f}" if "work_mean_ms" in s else "")
+              + (f"   draws {s['draws_mean']:.0f}" if "draws_mean" in s else ""))
 
 
 def compare(baseline, candidate, threshold=0.05):
@@ -430,13 +435,13 @@ def compare(baseline, candidate, threshold=0.05):
         if phase == "meta" or phase not in a or not a[phase].get("frames") or not b[phase].get("frames"):
             continue
         cells = []
-        for key in ("mean_ms", "p95_ms", "p99_ms", "work_mean_ms", "work_p95_ms"):
+        for key in ("mean_ms", "p95_ms", "p99_ms", "work_mean_ms", "work_p95_ms", "draws_mean"):
             if key not in a[phase] or key not in b[phase]:
                 continue
             old, new = a[phase][key], b[phase][key]
             change = (new - old) / old if old else 0
             worse |= key == "mean_ms" and change > threshold
-            cells.append(f"{key[:-3]} {old:.1f}->{new:.1f} ({change:+.1%})")
+            cells.append(f"{key.removesuffix('_ms')} {old:.1f}->{new:.1f} ({change:+.1%})")
         print(f"  {phase:<10} " + "  ".join(cells))
     for run in (a, b):
         if not run.get("meta", {}).get("exited_cleanly"):
