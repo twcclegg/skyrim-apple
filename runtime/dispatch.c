@@ -199,6 +199,10 @@ __attribute__((naked, noinline)) static void rt_enter_guest(CPU *c, GuestFn fn) 
 static inline void rt_enter_guest(CPU *c, GuestFn fn) { fn(c); }
 #endif
 
+/* For host code that calls a lifted function it holds a pointer to (a host replacement calling the guest
+ * body it replaced): the registers are taken from and returned to the CPU struct. */
+void rt_host_call_guest(CPU *c, GuestFn fn) { rt_enter_guest(c, fn); }
+
 void rt_call(CPU *c, uint32_t t) {
     if (t >= GUEST_THUNK_BASE) {
         uint32_t i = (t - GUEST_THUNK_BASE) / 4;

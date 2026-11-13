@@ -6,6 +6,7 @@
 void rt_call_ic(CPU *c, uint32_t t, const FnEntry **cache);
 /* the table entry for a lifted function at t (remembered in *cache), or NULL for an import or unknown target */
 const FnEntry *rt_ic_lookup(uint32_t t, const FnEntry **cache);
+void rt_host_call_guest(CPU *c, void (*fn)(CPU *));
 jmp_buf *rt_setjmp_slot(CPU *c, uint32_t guest_jb);
 void rt_setjmp3(CPU *c);
 /* Where the eight guest registers live while lifted code runs.
@@ -89,6 +90,11 @@ __attribute__((weak, noinline, noreturn)) void rt_pin_fail(CPU *c, const char *f
 #define SPILL_RT() REGS_TO_CPU()
 #define RELOAD_RT() do { REGS_CHANGED(); REGS_FROM_CPU(); } while (0)
 #define HOST_ENTRY(fn) do { REGS_TO_CPU(); fn(c); REGS_CHANGED(); REGS_FROM_CPU(); } while (0)
+/* The guest body of a function that host code replaced. Host code calls it as f_X_guest(c), with the
+ * guest registers in the CPU struct, so that name is a wrapper that goes through the same hand-over as any
+ * other entry from host code; the lifted body itself is f_X_guest_lifted. */
+#define GUEST_BODY(fn) fn##_guest_lifted
+#define GUEST_BODY_FOR_HOST(fn) void fn##_guest(CPU *c) { rt_host_call_guest(c, fn##_guest_lifted); }
 #else
 #define GUEST_REGS uint32_t eax = c->r[0], ecx = c->r[1], edx = c->r[2], ebx = c->r[3], \
     esp = c->r[4], ebp = c->r[5], esi = c->r[6], edi = c->r[7]; TRACE_ENTRY()
@@ -97,6 +103,8 @@ __attribute__((weak, noinline, noreturn)) void rt_pin_fail(CPU *c, const char *f
 #define SPILL_RT() REGS_TO_CPU()
 #define RELOAD_RT() REGS_FROM_CPU()
 #define HOST_ENTRY(fn) fn(c)
+#define GUEST_BODY(fn) fn##_guest
+#define GUEST_BODY_FOR_HOST(fn)
 #endif
 /* Guest atomics (xchg with memory, lock-prefixed instructions, cmpxchg; see tools/lift.py). x86 allows them
  * at any address. ARM's atomic instructions fault when the address isn't a multiple of the operand size (SIGBUS
