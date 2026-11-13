@@ -6,19 +6,19 @@ __attribute__((noinline)) static uint32_t c9(uint32_t a, uint32_t b, uint32_t c,
     g[a & 15] += j;
     return a + 2 * b + 3 * c + 4 * d + 5 * e + 6 * f + 7 * h + 8 * i + 9 * j;
 }
-__attribute__((noinline, stdcall)) static uint32_t s5(uint32_t a, uint32_t b, uint64_t c, uint32_t d, uint8_t e) {
+__attribute__((noinline)) X86_STDCALL static uint32_t s5(uint32_t a, uint32_t b, uint64_t c, uint32_t d, uint8_t e) {
     g[d & 15] ^= (uint32_t)c;
     return (a ^ b) + (uint32_t)(c >> 32) * d + e;
 }
-__attribute__((noinline, fastcall)) static uint32_t f6(uint32_t a, uint32_t b, uint32_t c, uint16_t d, uint32_t e, uint32_t f) {
+__attribute__((noinline)) X86_FASTCALL static uint32_t f6(uint32_t a, uint32_t b, uint32_t c, uint16_t d, uint32_t e, uint32_t f) {
     return (a - b) * (c | 1) + d + (e ^ f);
 }
-__attribute__((noinline, regparm(3))) static uint32_t r7(uint32_t a, uint32_t b, uint32_t c, uint32_t d, uint32_t e, uint32_t f, uint32_t h) {
+__attribute__((noinline)) X86_REGPARM(3) static uint32_t r7(uint32_t a, uint32_t b, uint32_t c, uint32_t d, uint32_t e, uint32_t f, uint32_t h) {
     g[h & 15] -= a;
     return a ^ b ^ c ^ (d + e + f + h);
 }
-__attribute__((noinline, stdcall)) static uint32_t s0(void) { return g[3] + 1; }
-__attribute__((noinline, stdcall)) static uint32_t s1(uint32_t a) { return a * 3 + g[a & 15]; }
+__attribute__((noinline)) X86_STDCALL static uint32_t s0(void) { return g[3] + 1; }
+__attribute__((noinline)) X86_STDCALL static uint32_t s1(uint32_t a) { return a * 3 + g[a & 15]; }
 
 __attribute__((noinline)) static uint32_t hub(uint32_t x, uint32_t y, uint32_t z) {
     uint32_t p = x + y, q = y * z, r = z - x, s = x ^ y ^ z, t = p * 3, u = q + r;
