@@ -138,6 +138,11 @@ static inline void ga_unlock(void) { __atomic_store_n(&g_ga_lock, 0, __ATOMIC_RE
  * each read compares the two and compares `a` with the cell's address. A callee or a stray pointer that
  * writes a promoted cell, a wrong stack height, and (through the key) code that reads a promoted cell
  * from memory all show up, the first two here and the last as a wrong result. */
+/* x87, SSE and MMX values in promoted cells: the local holds the bytes guest memory would hold */
+static inline float sl_f32(uint32_t u) { float f; __builtin_memcpy(&f, &u, 4); return f; }
+static inline double sl_f64(uint64_t u) { double d; __builtin_memcpy(&d, &u, 8); return d; }
+static inline uint32_t sl_u32(float f) { uint32_t u; __builtin_memcpy(&u, &f, 4); return u; }
+static inline uint64_t sl_u64(double d) { uint64_t u; __builtin_memcpy(&u, &d, 8); return u; }
 #define SL_GUARD(ok, at) do { if (__builtin_expect(!(ok), 0)) { SPILL_RT(); \
     rt_unimpl(c, at, "stack-slot guard: esp or ebp is not where the lifter expects it after this call"); } } while (0)
 #ifndef LB_SLOT_CHECK

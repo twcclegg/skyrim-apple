@@ -35,7 +35,7 @@ STACK_TOP, SENTINEL = 0x180000, 0xFEEDF00D
 INPUTS = [(0, 0), (1, 2), (5, 9), (17, 3), (255, 256), (0x7FFFFFFF, 1), (0x80000000, 0xFFFFFFFF), (123456789, 987654321)]
 X86_FLAGS = ["--target=i686-unknown-linux-gnu", "-march=i686", "-ffreestanding", "-fno-builtin", "-fno-jump-tables",
              "-fno-pic", "-fno-common", "-fno-stack-protector", "-fno-asynchronous-unwind-tables", "-fwrapv",
-             "-mno-sse", "-mno-mmx", "-fno-strict-aliasing", "-w", "-include", str(HERE / "x86prog.h")]
+             "-mno-sse", "-mno-mmx", "-fno-strict-aliasing", "-fno-math-errno", "-w", "-include", str(HERE / "x86prog.h")]
 # X86CORPUS_NO_PASS_FLAGS=1 leaves the three pass-disabling flags out of the pinned build: a control run that
 # should produce MISMATCH results and so shows the corpus can detect the known compiler bugs.
 PINNED = ["-ffixed-x%d" % n for n in range(21, 29)] + ([] if os.environ.get("X86CORPUS_NO_PASS_FLAGS") == "1" else [
@@ -370,7 +370,7 @@ def native_check(cc, src, work):
                        "-Dmemcpy=x86prog_memcpy", "-Dmemset=x86prog_memset", "-Dmemmove=x86prog_memmove",
                        "-include", HERE / "x86prog.h", "-c", src, "-o", obj])
     if not p.returncode:
-        p = sh(cc + san + [obj, main, "-o", exe])
+        p = sh(cc + san + [obj, main, "-o", exe] + HOST_LIBS)
     if p.returncode:
         return None, "host build: " + (p.stderr.strip().split("\n") or ["?"])[0][:200]
     out = []
@@ -394,6 +394,10 @@ def main():
     ap.add_argument("--modes", default=",".join(m for m, v in MODES.items() if HAVE_PINNED or not v[2]),
                     help="which lifted builds to run and compare: " + ", ".join(MODES))
     ap.add_argument("--native-cc", help="compiler for the sanitiser build of each program (default: --cc)")
+    ap.add_argument("--reference", choices=("emulator", "plain"), default="emulator",
+                    help="what the lifted builds must agree with: the x86 code under Unicorn (default), or the "
+                         "plain lifted build, for programs with float arithmetic (x87 is emulated in 80 bits, "
+                         "lifted in 64): every other mode must then match it bit for bit")
     ap.add_argument("--x86-cc", help="compiler for the 32-bit x86 programs (default: --cc); gcc works too")
     ap.add_argument("--x86-flags", default="", help="extra flags for the x86 build, e.g. -mrtd or -fno-omit-frame-pointer")
     ap.add_argument("paths", nargs="+")
@@ -442,20 +446,26 @@ def main():
         if not objs:
             continue
         text, data, infos, data_rva = link(objs)
-        ref = run_reference(text, data, data_rva, infos)
-        runs, err = run_lifted(work, text, data, data_rva, infos, cc, modes)
+        if a.reference == "plain":
+            if "plain" not in modes:
+                modes = ["plain"] + modes
+            runs, err = run_lifted(work, text, data, data_rva, infos, cc, modes)
+            ref = runs["plain"] if runs else {k: "no plain build" for k in range(len(live))}
+        else:
+            ref = run_reference(text, data, data_rva, infos)
+            runs, err = run_lifted(work, text, data, data_rva, infos, cc, modes)
         for k, f in enumerate(live):
             if isinstance(ref[k], str):
-                mark(f, "REJECT", "-%s reference: %s" % (level, ref[k]))
+                mark(f, "UNLIFTED" if a.reference == "plain" else "REJECT", "-%s reference: %s" % (level, ref[k]))
                 continue
-            if [r.split()[0] for r in ref[k]] != native[f]:
+            if a.reference == "emulator" and [r.split()[0] for r in ref[k]] != native[f]:
                 mark(f, "REJECT", "-%s: the x86 build and the arm64-native build of this source return different values "
                                   "(the program depends on undefined or platform-specific behaviour)" % level)
                 continue
             if err:
                 mark(f, "UNLIFTED", "-%s: %s" % (level, err))
                 continue
-            for mode, got in ((m, runs[m][k]) for m in modes):
+            for mode, got in ((m, runs[m][k]) for m in modes if not (a.reference == "plain" and m == "plain")):
                 if isinstance(got, str):
                     mark(f, "UNLIFTED" if "lifter" in got or "discovery" in got else "MISMATCH", "-%s %s: %s" % (level, mode, got))
                 elif got != ref[k]:

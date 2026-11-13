@@ -67,7 +67,11 @@ macos/.venv/bin/python tests/aot/x86gen.py /tmp/gen 300 1 && macos/.venv/bin/pyt
   of their arguments, variadic callees, calls through tables in mixed conventions, narrow locals, 64-bit
   spills, recursion, run-time-sized frames, structs by value, and (`msvc_shapes.c`, in assembly with a C
   twin for the host check) the shapes MSVC emits that clang and gcc do not.
-- `x86gen.py OUTDIR [COUNT] [SEED]` writes reproducible random programs of the same kind.
+- `x86gen.py OUTDIR [COUNT] [SEED]` writes reproducible random programs of the same kind;
+  `x86gen.py --float` writes float-heavy ones.
+- `x86float/` holds float programs. The emulator evaluates x87 in 80 bits and the lifter in 64, so run
+  them with `--reference plain`: every build is compared with the plain lifted build, bit for bit.
+  `--x86-flags="-msse -mfpmath=sse"` puts the floats in SSE registers instead.
 - The runner also works on Linux, where the lifted code is built for the host instead of arm64:
   `--cc clang --native-cc gcc` if clang has no sanitiser runtime, and `--x86-cc gcc`,
   `--x86-flags=-mrtd` (callee-popped arguments), `--x86-flags=-fno-omit-frame-pointer` and the like

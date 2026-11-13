@@ -529,3 +529,16 @@ the other, and pinned together with PGO.
   qualify, and why the rest don't); boot the `-DLB_SLOT_CHECK` build and play through the Whiterun and
   boss-fight scenarios; then A/B the normal build. The two biggest reasons a function might not qualify in
   MSVC code are listed in the doc with what would recover them.
+
+## 2026-11-12 — stack slots: float locals
+
+- **Change:** x87, SSE and MMX loads and stores of stack slots now use the promoted cell's local (bit casts
+  `sl_f32`/`sl_u32`, cells up to 8 bytes for doubles). Same switch, `LIFT_SLOTS=1`; output with it off is
+  still unchanged.
+- **Correctness:** float programs are checked against the plain lifted build (`x86corpus.py --reference
+  plain`), since the emulator's x87 is 80-bit: 63 programs, x87 and SSE, clang and gcc, all identical.
+- **Effect on float corpus programs, clang `-O2`:** about −18% arm64 instructions, −17% loads, −21–24% stores
+  (static); −19% run time on the x86-64 host. Integer programs unchanged from the first entry. Not
+  measured on the game; Skyrim's x87 code spills floats to `[esp+N]` constantly, so this is the part most
+  likely to show up there.
+
