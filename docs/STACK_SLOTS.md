@@ -1,7 +1,8 @@
 # Stack slots as C locals (`LIFT_SLOTS=1`)
 
 Off by default. Set `LIFT_SLOTS=1` when running `tools/lift.py` to turn it on; the generated code needs
-nothing else. **It has not been run on the game yet**, only on the x86 corpus (see "Testing").
+nothing else. On the game it runs the Whiterun and boss-fight benchmark scenarios to the end, also in the
+`-DLB_SLOT_CHECK` build (see "Testing" and "On the game").
 
 ## What it does
 
@@ -175,3 +176,22 @@ has no `cvtss2sd`, so SSE2 doubles are not tested; the game evidently does not u
 - 80-bit x87 values (`fld tbyte`) and 16-byte SSE values stay in memory.
 - Functions rejected for the reasons above.
 - No measurement on the game or on arm64 hardware.
+
+## On the game
+
+M1 MacBook Air, macOS build with pinned registers, slots off against on, alternating order, work ms per
+frame (mean of the runs, with the range). The machine was not quiet (system daemons used one to two cores).
+
+| Scenario, phase | Off | On | Change | Runs each |
+|---|---|---|---|---|
+| Whiterun, overall | 9.08 (8.98-9.19) | 9.09 (8.89-9.38) | +0.1% | 4 |
+| Whiterun, run | 7.08 (6.96-7.22) | 6.98 (6.87-7.28) | -1.5% | 4 |
+| Boss fight, overall | 12.70 (12.37-13.27) | 11.75 (11.12-12.09) | -7.5% | 3 |
+| Boss fight, calm (before combat) | 9.36 (9.06-9.89) | 8.47 (8.29-8.61) | -9.5% | 3 |
+
+Whiterun is within run-to-run noise. The boss-fight ranges do not overlap, but it is three runs each and
+boss-fight runs diverge once combat starts; the calm phase is the more trustworthy row. Not run on a headset.
+
+Two faults showed only on the game and are fixed: a local's cell reused as an outgoing argument after the
+frame was released, and a jump table that leaves the function with the frame up (the CRT's `memmove`). The
+second has no corpus test.
