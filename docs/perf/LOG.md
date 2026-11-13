@@ -296,3 +296,217 @@ tear handling, and flat menus).
 - **CPU:** the process used 43–70% of one core, the main thread 21–28%. Thermal state stayed nominal.
 - **Thomas's verdict:** "Much better." His screenshots show clean edges on a rock and the sword at the
   reduced depth, and a flat main menu.
+
+## 2026-11-10 (evening) — heavy combat scenario (`boss-fight-mac`) and its first profile
+
+- **Scenario:** `tools/bench/scenarios/boss-fight-mac.json`, run with `--env LB_VPAD=0`. `coc whiterunorigin`,
+  then at frame 1900 the console runs `bat benchboss`. `benchboss.txt` sits in the game folder (private, not in
+  git) and contains:
+  `tgm` / `fw 000C8220` (storm) / `player.placeatme 000F811C 1` and `000F811A 1` (two high-level dragons) /
+  `00039D21 6`, `00037C47 4`, `00039D5E 4` (bandits: melee, archers, mages) / `00023AA8 2` (storm atronachs).
+  Form IDs were read from the local Skyrim.esm by editor ID.
+- **Two harness facts (observed):** with the virtual pad on, the A in `bat` acts as stick-left and garbles the
+  command, hence `LB_VPAD=0` (and no scripted turning); that is probably also why a second console command used
+  to arrive garbled. `coc` inside the batch file together with the spawns hung the load at the first frame.
+- **Result, M1, low preset, 1280×720:** before the spawn 11.4–11.5 ms of work per frame (60 fps). During the
+  fight, work per frame over four runs: early phase 31.8 / 26.1 / 14.2 / 46.0 ms, late 16.7 / 30.7 / 17.1 /
+  45.5 ms, with single frames of 0.4–4 s. **Indicative only:** the fight isn't deterministic, and another
+  session was running the game on the same Mac during at least the last two runs. What is safe to say: this
+  scene drops the M1 from 60 fps to roughly 20–40, with hitches, where Whiterun without the fight holds 60.
+- **Profile (`sample`, 12 s early and 10 s late, one run, the polluted one):**
+  - Main thread on-CPU only 37% of the time; it waits on a condition variable for 34%. Two worker threads run
+    lifted code at 64–67% of a core each. So the fight is limited by the game's job threads as much as by the
+    main thread; lifter-wide gains (x87, memory ordering) apply to all three.
+  - **Audio mixer thread** (`engine_main` / `route` / `next_frame` in `runtime/xaudio2.c`): 38–40% of a core
+    in both samples. Native runtime code, not lifted. Not measured in a calm scene yet.
+  - **Our own profiler report:** the watchdog thread's `prof_report` → `prof_table` calls `dladdr` once per
+    sample; in the early sample it used 56% of a core (1,463 of 2,587 ms-samples). It runs on its own thread,
+    so it doesn't show in frame work, but it is a core's worth of heat while it runs.
+  - `dxvk-cs` spent 52% of the early sample in `swtch_pri` (a yield spin), gone in the late sample; probably
+    waiting on pipeline compiles for the new actors. Not investigated.
+
+## 2026-11-10 (evening) — "exempt stack accesses from strict ordering": already done, closed
+
+- Idea: strict ordering costs about 11% (indicative); stack memory is thread-private, so skip it there.
+- Read `tools/lift.py`: `stack_op` already exempts `esp`-based operands, `ebp`-based ones in functions with a
+  frame pointer, and `fs:` (TEB). In `exe_14.c` (gen-x87) there are 18,216 ordered accesses against 44,431
+  plain ones, and none of the ordered ones is `esp`- or `ebp`-based.
+- What remains ordered is heap and global memory, plus stack memory reached through another register, which
+  can't be proven private per instruction. No further safe cut here; the choice is still strict on or off,
+  which is the maintainer's.
+
+## 2026-11-10 (night) — preset sweep on the M1, and the profile at ultra
+
+Whiterun market scenario, 1280×720, build `perf-x87` (rebuilt 20:17 from the head-tracking checkout, with
+`LB_PRESET`), one run per preset. Not a quiet machine: system daemons used 1.6–4.3 cores before each run
+(`audiomxd` pinned at 75%, `configd`, the ANE compiler). The low run's idle figure (9.62 ms) matches the quiet
+baseline from earlier (about 9.5), so the noise is small at least there. Work = ms per frame outside Present
+and pacing sleep; GPU = DXVK's busy time per frame (last three 10 s windows of each run).
+
+| preset | idle (city gate view) | run | pan (market) | GPU ms/frame | fps in idle |
+|---|---|---|---|---|---|
+| low | 9.6 | 7.6 | 5.5 | 9.7–10.0 | 59.5 |
+| medium | 10.6 | 8.5 | 5.6 | 10.5–13.2 | 59.6 |
+| high | 13.1 (p95 16.9) | 11.3 | 6.3 | 10.2–12.4 | 59.1 |
+| ultra (`veryhigh`) | 19.3 | 15.5 | 6.9 | 11.2–15.9 | 51.6 |
+
+- CPU is the first limit at every preset: low → ultra doubles the work in the long view (9.6 → 19.3 ms) while
+  GPU time goes from about 10 to at most 16 ms. High just holds 60 fps on the M1; ultra doesn't.
+- The cost is in the view: looking down the street from the gate doubles, standing in the market barely moves
+  (5.5 → 6.9). That points at draw distance and shadow settings (more objects through culling and draw
+  submission), not per-pixel quality.
+- An earlier pair of runs on a starved machine (3+ cores of other load) read 23–31 ms of GPU per frame at
+  ultra. That was the starvation, not the GPU; discard it.
+- **Profile at ultra** (`sample`, 14 s in the pan, starved run, so shape only): main thread 66% on-CPU, of
+  which 87% lifted code and 8% DXVK's front end; top entries `f_472580` (culling test, already native) 5.6%,
+  `com_host` 5.3%, then `f_B1B6C0`, `f_CAFD70`, `f_F531CC`, `f_CB0090`. Two job threads at 50–63% of a core in
+  lifted code. Same picture as low, more of it; nothing new takes over.
+
+## 2026-11-11 (overnight) — profile-guided build of the generated code, and preset repeats
+
+Unattended batch on the M1 (`perf-x87` as the base). The machine was never quiet (`audiomxd` and `configd`
+stuck busy), so each run waited 240 s and ran anyway. Instrumented build with `-fprofile-instr-generate`,
+trained on the Whiterun, Riverwood and boss-fight scenarios (continuous mode, `%c` in `LLVM_PROFILE_FILE`,
+because the game leaves through `_exit`), then `-fprofile-instr-use` (`perf-pgo`).
+
+Whiterun, work ms per frame, four interleaved pairs; one pair dropped because my own builds overlapped it:
+
+| phase | base (mean of 3) | profile-guided | change |
+|---|---|---|---|
+| idle (long street view) | 9.96 | 9.28 | −7% |
+| run | 7.67 | 7.29 | −5% |
+| pan (market) | 5.33 | 4.91 | −8% |
+
+- Run-to-run spread on the base is about ±4%, so this is a real but modest gain. One profile-guided pan run
+  read 9.73 ms against 4.8–5.0 for the others (dropped as an outlier, cause unknown).
+- **Boss fight: no visible difference.** Overall work 12.5 / 14.2 / 12.5 ms on the base against
+  14.2 / 15.5 / 11.7; the scenario varies more between runs than any effect of this size.
+- The boss fight now holds 57–59 fps on the M1 (20–40 before the audio and profiler fixes on
+  `visionos/head-tracking`).
+- Not adopted yet: it needs a profile checked in or regenerated per build, and the visionOS engine would
+  need the same profile applied. Worth it only if the headset shows the same few percent.
+
+Preset repeats on the base (idle work ms, two runs each): low 9.4 / 9.7, medium 10.7 / 10.6, high 12.2 / 12.1,
+ultra 17.1 / 15.3. They agree with the earlier sweep except ultra, which read 19.3 then on a busier machine.
+
+## 2026-11-11 (overnight) — DXVK: pipeline compiles no longer hold the pipeline lock
+
+Boss-fight sample: the DXVK command thread spent 1342 of 2587 samples yielding in the spinlock that
+`DxvkGraphicsPipeline` held across a Metal pipeline compile. Vendored DXVK is 1.9.2; MoltenVK 1.4.2 has no
+graphics pipeline library, and DXVK 2.x dropped the state cache, so upgrading isn't the fix. Changed
+(`dxvk_graphics.{h,cpp}`): the lock is a mutex, the instance list is a `std::deque` (stable addresses), and
+an instance is compiled outside the lock; a second thread wanting the same instance waits on a condition
+variable. Opt-in `DXVK_ASYNC=1` (`dxvk_pipemanager`, two worker threads) skips draws whose pipeline isn't
+ready instead of stalling. Measurements are queued (`cs-`, `async-`, `cold-` runs); results to follow here.
+
+## 2026-11-11 (overnight) — where the lifted code's time goes, per instruction
+
+From saved `sample` files, attributing samples to instruction offsets within lifted functions:
+
+- 18–28% of lifted-code samples land on a function's **first instruction** (12% in the boss fight). The
+  profile is flat (1,300+ functions, top 50 = 30%) and the text is about 95 MB, so this reads as instruction
+  cache and branch-target misses on entry. To confirm with CPU counters before acting on it.
+- About 15% is the entry loads of guest registers from the CPU struct, 4–5% reloads after calls, 2% spills.
+- 70% of guest memory accesses are stack accesses.
+- Ordered loads compile to `ldapr` with the macOS and visionOS deployment targets but to `ldar` (stronger,
+  slower) with the iOS default. Worth telling upstream.
+
+Two experiments from this:
+
+- **Order file** (`-Wl,-order_file`, 5,390 hot functions from samples, relink only → `perf-order`). Boots;
+  A/B queued (`ord-` runs).
+- **Pinned guest registers** (`LB_PINNED_REGS`, off by default): the eight guest registers live in x21–x28
+  as global register variables, generated code built with `-ffixed-x21 … -ffixed-x28`, the runtime enters
+  lifted code through an assembly trampoline (`rt_enter_guest`). Removes the entry loads, spills and reloads
+  between lifted functions. **Does not work yet.** Two bugs found and fixed, both from the compiler taking
+  x21–x28 as preserved across calls (they are callee-saved in the host convention): a repeated register
+  write after a call was dropped (fixed with an empty asm clobber after every call, `REGS_CHANGED`), and
+  the marker for indirect calls sat after a branch join. It still crashes at the same point every run
+  (`f_A50D50` reached with a null `this`, from `f_C686D0`); the unpinned build from the same generated code
+  boots. Diagnosis continues; `LB_TRACE_ENTRY` (per-thread function-entry trace) was added for it, but heap
+  addresses differ between runs, so traces diverge for innocent reasons within a few hundred calls.
+  Later the same night:
+  - Every call form in the generated code was checked to be followed by the right hand-over, and no host
+    code in the Skyrim build calls lifted code except through `rt_enter_guest`.
+  - With **all** generated code at `-O0` the pinned build boots (3 of 3); fully optimised it crashes (3 of 3).
+    So it is tied to optimisation, not to the hand-over design.
+  - Bisecting by file and then by function (linking `-O0` and `-O2` objects together, `#pragma clang optimize
+    off` per function) did **not** converge: the same mixed binary crashed three times and, minutes later,
+    booted. It pointed at `f_918B10` in `exe_26.c`, whose optimised machine code I read against the C line
+    by line and found correct. `-O1`, `-fno-inline`, `-fno-optimize-sibling-calls` and disabling AArch64
+    redundant-copy elimination don't change the full-file result.
+  - So either there are several miscompiled functions on paths the game takes at random, or the failure
+    depends on timing or on values that differ between runs. Not resolved. `LB_PINNED_CHECK` (registers and
+    CPU struct compared at every entry and return) is in the prelude, untried.
+  - Next steps when picked up: a deterministic start (fixed seed, no intro video) so bisection is
+    trustworthy; `tools/difftest.py` built in pinned mode; a 10-run tally per configuration.
+
+Ruled out tonight, with reasons: box64's CALL/RET optimisation (ours are already host calls), using the host
+stack pointer for `esp` (−2.4% instructions statically, not worth the risk), the hardware TSO bit (not
+available to ordinary processes), a newer MoltenVK (nothing relevant), a DXVK upgrade (see above).
+
+Bug in the batch itself: the stage scripts waited on each other with `grep "a\|b"`, which macOS's grep
+doesn't treat as alternation, so stages 2–5 sat idle from 01:20 to 02:36 before I noticed and restarted them.
+The `cs-`, `async-` and `cold-` runs made between 02:51 and 03:56 are **not usable**: the pinned-register
+bisection (compiles, links and test runs, even at background priority) ran alongside and the baseline read
+18–23 ms where stage 1 read 12–14. The queue was stopped and restarted at 04:20 with nothing else running.
+
+### Clean rerun, 04:30–07:07 (nothing else running; `audiomxd` still at ~110% throughout)
+
+Work time per frame in ms, mean of runs (per-run values in `bench-results`, labels `cs-`, `async-`, `cold-`, `ord-`).
+
+| Comparison | Scenario | Baseline | Variant | Verdict |
+|---|---|---|---|---|
+| DXVK lock fix (`perf-cs`), 4 pairs | boss fight overall | 21.55 | 20.86 | within noise (runs 17.6–22.3; one fast outlier carries the mean) |
+| DXVK lock fix, 1 pair | Whiterun overall | 14.94 | 14.92 | no change |
+| `DXVK_ASYNC=1`, warm cache, 3 runs | boss fight overall | 21.55 | 22.36 | no gain |
+| Async vs sync, cold cache, 3 pairs | boss fight overall | 21.19 | 21.69 | no change; frames over 50 ms 23 → 19 (weak) |
+| Order file (`perf-order`), 4 pairs | Whiterun overall | 13.76 | 14.50 | no gain, possibly worse (two runs with extra hitches) |
+| Order file, 3 pairs | boss fight overall | 22.85 | 24.57 | no gain (one run with 77 frames over 50 ms) |
+| Order file, 2 pairs, ultra | Whiterun overall | 15.45 | 16.09 | no gain |
+
+None of the three helps on the Mac. The cold-cache async signal from the discarded data (17.9 vs 23.2 ms) did
+not reproduce. The order file is dropped; the DXVK lock fix is harmless and stays as a correctness-neutral
+change only if the maintainer wants it; `DXVK_ASYNC` stays off. Of the overnight work, only the profile-guided
+build (−5 to −8% in Whiterun) measured as a gain.
+
+## 2026-11-11 (morning) — pinned guest registers: boots, and the first A/B
+
+**Cause of the crash.** Three LLVM code-generation passes miscompile code that writes the reserved registers
+x21–x28. Found by bisecting compiler passes over the whole build (the same flags for all generated code),
+which, unlike mixing `-O0` and `-O2` objects, gave the same answer every run:
+
+| Generated code built with | Boots to frame 200 |
+|---|---|
+| `-O0` | 3/3 |
+| `-O2` | 0/3 |
+| IR optimiser off (`-Xclang -disable-llvm-passes`), `-O2` code generation | 0/3 |
+| the same, plus every optional machine pass off | 3/3 |
+| the same, plus only `-disable-postra-machine-licm` | 2/2 |
+| `-O2`, `-disable-postra-machine-licm` | 0/4 |
+| `-O2`, every optional machine pass off | 2/2 |
+| `-O2`, `-disable-postra-machine-licm -disable-early-ifcvt -aarch64-enable-ccmp=false` | 2/2, then 5/5 |
+| the same without either of the last two | 0/2 each |
+
+All three move or speculate instructions (hoisting out of loops, turning branches into conditional selects
+and conditional compares). The likely mechanism is that they treat a write to a reserved register as free to
+move, because reserved registers are not tracked as live; **not confirmed in the assembly**. Register
+allocator choice, coalescing, scheduling and copy propagation were tried and are not the cause. The three
+flags are now set by `LB_PINNED_REGS` in `macos/CMakeLists.txt`. Their cost applies to all generated code and
+is included in the numbers below.
+
+**A/B**, `perf-pin` against `perf-x87` (which lacks only the DXVK lock change, measured as noise), alternating
+runs, work ms/frame, overall mean. `audiomxd` was still busy.
+
+| Scenario | Baseline runs | Pinned runs | Mean | Pairs won |
+|---|---|---|---|---|
+| Whiterun market | 14.22, 14.18, 14.86, 12.50 | 13.79, 12.94, 11.35, 11.51 | 13.94 → 12.40 (−11%) | 4/4 |
+| Whiterun, very high preset | 14.01, 12.71 | 11.53, 11.64 | 13.36 → 11.59 (−13%) | 2/2 |
+| Boss fight | 17.76, 18.00, 20.82 | 17.06, 18.37, 20.15 | 18.86 → 18.53 (−2%) | 2/3 |
+| Riverwood walk | 19.66 | 19.22 | −2% | 1/1 |
+
+Verdict: **a real gain in Whiterun, size uncertain.** Every Whiterun pair favours the pinned build (6 of 6),
+but the ranges overlap and both builds drift by 2 ms between runs, so read it as "probably 5–10%", not 11%.
+Boss fight and Riverwood are within noise. All ten pinned runs ran to their exit frame, the first full-length
+runs of this build. Not tested: the headset, long play sessions, saves made under one build and loaded under
+the other, and pinned together with PGO.

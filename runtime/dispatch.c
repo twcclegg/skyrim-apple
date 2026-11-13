@@ -164,6 +164,45 @@ void rt_watchdog_start(void) {
     pthread_detach(th);
 }
 
+/* Runs a lifted function from host code. With pinned guest registers (LB_PINNED, see lift_prelude.h) lifted
+ * code expects the registers in x21-x28 and leaves its results there, and it doesn't preserve them, so this
+ * saves the host's values, loads the registers from the CPU struct, and writes them back afterwards. */
+#if defined(LB_PINNED) && defined(__aarch64__)
+_Static_assert(offsetof(CPU, r) == 0, "rt_enter_guest reads the registers at the start of CPU");
+__attribute__((naked, noinline)) static void rt_enter_guest(CPU *c, GuestFn fn) {
+    __asm__("stp x29, x30, [sp, #-96]!\n"
+            "mov x29, sp\n"
+            "stp x19, x20, [sp, #16]\n"
+            "stp x21, x22, [sp, #32]\n"
+            "stp x23, x24, [sp, #48]\n"
+            "stp x25, x26, [sp, #64]\n"
+            "stp x27, x28, [sp, #80]\n"
+            "mov x19, x0\n"
+            "ldp w21, w22, [x0]\n"
+            "ldp w23, w24, [x0, #8]\n"
+            "ldp w25, w26, [x0, #16]\n"
+            "ldp w27, w28, [x0, #24]\n"
+            "blr x1\n"
+            "stp w21, w22, [x19]\n"
+            "stp w23, w24, [x19, #8]\n"
+            "stp w25, w26, [x19, #16]\n"
+            "stp w27, w28, [x19, #24]\n"
+            "ldp x19, x20, [sp, #16]\n"
+            "ldp x21, x22, [sp, #32]\n"
+            "ldp x23, x24, [sp, #48]\n"
+            "ldp x25, x26, [sp, #64]\n"
+            "ldp x27, x28, [sp, #80]\n"
+            "ldp x29, x30, [sp], #96\n"
+            "ret\n");
+}
+#else
+static inline void rt_enter_guest(CPU *c, GuestFn fn) { fn(c); }
+#endif
+
+/* For host code that calls a lifted function it holds a pointer to (a host replacement calling the guest
+ * body it replaced): the registers are taken from and returned to the CPU struct. */
+void rt_host_call_guest(CPU *c, GuestFn fn) { rt_enter_guest(c, fn); }
+
 void rt_call(CPU *c, uint32_t t) {
     if (t >= GUEST_THUNK_BASE) {
         uint32_t i = (t - GUEST_THUNK_BASE) / 4;
@@ -188,7 +227,7 @@ void rt_call(CPU *c, uint32_t t) {
         }
         rt_fatal("no recompiled code at %08x (return address %08x)", t, ret);
     }
-    fn(c);
+    rt_enter_guest(c, fn);
 }
 
 /* Indirect call from recompiled code with a per-call-site cache: remember the
@@ -199,11 +238,20 @@ void rt_call_ic(CPU *c, uint32_t t, const FnEntry **cache) {
         const FnEntry *e = lookup_entry(t);
         if (e) {
             __atomic_store_n(cache, e, __ATOMIC_RELAXED);
-            e->fn(c);
+            rt_enter_guest(c, e->fn);
             return;
         }
     }
     rt_call(c, t);
+}
+
+/* The lookup half of rt_call_ic, for call sites that then call the entry themselves (a lifted function
+ * can be called straight from lifted code; anything else goes through rt_call). */
+const FnEntry *rt_ic_lookup(uint32_t t, const FnEntry **cache) {
+    if (t >= GUEST_THUNK_BASE) return NULL;
+    const FnEntry *e = lookup_entry(t);
+    if (e) __atomic_store_n(cache, e, __ATOMIC_RELAXED);
+    return e;
 }
 
 uint32_t rt_invoke(CPU *c, uint32_t fn, int nargs, const uint32_t *args) {
