@@ -378,6 +378,7 @@ final class ImmersiveCompositor: @unchecked Sendable {
 
         var game = skyrim_immersive_frame()
         let hasImage = skyrim_immersive_acquire(&game) == 1
+        skyrim_display_tick()
         // An integer so the completion handler can carry it across threads.
         let retiredState = game.retired != 0 ? UInt(bitPattern: game.retired_state) : 0
         let retiredSlot = game.retired_slot
