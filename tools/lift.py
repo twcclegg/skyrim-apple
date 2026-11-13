@@ -234,6 +234,44 @@ class Unsupported(Exception):
     pass
 
 
+# Plain heap accesses in loop-free functions (LIFT_PLAIN_ACYCLIC=1; off by default). Guest memory other
+# threads can see is read and written through TL/TS, which in the default arm64 build are volatile so the
+# compiler cannot hoist a flag test out of a spin loop or drop a re-read. A function with no cycle in its
+# blocks and no tail jump into lifted code cannot spin within itself, so there its accesses use PL/PS:
+# plain loads and stores the compiler may forward, merge or drop where it can prove them redundant. A loop
+# that calls such a function still stores its return address on every iteration, which keeps the loads in
+# the inlined callee from being hoisted. Hardware ordering is unchanged: the default build was already not
+# x86-ordered, and with -DLB_STRICT_ORDER PL/PS are TL/TS again. See docs/HEAP_ACCESSES.md.
+# LIFT_PLAIN_ACYCLIC=all applies it to every function: a deliberately wrong build for testing.
+PLAIN_ACYCLIC = os.environ.get("LIFT_PLAIN_ACYCLIC", "0")
+
+
+def loop_free(fa, blocks, all_funcs):
+    """No cycle among the function's blocks, no computed jump without a table, no tail jump to lifted code."""
+    ir = stackslots.frame_ir(fa, blocks)
+    if ir is None or ir.wild or any(t is not None and t in all_funcs for t in ir.tails):
+        return False
+    succ = {a: s for a, (_, s) in ir.blocks.items()}
+    state = {}
+    for root in succ:
+        if root in state:
+            continue
+        stack = [(root, iter(succ[root]))]
+        state[root] = 1
+        while stack:
+            a, it = stack[-1]
+            nxt = next(it, None)
+            if nxt is None:
+                state[a] = 2
+                stack.pop()
+            elif state.get(nxt) == 1:
+                return False
+            elif nxt not in state:
+                state[nxt] = 1
+                stack.append((nxt, iter(succ.get(nxt, ()))))
+    return True
+
+
 # Stack slots as C locals (LIFT_SLOTS=1; off by default). In the plain translation every [esp+N] or [ebp-N]
 # operand, push and pop is a load or store in guest memory, which no later guest store lets the compiler
 # forward or drop. With this on, functions whose stack address never leaves them (tools/stackslots.py) keep
@@ -284,6 +322,7 @@ class Lifter:
         self.rec = None     # first pass: the record of stack accesses that classify() works from
         self.prom = {}      # frame offset of each promoted byte -> (cell offset, cell size, C name)
         self.cur_block = None
+        self.plain_heap = PLAIN_ACYCLIC == "all" or (PLAIN_ACYCLIC == "1" and loop_free(fstart, blocks, all_funcs))
         self._simple = 0
         self._pend = []     # stack operands addr() handed out for this instruction outside get/set
         self.frame = False
@@ -526,7 +565,7 @@ class Lifter:
                 self._simple -= 1
                 return self.slot_rd(c, off, size, a) if c else self.mem(size, a)
             if TSO and size in (1, 2, 4) and not stack_op(i, op, self.frame):
-                return "TL%d(%s)" % (size * 8, self.addr(i, op))
+                return "%s%d(%s)" % ("PL" if self.plain_heap else "TL", size * 8, self.addr(i, op))
             return self.mem(size, self.addr(i, op))
         raise Unsupported("operand")
 
@@ -547,7 +586,8 @@ class Lifter:
                     return self.slot_wr(c, off, op.size, a, e)
                 return "%s = (%s)(%s);" % (self.mem(op.size, a), UT[op.size], e)
             if TSO and op.size in (1, 2, 4) and not stack_op(i, op, self.frame):
-                return "TS%d(%s, (%s)(%s));" % (op.size * 8, self.addr(i, op), UT[op.size], e)
+                return "%s%d(%s, (%s)(%s));" % ("PS" if self.plain_heap else "TS", op.size * 8, self.addr(i, op),
+                                                UT[op.size], e)
             return "%s = (%s)(%s);" % (self.mem(op.size, self.addr(i, op)), UT[op.size], e)
         raise Unsupported("set operand")
 
