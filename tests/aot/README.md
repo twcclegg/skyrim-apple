@@ -76,7 +76,5 @@ macos/.venv/bin/python tests/aot/x86gen.py /tmp/gen 300 1 && macos/.venv/bin/pyt
   `--cc clang --native-cc gcc` if clang has no sanitiser runtime, and `--x86-cc gcc`,
   `--x86-flags=-mrtd` (callee-popped arguments), `--x86-flags=-fno-omit-frame-pointer` and the like
   to get other stack shapes from the same sources.
-- `--modes acyclic,slots-acyclic` adds builds with `LIFT_PLAIN_ACYCLIC=1` (plain heap accesses in
-  loop-free functions, `docs/HEAP_ACCESSES.md`); `x86threads.py` is its two-thread spin test.
 - `X86CORPUS_REPS=n` in the environment of a built `run-<mode>` binary repeats each call n times, for
   timing one build against another.

@@ -542,14 +542,3 @@ the other, and pinned together with PGO.
   measured on the game; Skyrim's x87 code spills floats to `[esp+N]` constantly, so this is the part most
   likely to show up there.
 
-## 2026-11-12 — plain heap accesses in loop-free functions (`LIFT_PLAIN_ACYCLIC=1`): no gain
-
-- **Hypothesis:** the default build's `volatile` heap accesses keep the compiler from merging or
-  forwarding loads; in functions that cannot spin (no cycle, no tail jump into lifted code) plain accesses
-  are just as correct.
-- **Result:** 55% of heap accesses qualify in the corpus, but arm64 instructions, loads and stores drop by
-  under 0.5%. The x86 compiler had already removed the redundancy it could see, and guest stores alias
-  everything for the host compiler too. Correct in the corpus and in a new two-thread spin test
-  (`tests/aot/x86threads.py`), which also shows the deliberately wrong "plain everywhere" build hanging.
-- **Status:** opt-in, off by default; `docs/HEAP_ACCESSES.md`. Worth one try on the game, then drop if flat.
-

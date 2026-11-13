@@ -208,8 +208,7 @@ static inline void rt_movsd(uint32_t n, uint32_t dst, uint32_t src) {
  * -DLB_STRICT_ORDER brings back x86 (TSO) ordering: load-acquire /
  * store-release on aligned addresses; an unaligned access (no ldar/stlr
  * form) is a plain access with a fence. */
-#if !defined(LB_STRICT_ORDER) && (defined(__aarch64__) || defined(LB_GUEST_VOLATILE))
-/* LB_GUEST_VOLATILE: the same volatile accesses on other hosts, for tests run there */
+#if defined(__aarch64__) && !defined(LB_STRICT_ORDER)
 #define TL8(a) (*(volatile uint8_t *)(MEM + (uint32_t)(a)))
 #define TL16(a) (*(volatile u16u *)(MEM + (uint32_t)(a)))
 #define TL32(a) (*(volatile u32u *)(MEM + (uint32_t)(a)))
@@ -235,22 +234,4 @@ TSO_PAIR(32, uint32_t, 3)
 #define TS8(a, v) (M8(a) = (v))
 #define TS16(a, v) (M16(a) = (v))
 #define TS32(a, v) (M32(a) = (v))
-#endif
-
-/* Guest memory in functions with no loop (LIFT_PLAIN_ACYCLIC=1 in tools/lift.py, docs/HEAP_ACCESSES.md):
- * plain accesses, except in the strict build, which keeps x86 ordering everywhere. */
-#ifdef LB_STRICT_ORDER
-#define PL8(a) TL8(a)
-#define PL16(a) TL16(a)
-#define PL32(a) TL32(a)
-#define PS8(a, v) TS8(a, v)
-#define PS16(a, v) TS16(a, v)
-#define PS32(a, v) TS32(a, v)
-#else
-#define PL8(a) M8(a)
-#define PL16(a) M16(a)
-#define PL32(a) M32(a)
-#define PS8(a, v) (M8(a) = (v))
-#define PS16(a, v) (M16(a) = (v))
-#define PS32(a, v) (M32(a) = (v))
 #endif
