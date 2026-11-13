@@ -276,12 +276,7 @@ MODES = {
     "slots": ({"LIFT_SLOTS": "1"}, [], False),
     "slots-check": ({"LIFT_SLOTS": "1"}, ["-DLB_SLOT_CHECK"], False),
     "slots-pinned": ({"LIFT_SLOTS": "1"}, ["-DLB_PINNED"] + PINNED, True),
-    # LIFT_PLAIN_ACYCLIC=1: plain instead of volatile heap accesses in loop-free functions. LB_GUEST_VOLATILE
-    # gives the other functions the arm64 build's volatile accesses on any host. Not in the default set.
-    "acyclic": ({"LIFT_SLOTS": "0", "LIFT_PLAIN_ACYCLIC": "1"}, ["-DLB_GUEST_VOLATILE"], False),
-    "slots-acyclic": ({"LIFT_SLOTS": "1", "LIFT_PLAIN_ACYCLIC": "1"}, ["-DLB_GUEST_VOLATILE"], False),
 }
-DEFAULT_OFF = ("acyclic", "slots-acyclic")
 
 
 def run_lifted(work, text, data, data_rva, infos, cc, modes):
@@ -396,8 +391,7 @@ def main():
     ap.add_argument("--work")
     ap.add_argument("--json")
     ap.add_argument("--levels", default="O0,O1,O2,Os")
-    ap.add_argument("--modes", default=",".join(m for m, v in MODES.items()
-                                                if (HAVE_PINNED or not v[2]) and m not in DEFAULT_OFF),
+    ap.add_argument("--modes", default=",".join(m for m, v in MODES.items() if HAVE_PINNED or not v[2]),
                     help="which lifted builds to run and compare: " + ", ".join(MODES))
     ap.add_argument("--native-cc", help="compiler for the sanitiser build of each program (default: --cc)")
     ap.add_argument("--reference", choices=("emulator", "plain"), default="emulator",
