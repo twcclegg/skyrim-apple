@@ -20,7 +20,9 @@ come from private game files).
 3. Pulls the new log and screenshots, then writes `frametimes.csv`, `summary.json` (per phase: fps, mean, median,
    p95, p99, max, frames over 33/50/250 ms, Present time), `env.json` and the device console. A screenshot
    stalls its frame for 50-300 ms (a GPU readback and two files written), so those frames are left out of the
-   statistics; `summary.json` lists them under `meta.screenshot_frames`.
+   statistics; `summary.json` lists them under `meta.screenshot_frames`. On a Mac it also records how much the
+   system swapped during the run (`meta.paging_mb`) and warns past 1 GB: with little memory, swapping can make
+   a run several times slower for no reason in the build under test.
 
 ## Scenarios
 

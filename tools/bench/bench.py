@@ -292,6 +292,19 @@ def stats(frames):
     }
 
 
+def paging_counters():
+    """macOS swap-ins, swap-outs and page-outs since boot, in MB; None where vm_stat isn't available."""
+    try:
+        out = subprocess.run(["vm_stat"], capture_output=True, text=True, timeout=10).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    page = re.search(r"page size of (\d+) bytes", out)
+    counts = {k: re.search(rf"^{k}:\s+(\d+)", out, re.M) for k in ("Swapins", "Swapouts", "Pageouts")}
+    if not page or not all(counts.values()):
+        return None
+    return {k.lower(): int(m[1]) * int(page[1]) / 2**20 for k, m in counts.items()}
+
+
 def parse_log(text, scenario=None):
     frames, shots, notes, stalled, pending = [], {}, [], {}, False
     for line in text.splitlines():
@@ -354,7 +367,11 @@ def execute(scenario, args):
     timeout = scenario["exit_frame"] / 20 + 240  # a third of real time, plus loading
     started = datetime.now(timezone.utc)
     print(f"bench: running {scenario['name']} to frame {scenario['exit_frame']} (timeout {timeout:.0f} s)")
+    paging = paging_counters() if isinstance(target, Mac) else None
     console = target.launch(env, timeout)
+    if paging:
+        after = paging_counters()
+        paging = {k: round(after[k] - v) for k, v in paging.items()} if after else None
     logs = sorted(set(target.list_files("Documents/SkyrimLogs")) - before)
     if not logs:
         fail(f"the run wrote no new log. Console:\n{console[-2000:]}")
@@ -377,6 +394,8 @@ def execute(scenario, args):
         csv.write("frame,frame_ms,present_ms,work_ms\n")
         for frame, ms, present, work in frames:
             csv.write(f"{frame},{ms},{present},{'' if work is None else work}\n")
+    if paging:
+        summary["meta"]["paging_mb"] = paging
     summary["meta"] = {**summary["meta"], "scenario": scenario["name"], "label": label, "started_utc": started.isoformat(),
                        "exited_cleanly": exited, "notes": notes[-40:], "log": logs[-1]}
     (out / "summary.json").write_text(json.dumps(summary, indent=2))
@@ -384,6 +403,9 @@ def execute(scenario, args):
     print(f"bench: results in {out}")
     if not exited:
         print("bench: WARNING the run didn't reach its exit frame; don't compare it", file=sys.stderr)
+    if paging and paging["swapins"] + paging["swapouts"] > 1024:
+        print(f"bench: WARNING the Mac swapped {paging['swapins']} MB in and {paging['swapouts']} MB out during the "
+              "run; memory pressure slows everything, so check this run before comparing it", file=sys.stderr)
     if args.baseline:
         compare(Path(args.baseline), out)
     return out
