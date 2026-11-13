@@ -7,11 +7,14 @@ uint32_t gtab[8];
 ASMFN p1(uint32_t a, uint32_t b); ASMFN p2(uint32_t a, uint32_t b); ASMFN p3(uint32_t a, uint32_t b);
 ASMFN p4(uint32_t a, uint32_t b); ASMFN p5(uint32_t a, uint32_t b); ASMFN p6(uint32_t a, uint32_t b);
 ASMFN p7(uint32_t a, uint32_t b); ASMFN p8(uint32_t a, uint32_t b); ASMFN p9(uint32_t a, uint32_t b);
+ASMFN p10(uint32_t a, uint32_t b); ASMFN p11(uint32_t a, uint32_t b);
 #ifdef __i386__
 __asm__(".intel_syntax noprefix\n"
 ".data\n"
 "vt: .long s_add, s_mul3\n"
 "vc: .long c_sub, c_neg1\n"
+"t10: .long a10_3, a10_2, a10_1, a10_0\n"
+"t11: .long a11_0, a11_1, a11_2, a11_3\n"
 ".text\n"
 "helper1: mov eax, [esp+4]\n lea eax, [eax+eax*2+1]\n mov dword ptr [esp+4], 0xDEAD\n ret\n"
 "s_add: mov eax, [esp+4]\n add eax, [esp+8]\n mov dword ptr [esp+4], 0\n mov dword ptr [esp+8], 0\n ret 8\n"
@@ -55,6 +58,18 @@ __asm__(".intel_syntax noprefix\n"
 ".globl p9\np9:\n sub esp, 12\n mov eax, [esp+16]\n mov [esp+8], eax\n mov ecx, [esp+20]\n mov [esp], ecx\n"
 " mov eax, [esp+8]\n add eax, [esp]\n mov dword ptr [gtab+20], eax\n mov ecx, [esp]\n add esp, 12\n push eax\n"
 " push ecx\n call dword ptr [vc]\n add esp, 8\n ret\n"
+/* saved registers, then a jump table indexed from its end by a negated count (the CRT's
+ * backward memmove); the blocks it reaches pop the saved registers */
+".globl p10\np10:\n push esi\n push edi\n mov esi, [esp+12]\n mov edi, [esp+16]\n mov ecx, esi\n and ecx, 7\n"
+" cmp ecx, 4\n jb 1f\n mov ecx, 3\n1: neg ecx\n jmp dword ptr [ecx*4 + t10 + 12]\n"
+"a10_0: lea eax, [esi+edi]\n jmp 9f\na10_1: lea eax, [esi+edi*2]\n jmp 9f\na10_2: mov eax, esi\n sub eax, edi\n jmp 9f\n"
+"a10_3: mov eax, edi\n xor eax, esi\n9: add eax, esi\n pop edi\n pop esi\n ret\n"
+/* the same with a table indexed from one: its last entry is past what a bound of four finds, so that block
+ * is a function of its own and is entered with this frame still up */
+".globl p11\np11:\n push esi\n push edi\n mov esi, [esp+12]\n mov edi, [esp+16]\n mov ecx, edi\n and ecx, 3\n"
+" inc ecx\n jmp dword ptr [ecx*4 + t11 - 4]\n"
+"a11_0: lea eax, [esi+edi]\n jmp 9f\na11_1: lea eax, [esi+edi*2]\n jmp 9f\na11_2: mov eax, esi\n sub eax, edi\n jmp 9f\n"
+"a11_3: mov eax, edi\n xor eax, esi\n pop edi\n pop esi\n ret\n9: add eax, esi\n pop edi\n pop esi\n ret\n"
 ".att_syntax\n");
 #else
 ASMFN p1(uint32_t a, uint32_t b) { uint32_t local = a, t = b * 3 + 1 + local; gtab[1] = t; local += b; return local; }
@@ -70,6 +85,14 @@ ASMFN p6(uint32_t a, uint32_t b) { return ~b + (a - b); }
 ASMFN p7(uint32_t a, uint32_t b) { return (a + b) * 3 + 1 + 0xDEAD; }
 ASMFN p8(uint32_t a, uint32_t b) { gtab[4] = a + b; return b + (a + b); }
 ASMFN p9(uint32_t a, uint32_t b) { gtab[5] = a + b; return b - (a + b); }
+ASMFN p10(uint32_t a, uint32_t b) {
+    uint32_t k = a & 7; if (k >= 4) k = 3;
+    return (k == 0 ? a + b : k == 1 ? a + b * 2 : k == 2 ? a - b : (b ^ a)) + a;
+}
+ASMFN p11(uint32_t a, uint32_t b) {
+    uint32_t k = b & 3;
+    return k == 0 ? a + b + a : k == 1 ? a + b * 2 + a : k == 2 ? a - b + a : (b ^ a);
+}
 #endif
 
 __attribute__((noinline)) static uint32_t fold(uint32_t h, uint32_t v) { return (h ^ v) * 16777619u; }
@@ -78,6 +101,7 @@ __attribute__((noinline)) static uint32_t all(uint32_t a, uint32_t b) {
     h = fold(h, p1(a, b)); h = fold(h, p2(a, b)); h = fold(h, p3(a, b)); h = fold(h, p4(a, b));
     h = fold(h, p5(a, b)); h = fold(h, p6(a, b)); h = fold(h, p7(a, b));
     h = fold(h, p8(a, b)); h = fold(h, p9(a, b));
+    h = fold(h, p10(a, b)); h = fold(h, p11(a, b));
     return h;
 }
 
