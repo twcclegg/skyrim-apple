@@ -20,6 +20,8 @@ bool bc_surface_target(void *surf, void **tex, uint32_t *sub);
 #include <mutex>
 #include <thread>
 #include <chrono>
+#include <cmath>
+#include <condition_variable>
 #include <unordered_map>
 #include <vector>
 #include <map>
@@ -584,12 +586,52 @@ static void shot_before_present(IDirect3DDevice9 *d) {
 // sleeps while holding the D3D9 device lock, which stalled Skyrim's main-thread
 // loading behind the loading-screen thread's presents; pace here instead, after
 // Present has returned and no DXVK lock is held. LB_MAX_FPS overrides, 0 = off.
+//
+// Display ticks: in immersive play the visionOS compositor calls skyrim_display_tick() once per display refresh,
+// right after taking the newest finished game frame. While ticks arrive and the frame rate asked for is the refresh
+// rate divided by a whole number (LB_MAX_FPS=45 at 90 Hz: every second refresh), the game is released on those
+// ticks instead of by its own clock. Each frame then starts at the same point of the display's cycle, and one that
+// is finished in time is shown for exactly that many refreshes, rather than sometimes one and sometimes three as
+// two unsynchronised clocks drift past each other. A frame that runs late is released at once, and counting
+// restarts from its tick.
+static std::mutex g_tick_lock;
+static std::condition_variable g_tick_cv;
+static uint64_t g_ticks;
+static int64_t g_tick_ns, g_tick_period_ns;
+
+static int64_t pace_now_ns(void) {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+extern "C" void skyrim_display_tick(void) {
+    const int64_t now = pace_now_ns();
+    {
+        std::lock_guard<std::mutex> guard(g_tick_lock);
+        const int64_t gap = now - g_tick_ns;
+        if (g_tick_ns && gap > 0 && gap < 50000000)
+            g_tick_period_ns = g_tick_period_ns ? (g_tick_period_ns * 15 + gap) / 16 : gap;
+        g_tick_ns = now;
+        g_ticks++;
+    }
+    g_tick_cv.notify_all();
+}
+
+// Refreshes per game frame when pacing on display ticks, else 0 (no recent ticks, or no whole-number ratio).
+static int ticks_per_frame(int64_t interval_ns, int64_t now) {
+    if (!g_tick_period_ns || now - g_tick_ns > 100000000) return 0;
+    const double ratio = (double)interval_ns / (double)g_tick_period_ns;
+    const long n = std::lround(ratio);
+    return n >= 1 && std::fabs(ratio - (double)n) < 0.15 ? (int)n : 0;
+}
+
 static void pace_present(void) {
     static std::mutex lock;
     static int64_t interval_ns = -1, next_ns = 0;
+    static uint64_t released_tick;
+    static int last_mode = -1;
     int64_t wait_ns;
     {
-        std::lock_guard<std::mutex> guard(lock);
+        std::unique_lock<std::mutex> guard(lock);
         if (interval_ns < 0) {
             const char *e = getenv("LB_MAX_FPS");
             int fps = e ? atoi(e) : 60;
@@ -597,8 +639,33 @@ static void pace_present(void) {
             LOG("present pacing: %s %d fps (LB_MAX_FPS)", fps > 0 ? "at most" : "off,", fps > 0 ? fps : 0);
         }
         if (!interval_ns) return;
-        const int64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::steady_clock::now().time_since_epoch()).count();
+        const int64_t now = pace_now_ns();
+        std::unique_lock<std::mutex> ticks(g_tick_lock);
+        const int per = ticks_per_frame(interval_ns, now);
+        if (per != last_mode) {
+            if (per) LOG("present pacing: on display ticks, every %d refreshes", per);
+            else if (last_mode > 0) LOG("present pacing: display ticks stopped, back to the timer");
+            last_mode = per;
+            released_tick = g_ticks;
+        }
+        if (per) {
+            const uint64_t target = released_tick + (uint64_t)per;
+            next_ns = 0;
+            guard.unlock();  // only the tick lock is held while waiting
+            if (g_ticks < target) {
+                const auto before = std::chrono::steady_clock::now();
+                // The deadline covers a compositor that stops ticking mid-wait.
+                g_tick_cv.wait_for(ticks, std::chrono::nanoseconds((per + 2) * g_tick_period_ns),
+                                   [&] { return g_ticks >= target; });
+                platform_present_slept(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - before).count());
+            }
+            const uint64_t now_tick = g_ticks;
+            ticks.unlock();
+            guard.lock();
+            released_tick = now_tick;
+            return;
+        }
+        ticks.unlock();
         const int64_t slot = next_ns > now ? next_ns : now;  // no catch-up bursts after stalls
         next_ns = slot + interval_ns;
         wait_ns = slot - now;

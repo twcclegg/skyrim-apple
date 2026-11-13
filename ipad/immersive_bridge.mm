@@ -10,6 +10,7 @@
 #define VK_USE_PLATFORM_METAL_EXT 1
 #import <Metal/Metal.h>
 #include <vulkan/vulkan.h>
+#include <atomic>
 #include <mutex>
 #include <stdio.h>
 #include <string.h>
@@ -58,6 +59,7 @@ bool g_active;
 
 /* Compositor thread only. */
 Entry g_shown;
+std::atomic<uint32_t> g_mailbox_drops;  /* frames pushed out of a full mailbox by the game thread */
 void *g_cache_state;
 std::unordered_map<uint64_t, Cached> g_cache;
 std::unordered_map<uint64_t, id<MTLTexture>> g_depth_cache;  /* R32Float, sampled as it is */
@@ -89,6 +91,7 @@ void on_frame(void *, const dxvk_present_tap_frame *frame) {
             } else if (!g_mailbox[1].valid) {
                 std::swap(drop, g_mailbox[1]);
             } else {
+                g_mailbox_drops.fetch_add(1, std::memory_order_relaxed);
                 std::swap(drop, g_mailbox[0]);     /* drop = oldest, [0] = new */
                 std::swap(g_mailbox[0], g_mailbox[1]);
             }
@@ -179,6 +182,32 @@ extern "C" void skyrim_immersive_stop(void) {
 
 extern "C" void skyrim_immersive_release(void *state, uint32_t slot) { dxvk_present_tap_release(state, slot); }
 
+namespace {
+/* Display cadence: for each game frame, how many compositor refreshes it stayed on screen, and how many frames
+ * were replaced before being shown. Logged every 900 refreshes (10 s at 90 Hz); an even 45 fps at 90 Hz shows as
+ * nearly every frame held for 2. */
+struct Cadence { uint32_t refreshes, held, hist[5], skipped; };
+Cadence g_cadence;
+
+void cadence_refresh(bool fresh, int skipped) {
+    Cadence &c = g_cadence;
+    if (fresh) {
+        if (c.held) c.hist[c.held < 4 ? c.held : 4]++;
+        c.held = 0;
+    }
+    c.held += fresh || g_shown.valid ? 1 : 0;
+    c.skipped += (uint32_t)skipped + g_mailbox_drops.exchange(0, std::memory_order_relaxed);
+    if (++c.refreshes < 900) return;
+    uint32_t frames = c.hist[1] + c.hist[2] + c.hist[3] + c.hist[4];
+    if (frames)
+        fprintf(stderr, "immersive cadence: %u game frames over %u refreshes; held 1: %u, 2: %u, 3: %u, 4+: %u; "
+                "replaced unseen: %u\n", frames, c.refreshes, c.hist[1], c.hist[2], c.hist[3], c.hist[4], c.skipped);
+    uint32_t held = c.held;
+    c = Cadence();
+    c.held = held;
+}
+}  // namespace
+
 extern "C" int skyrim_immersive_acquire(skyrim_immersive_frame *out) {
     *out = skyrim_immersive_frame();
     Entry taken, skipped;
@@ -193,6 +222,7 @@ extern "C" int skyrim_immersive_acquire(skyrim_immersive_frame *out) {
         }
     }
     if (skipped.valid) dxvk_present_tap_release(skipped.state, skipped.slot);
+    cadence_refresh(taken.valid, skipped.valid ? 1 : 0);
     if (taken.valid) {
         if (g_shown.valid) {
             out->retired = 1;

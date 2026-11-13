@@ -46,6 +46,9 @@ void skyrim_immersive_start(void);
 void skyrim_immersive_stop(void);
 int skyrim_immersive_acquire(skyrim_immersive_frame *out);
 void skyrim_immersive_release(void *state, uint32_t slot);
+/* runtime/d3d9_bridge.cpp: once per display refresh, after skyrim_immersive_acquire. With LB_MAX_FPS at the refresh
+ * rate divided by a whole number (45 at 90 Hz), the game paces its frames on these ticks instead of its own clock. */
+void skyrim_display_tick(void);
 /* runtime/platform_sdl.c head steering: the head's yaw (clockwise) and pitch (up) in radians relative to its
  * starting direction, from the compositor thread; on = 0 stops steering. */
 void skyrim_head_set(float yaw, float pitch, int on);
