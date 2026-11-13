@@ -260,6 +260,11 @@ HOST_OVERRIDES_SKYRIM = {
 # LIFT_GAME=marvel|skyrim selects the overrides (runtime built with -DGAME_MARVEL / -DGAME_SKYRIM).
 HOST_OVERRIDES = {"marvel": HOST_OVERRIDES_MARVEL, "skyrim": HOST_OVERRIDES_SKYRIM}.get(
     os.environ.get("LIFT_GAME"), HOST_OVERRIDES_BATMAN)
+# LIFT_HOST_OVERRIDES=<hex address>,... adds host replacements in the module being lifted (for tests).
+if os.environ.get("LIFT_HOST_OVERRIDES"):
+    HOST_OVERRIDES = dict(HOST_OVERRIDES)
+    HOST_OVERRIDES[MOD] = set(HOST_OVERRIDES.get(MOD, ())) | {
+        int(a, 16) for a in os.environ["LIFT_HOST_OVERRIDES"].split(",") if a}
 
 
 class Lifter:
@@ -1226,8 +1231,13 @@ class Lifter:
     # ---------------- function ----------------
     def emit(self):
         o = self.out
-        # A function replaced by host code keeps its guest body as f_X_guest.
-        o.append("void f_%X%s(CPU *c) {" % (self.f, "_guest" if self.f in HOST_OVERRIDES.get(MOD, ()) else ""))
+        # A function replaced by host code keeps its guest body, which the replacement may call as
+        # f_X_guest. GUEST_BODY names the lifted body; GUEST_BODY_FOR_HOST (after it) makes f_X_guest
+        # callable from host code when lifted code has its own register convention.
+        if self.f in HOST_OVERRIDES.get(MOD, ()):
+            o.append("void GUEST_BODY(f_%X)(CPU *c) {" % self.f)
+        else:
+            o.append("void f_%X(CPU *c) {" % self.f)
         o.append("    GUEST_REGS;")
         o.append("    Flags f = {0};")
         o.append("    uint32_t jt_ = 0;")
@@ -1295,6 +1305,7 @@ class Lifter:
         if self.f in HOST_OVERRIDES.get(MOD, ()):
             # the table's entry for a host replacement: callable like a lifted function
             o.append("")
+            o.append("GUEST_BODY_FOR_HOST(f_%X)" % self.f)
             o.append("void f_%X_entry(CPU *c) { HOST_ENTRY(f_%X); }" % (self.f, self.f))
         return o
 
