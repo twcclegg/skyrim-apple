@@ -112,6 +112,36 @@ static const char *ini_find(IniFile *f, const char *sec, const char *key) {
     return NULL;
 }
 
+/* LB_INI="Section:key=value;Section:key=value": values the game reads instead of its INI files' (any of them), for
+ * benchmarking one setting at a time without editing the player's files. Each override is logged once, when the
+ * game first reads it. */
+#define INI_OVERRIDES 32
+static struct { char sec[64], key[64], val[64]; int logged; } g_ini_over[INI_OVERRIDES];
+static int g_ini_nover = -1;
+static const char *ini_override(const char *sec, const char *key) {
+    if (g_ini_nover < 0) {
+        g_ini_nover = 0;
+        const char *e = getenv("LB_INI");
+        while (e && *e && g_ini_nover < INI_OVERRIDES) {
+            const char *end = strchr(e, ';'), *colon = strchr(e, ':'), *eq = strchr(e, '=');
+            if (!end) end = e + strlen(e);
+            if (colon && eq && colon < eq && eq < end) {
+                snprintf(g_ini_over[g_ini_nover].sec, 64, "%.*s", (int)(colon - e), e);
+                snprintf(g_ini_over[g_ini_nover].key, 64, "%.*s", (int)(eq - colon - 1), colon + 1);
+                snprintf(g_ini_over[g_ini_nover].val, 64, "%.*s", (int)(end - eq - 1), eq + 1);
+                g_ini_nover++;
+            }
+            e = *end ? end + 1 : end;
+        }
+    }
+    for (int i = 0; i < g_ini_nover; i++)
+        if (!strcasecmp(g_ini_over[i].sec, sec) && !strcasecmp(g_ini_over[i].key, key)) {
+            if (!g_ini_over[i].logged++) LOG("ini: LB_INI sets [%s] %s=%s", sec, key, g_ini_over[i].val);
+            return g_ini_over[i].val;
+        }
+    return NULL;
+}
+
 /* Copies a double-NUL list or a string into a guest buffer, Windows style:
  * returns chars written excluding the final NUL; truncates to size-1 (or
  * size-2 for lists). */
@@ -161,7 +191,8 @@ SHIM(GetPrivateProfileStringA) {
         r = put_str(buf, size, tmp, len + 1, 1);
         free(tmp);
     } else {
-        const char *v = f ? ini_find(f, app, key) : NULL;
+        const char *v = ini_override(app, key);
+        if (!v) v = f ? ini_find(f, app, key) : NULL;
         if (!v) v = def ? def : "";
         r = put_str(buf, size, v, strlen(v), 0);
     }
@@ -173,7 +204,8 @@ SHIM(GetPrivateProfileStringA) {
 SHIM(GetPrivateProfileIntA) {
     pthread_mutex_lock(&g_ini_lock);
     IniFile *f = ini_get(GSTR(ARG(3)));
-    const char *v = f && ARG(0) && ARG(1) ? ini_find(f, GSTR(ARG(0)), GSTR(ARG(1))) : NULL;
+    const char *v = ARG(0) && ARG(1) ? ini_override(GSTR(ARG(0)), GSTR(ARG(1))) : NULL;
+    if (!v) v = f && ARG(0) && ARG(1) ? ini_find(f, GSTR(ARG(0)), GSTR(ARG(1))) : NULL;
     uint32_t r = v ? (uint32_t)strtol(v, NULL, 10) : ARG(2);
     pthread_mutex_unlock(&g_ini_lock);
     RET(r, 4);
