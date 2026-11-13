@@ -1549,7 +1549,12 @@ class Lifter:
         if self.need_dispatch:
             cases = " ".join("case 0x%Xu: goto L_%X;" % (b, b) for b in sorted(self.block_starts))
             o.append("L_dispatch:")
-            o.append("    switch (jt_) { %s default: %s rt_call(c, jt_); %s return; }" % (cases, SPILL_RT, RELOAD_RT))
+            # A table entry that is not one of this function's blocks leaves the function with its frame still
+            # up, and the code it lands in reads that frame from guest memory (the CRT's memmove ends this
+            # way): put the promoted cells there first.
+            flush = "".join("M%d(fb_ + (uint32_t)(%d)) = %s; " % (n * 8, lo, name)
+                            for lo, n, name in sorted(set(self.prom.values())))
+            o.append("    switch (jt_) { %s default: %s%s rt_call(c, jt_); %s return; }" % (cases, flush, SPILL_RT, RELOAD_RT))
         o.append("}")
         if xc and xc.used:
             o[:] = [l.replace(SPILL, "SPILLF();").replace(RELOAD, "RELOADF();")
