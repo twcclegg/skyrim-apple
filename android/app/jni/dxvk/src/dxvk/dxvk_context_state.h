@@ -100,6 +100,22 @@ namespace dxvk {
   };
 
 
+  /**
+   * \brief Rate map for a render pass (private extension)
+   *
+   * Chained to VkRenderPassBeginInfo. Read by MoltenVK with the patch in
+   * docs/handoff/foveated-render.md, which sets the map on the Metal render
+   * pass descriptor. The same layout and number are in that patch.
+   */
+  struct DxvkFoveationRateMapInfo {
+    static constexpr VkStructureType StructureType = VkStructureType(1000999001);
+
+    VkStructureType sType;
+    const void*     pNext;
+    void*           mtlRasterizationRateMap;  // id<MTLRasterizationRateMap>
+  };
+
+
   struct DxvkOutputMergerState {
     std::array<VkClearValue, MaxNumRenderTargets + 1> clearValues = { };
     

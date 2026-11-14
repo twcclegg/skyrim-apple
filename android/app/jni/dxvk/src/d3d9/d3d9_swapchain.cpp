@@ -6,6 +6,20 @@
 #include "d3d9_monitor.h"
 
 #include "d3d9_hud.h"
+#include "d3d9_foveation.h"
+
+#include <mutex>
+
+#include "skyrim_foveation.h"
+
+namespace {
+  std::atomic<skyrim_foveation_provider_fn> g_foveationProviderFn   = { nullptr };
+  std::atomic<void*>                        g_foveationProviderUser = { nullptr };
+  std::mutex                                g_foveationCurrentMutex;
+  skyrim_foveation_map                      g_foveationCurrent      = { };
+  bool                                      g_foveationCurrentOn    = false;
+  skyrim_foveation_counts                   g_foveationLastFrame    = { };
+}
 
 #if defined(__APPLE__)
 #include "skyrim_present_tap.h"
@@ -274,6 +288,8 @@ namespace dxvk {
     const RGNDATA* pDirtyRegion,
           DWORD    dwFlags) {
     D3D9DeviceLock lock = m_parent->LockDevice();
+
+    D3D9FoveationEndFrame();
 
 #ifdef __APPLE__
     // Skyrim Apple port: GPU load for the device log every ~10 s, from DXVK's own GPU idle counter (the time its
@@ -920,6 +936,16 @@ namespace dxvk {
         {  int32_t(m_srcRect.left),                    int32_t(m_srcRect.top)                    },
         { uint32_t(m_srcRect.right - m_srcRect.left), uint32_t(m_srcRect.bottom - m_srcRect.top) } };
 
+      // Foveated game render: the back buffer's image is smaller than the
+      // game's back buffer. A window shows the warped picture stretched;
+      // undoing the map is the immersive compositor's job.
+      if (unlikely(m_backBuffers[0]->GetCommonTexture()->IsFoveated())) {
+        const int32_t x1 = g_foveation.UpX(m_srcRect.right);
+        const int32_t y1 = g_foveation.UpY(m_srcRect.bottom);
+        srcRect.offset = { g_foveation.DownX(m_srcRect.left), g_foveation.DownY(m_srcRect.top) };
+        srcRect.extent = { uint32_t(std::max(x1 - srcRect.offset.x, 1)), uint32_t(std::max(y1 - srcRect.offset.y, 1)) };
+      }
+
       VkRect2D dstRect = {
         {  int32_t(m_dstRect.left),                    int32_t(m_dstRect.top)                    },
         { uint32_t(m_dstRect.right - m_dstRect.left), uint32_t(m_dstRect.bottom - m_dstRect.top) } };
@@ -1294,6 +1320,11 @@ namespace dxvk {
     desc.IsBackBuffer       = TRUE;
     desc.IsAttachmentOnly   = FALSE;
 
+    // Foveated game render: decided here, per back-buffer size, before the
+    // back buffers and everything the game creates at their size.
+    m_parent->SuspendFoveationMap();
+    D3D9ConfigureFoveation(desc.Width, desc.Height, desc.MultiSample != D3DMULTISAMPLE_NONE);
+
     for (uint32_t i = 0; i < m_backBuffers.size(); i++)
       m_backBuffers[i] = new D3D9Surface(m_parent, &desc, this);
 
@@ -1582,6 +1613,112 @@ namespace dxvk {
     return this->GetParent()->IsExtended() ? "D3D9Ex" : "D3D9";
   }
 
+
+  void D3D9ConfigureFoveation(uint32_t width, uint32_t height, bool multisampled) {
+    D3D9FoveationConfig config;
+    skyrim_foveation_map map = { width, height, 0, 0, nullptr };
+
+    if (env::getEnvVar("LB_GAME_FOVEATION") == "1") {
+      config.log = env::getEnvVar("LB_GAME_FOVEATION_LOG") == "1";
+
+      skyrim_foveation_provider_fn fn = g_foveationProviderFn.load(std::memory_order_acquire);
+      bool have = false;
+
+      if (multisampled) {
+        Logger::warn("Foveation: multisampled back buffer, left off (rate maps with MSAA are untried)");
+      } else if (fn != nullptr && fn(g_foveationProviderUser.load(std::memory_order_acquire), &map) != 0) {
+        have = true;
+      } else {
+        // No map: a plain uniform scale, to exercise the plumbing where
+        // there is no Metal (LB_GAME_FOVEATION_EMULATE=0.25..1)
+        std::string emulate = env::getEnvVar("LB_GAME_FOVEATION_EMULATE");
+        float scale = emulate.empty() ? 0.0f : std::strtof(emulate.c_str(), nullptr);
+
+        if (scale >= 0.25f && scale <= 1.0f) {
+          map.physical_width  = std::max<uint32_t>(uint32_t(float(width)  * scale + 0.5f), 1u);
+          map.physical_height = std::max<uint32_t>(uint32_t(float(height) * scale + 0.5f), 1u);
+          map.mtl_rate_map    = nullptr;
+          have = true;
+        }
+      }
+
+      if (have && map.physical_width != 0 && map.physical_height != 0) {
+        config.enabled  = true;
+        config.screen   = { width, height };
+        config.physical = { map.physical_width, map.physical_height };
+        config.rateMap  = map.mtl_rate_map;
+      } else if (!multisampled) {
+        Logger::warn("Foveation: LB_GAME_FOVEATION=1 but no map provider and no LB_GAME_FOVEATION_EMULATE, left off");
+      }
+    }
+
+    g_foveation      = config;
+    g_foveationStats = { };
+
+    { std::lock_guard<std::mutex> lock(g_foveationCurrentMutex);
+      g_foveationCurrent   = map;
+      g_foveationCurrentOn = config.enabled; }
+
+    if (config.enabled) {
+      Logger::info(str::format("Foveation: game ", width, "x", height, " rendered at ",
+        config.physical.width, "x", config.physical.height,
+        config.rateMap != nullptr ? " through a rate map" : " (uniform scale, no map)"));
+    }
+  }
+
+
+  void D3D9FoveationEndFrame() {
+    if (likely(!g_foveation.enabled))
+      return;
+
+    static uint32_t s_frame = 0;
+
+    if (g_foveation.log && (s_frame % 60) == 0) {
+      const D3D9FoveationStats& st = g_foveationStats;
+      Logger::info(str::format("Foveation frame ", s_frame,
+        ": mapped ", st.mapped, ", unmapped quads ", st.unmapped,
+        ", hazards ", st.hazards, ", tainted ", st.tainted,
+        ", mixed targets ", st.mixedTargets, ", partial clears ", st.partialClears,
+        ", partial copies ", st.partialCopies, ", mode switches ", st.modeSwitches));
+    }
+
+    {
+      std::lock_guard<std::mutex> lock(g_foveationCurrentMutex);
+      const D3D9FoveationStats& st = g_foveationStats;
+      g_foveationLastFrame = { st.mapped, st.unmapped, st.hazards, st.tainted,
+        st.mixedTargets, st.partialClears, st.partialCopies, st.modeSwitches };
+    }
+
+    g_foveationStats = { };
+    s_frame += 1;
+  }
+
+}
+
+
+extern "C" void skyrim_foveation_set_provider(skyrim_foveation_provider_fn fn, void* user) {
+  g_foveationProviderUser.store(user, std::memory_order_release);
+  g_foveationProviderFn.store(fn, std::memory_order_release);
+}
+
+
+extern "C" int skyrim_foveation_current(skyrim_foveation_map* map) {
+  std::lock_guard<std::mutex> lock(g_foveationCurrentMutex);
+
+  if (map != nullptr)
+    *map = g_foveationCurrent;
+
+  return g_foveationCurrentOn ? 1 : 0;
+}
+
+
+extern "C" int skyrim_foveation_last_frame(skyrim_foveation_counts* counts) {
+  std::lock_guard<std::mutex> lock(g_foveationCurrentMutex);
+
+  if (counts != nullptr)
+    *counts = g_foveationLastFrame;
+
+  return g_foveationCurrentOn ? 1 : 0;
 }
 
 

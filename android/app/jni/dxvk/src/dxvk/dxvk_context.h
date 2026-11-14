@@ -876,6 +876,18 @@ namespace dxvk {
             uint32_t            viewportCount,
       const VkViewport*         viewports,
       const VkRect2D*           scissorRects);
+
+    /**
+     * \brief Sets the rasterization rate map for following draws
+     *
+     * Foveating the game's own render (include/native/skyrim_foveation.h).
+     * A non-null map is passed to the driver when the render pass begins,
+     * in a private structure that only a patched MoltenVK reads. Changing
+     * it ends the current render pass.
+     * \param [in] mtlRateMap An id<MTLRasterizationRateMap>, or null
+     */
+    void setFoveationRateMap(
+            void*               mtlRateMap);
     
     /**
      * \brief Sets blend constants
@@ -1090,6 +1102,7 @@ namespace dxvk {
 
     DxvkContextFlags        m_flags;
     DxvkContextState        m_state;
+    void*                   m_foveationRateMap = nullptr;
     DxvkContextFeatures     m_features;
 
     DxvkBarrierSet          m_sdmaAcquires;

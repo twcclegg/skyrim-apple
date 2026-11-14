@@ -2504,6 +2504,17 @@ namespace dxvk {
   }
 
 
+  void DxvkContext::setFoveationRateMap(
+          void*               mtlRateMap) {
+    if (m_foveationRateMap != mtlRateMap) {
+      // The map belongs to the render pass, so the pass ends here and
+      // the next draw begins a new one (contents kept, as for any spill)
+      this->spillRenderPass(true);
+      m_foveationRateMap = mtlRateMap;
+    }
+  }
+
+
   void DxvkContext::setViewports(
           uint32_t            viewportCount,
     const VkViewport*         viewports,
@@ -4132,6 +4143,18 @@ namespace dxvk {
     info.renderArea           = renderArea;
     info.clearValueCount      = clearValueCount;
     info.pClearValues         = clearValues;
+
+    // Foveated game render: hand the Metal rate map to the driver. The
+    // structure type is private; a stock MoltenVK and other drivers skip
+    // structures they don't know. Only this render pass (the one draws go
+    // into) is ever mapped; clears, blits and copies never are.
+    DxvkFoveationRateMapInfo rateMapInfo;
+    rateMapInfo.sType                   = DxvkFoveationRateMapInfo::StructureType;
+    rateMapInfo.pNext                   = nullptr;
+    rateMapInfo.mtlRasterizationRateMap = m_foveationRateMap;
+
+    if (m_foveationRateMap != nullptr)
+      info.pNext = &rateMapInfo;
     
     m_cmd->cmdBeginRenderPass(&info,
       VK_SUBPASS_CONTENTS_INLINE);

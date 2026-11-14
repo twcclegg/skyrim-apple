@@ -853,6 +853,20 @@ namespace dxvk {
 
     void PrepareDraw(D3DPRIMITIVETYPE PrimitiveType);
 
+    /**
+     * \brief Picks how the coming draw is rasterized (foveated game render)
+     *
+     * Scene geometry into a foveated target goes through the rate map. A
+     * full-screen quad that reads warped textures runs without it, in the
+     * warped image's own pixel grid. Called before PrepareDraw.
+     */
+    void UpdateFoveationForDraw(UINT PrimitiveCount);
+
+    /**
+     * \brief Ends rate-mapped rendering before a clear or copy
+     */
+    void SuspendFoveationMap();
+
     template <DxsoProgramType ShaderStage>
     void BindShader(
       const D3D9CommonShader*                 pShaderModule,
@@ -1210,6 +1224,9 @@ namespace dxvk {
 
     uint32_t                        m_activeRTs              = 0;
     uint32_t                        m_activeRTTextures       = 0;
+    // Samplers bound to a render-target or depth-stencil texture, kept whether or not
+    // hazard tracking is compiled in: the foveation prototype looks only at these.
+    uint32_t                        m_activeTargetTextures   = 0;
     uint32_t                        m_activeDSTextures       = 0;
     uint32_t                        m_activeHazardsRT        = 0;
     uint32_t                        m_activeHazardsDS        = 0;
@@ -1232,6 +1249,9 @@ namespace dxvk {
     uint32_t                        m_lastPointMode = 0;
     uint32_t                        m_lastFetch4    = 0;
     uint32_t                        m_lastHazardsDS = 0;
+
+    D3D9FoveationMode               m_foveationMode    = D3D9FoveationMode::None;
+    void*                           m_foveationSentMap = nullptr;
     uint32_t                        m_lastSamplerTypesFF = 0;
 
     D3D9ShaderMasks                 m_vsShaderMasks = D3D9ShaderMasks();

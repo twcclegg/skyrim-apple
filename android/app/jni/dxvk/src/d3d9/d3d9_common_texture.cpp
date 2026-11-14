@@ -37,6 +37,16 @@ namespace dxvk {
     m_mapMode = DetermineMapMode();
     m_shadow  = DetermineShadowState();
 
+    // Foveated game render: single-sample, single-level render targets and
+    // depth buffers of exactly the back buffer's size get a smaller image.
+    // m_desc keeps the size the game asked for.
+    m_foveated = g_foveation.Matches(m_desc.Width, m_desc.Height)
+      && (m_desc.Usage & (D3DUSAGE_RENDERTARGET | D3DUSAGE_DEPTHSTENCIL))
+      && (ResourceType == D3DRTYPE_SURFACE || ResourceType == D3DRTYPE_TEXTURE)
+      && m_desc.MipLevels == 1
+      && m_desc.ArraySize == 1
+      && m_desc.MultiSample == D3DMULTISAMPLE_NONE;
+
     if (m_mapMode == D3D9_COMMON_TEXTURE_MAP_MODE_BACKED) {
       bool plainSurface = m_type == D3DRTYPE_SURFACE &&
                           !(m_desc.Usage & (D3DUSAGE_RENDERTARGET | D3DUSAGE_DEPTHSTENCIL));
@@ -217,8 +227,8 @@ namespace dxvk {
                               : m_mapping.FormatColor;
     imageInfo.flags           = 0;
     imageInfo.sampleCount     = VK_SAMPLE_COUNT_1_BIT;
-    imageInfo.extent.width    = m_desc.Width;
-    imageInfo.extent.height   = m_desc.Height;
+    imageInfo.extent.width    = m_foveated ? g_foveation.physical.width  : m_desc.Width;
+    imageInfo.extent.height   = m_foveated ? g_foveation.physical.height : m_desc.Height;
     imageInfo.extent.depth    = m_desc.Depth;
     imageInfo.numLayers       = m_desc.ArraySize;
     imageInfo.mipLevels       = m_desc.MipLevels;

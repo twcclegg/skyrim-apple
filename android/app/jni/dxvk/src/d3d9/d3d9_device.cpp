@@ -873,14 +873,28 @@ namespace dxvk {
     VkExtent2D dstExtent = VkExtent2D{ pitchBlocks,
                                        texLevelExtentBlockCount.height * pitchBlocks };
 
+    // Foveated source: the image is smaller than the surface the game reads
+    // it into. Copy what exists into the top-left corner, keeping the
+    // destination's row pitch (a row alignment at least as large as a row
+    // is taken as the pitch), so LB_SHOT gets the warped picture intact.
+    VkDeviceSize rowAlignment = 4;
+
+    if (unlikely(srcTexInfo->IsFoveated())) {
+      VkExtent3D imageExtent = srcImage->mipLevelExtent(srcSubresource.mipLevel);
+      srcExtent.width  = std::min(srcExtent.width,  imageExtent.width);
+      srcExtent.height = std::min(srcExtent.height, imageExtent.height);
+      rowAlignment     = pitch;
+    }
+
     EmitCs([
       cBuffer       = dstBuffer,
       cImage        = srcImage,
       cSubresources = srcSubresourceLayers,
       cLevelExtent  = srcExtent,
-      cDstExtent    = dstExtent
+      cDstExtent    = dstExtent,
+      cRowAlignment = rowAlignment
     ] (DxvkContext* ctx) {
-      ctx->copyImageToBuffer(cBuffer, 0, 4, 0,
+      ctx->copyImageToBuffer(cBuffer, 0, cRowAlignment, 0,
         cImage, cSubresources, VkOffset3D { 0, 0, 0 },
         cLevelExtent);
     });
@@ -998,6 +1012,38 @@ namespace dxvk {
     blitInfo.srcOffsets[1] = pSourceRect != nullptr
       ? VkOffset3D{ int32_t(pSourceRect->right), int32_t(pSourceRect->bottom), 1 }
       : VkOffset3D{ int32_t(srcExtent.width),    int32_t(srcExtent.height),    1 };
+
+    // Foveated game render: rectangles the game gave are in its own pixels;
+    // the images are smaller. Whole-surface copies need nothing (the image
+    // extents above are already the real ones). Parts are scaled uniformly
+    // and counted. A copy also carries the warped picture with it.
+    if (unlikely(g_foveation.enabled)) {
+      auto scale = [] (VkOffset3D* offsets) {
+        offsets[0].x = g_foveation.DownX(offsets[0].x);
+        offsets[0].y = g_foveation.DownY(offsets[0].y);
+        offsets[1].x = g_foveation.UpX(offsets[1].x);
+        offsets[1].y = g_foveation.UpY(offsets[1].y);
+      };
+
+      auto whole = [] (const RECT* rect) {
+        return rect->left == 0 && rect->top == 0
+          && rect->right  == LONG(g_foveation.screen.width)
+          && rect->bottom == LONG(g_foveation.screen.height);
+      };
+
+      if (srcTextureInfo->IsFoveated() && pSourceRect != nullptr) {
+        scale(blitInfo.srcOffsets);
+        g_foveationStats.partialCopies += whole(pSourceRect) ? 0 : 1;
+      }
+
+      if (dstTextureInfo->IsFoveated() && pDestRect != nullptr) {
+        scale(blitInfo.dstOffsets);
+        g_foveationStats.partialCopies += whole(pDestRect) ? 0 : 1;
+      }
+
+      if (!dstTextureInfo->IsFoveated())
+        dstTextureInfo->SetWarpedContent(srcTextureInfo->HasWarpedContent());
+    }
 
     if (unlikely(IsBlitRegionInvalid(blitInfo.srcOffsets, srcExtent)))
       return D3DERR_INVALIDCALL;
@@ -1415,6 +1461,28 @@ namespace dxvk {
       extent.height = std::min<uint32_t>(extent.height, sc.bottom - offset.y);
     }
 
+    // Foveated game render: clears never go through the rate map (the
+    // driver draws them with its own viewport), and a cleared target no
+    // longer holds a warped picture.
+    D3D9CommonTexture* foveatedClearTarget = nullptr;
+
+    if (unlikely(g_foveation.enabled)) {
+      D3D9CommonTexture* rt = m_state.renderTargets[0] != nullptr ? m_state.renderTargets[0]->GetCommonTexture() : nullptr;
+      D3D9CommonTexture* ds = m_state.depthStencil     != nullptr ? m_state.depthStencil->GetCommonTexture()     : nullptr;
+
+      // The colour target decides, as it does for draws: a foveated depth
+      // buffer under an ordinary colour target is used in that target's
+      // own pixels (see mixedTargets).
+      if (rt != nullptr ? rt->IsFoveated() : (ds != nullptr && ds->IsFoveated()))
+        foveatedClearTarget = rt != nullptr ? rt : ds;
+
+      if (foveatedClearTarget != nullptr || (ds != nullptr && ds->IsFoveated()))
+        SuspendFoveationMap();
+
+      if (foveatedClearTarget == nullptr && rt != nullptr && (Flags & D3DCLEAR_TARGET))
+        rt->SetWarpedContent(false);
+    }
+
     // This becomes pretty unreadable in one singular if statement...
     if (Count) {
       // If pRects is null, or our first rect encompasses the viewport:
@@ -1497,6 +1565,26 @@ namespace dxvk {
       uint32_t           alignment,
       VkOffset3D         offset,
       VkExtent3D         extent) {
+      // Foveated target: the rectangle is in the game's pixels. The whole
+      // target stays the whole target; a part is put where a uniform scale
+      // would (right for the emulation, approximate under a real map).
+      if (unlikely(foveatedClearTarget != nullptr)) {
+        const bool whole = offset.x == 0 && offset.y == 0
+          && extent.width  >= g_foveation.screen.width
+          && extent.height >= g_foveation.screen.height;
+
+        if (!whole) {
+          g_foveationStats.partialClears += 1;
+
+          const int32_t x1 = g_foveation.UpX(offset.x + int32_t(extent.width));
+          const int32_t y1 = g_foveation.UpY(offset.y + int32_t(extent.height));
+          offset.x = g_foveation.DownX(offset.x);
+          offset.y = g_foveation.DownY(offset.y);
+          extent.width  = uint32_t(std::max(x1 - offset.x, 0));
+          extent.height = uint32_t(std::max(y1 - offset.y, 0));
+        }
+      }
+
       // Clear depth if we need to.
       if (depthAspectMask != 0)
         ClearImageView(alignment, offset, extent, m_state.depthStencil->GetDepthStencilView(), depthAspectMask, clearValueDepth);
@@ -2374,6 +2462,9 @@ namespace dxvk {
     if (unlikely(config::FullValidation && !PrimitiveCount))
       return S_OK;
 
+    if (unlikely(g_foveation.enabled))
+      UpdateFoveationForDraw(PrimitiveCount);
+
     PrepareDraw(PrimitiveType);
 
     EmitCs([this,
@@ -2409,6 +2500,9 @@ namespace dxvk {
 
     if (unlikely(config::FullValidation && !PrimitiveCount))
       return S_OK;
+
+    if (unlikely(g_foveation.enabled))
+      UpdateFoveationForDraw(PrimitiveCount);
 
     PrepareDraw(PrimitiveType);
 
@@ -2455,6 +2549,9 @@ namespace dxvk {
 
     if (unlikely(config::FullValidation && !PrimitiveCount))
       return S_OK;
+
+    if (unlikely(g_foveation.enabled))
+      UpdateFoveationForDraw(PrimitiveCount);
 
     PrepareDraw(PrimitiveType);
 
@@ -2508,6 +2605,9 @@ namespace dxvk {
 
     if (unlikely(config::FullValidation && !PrimitiveCount))
       return S_OK;
+
+    if (unlikely(g_foveation.enabled))
+      UpdateFoveationForDraw(PrimitiveCount);
 
     PrepareDraw(PrimitiveType);
 
@@ -5106,6 +5206,7 @@ namespace dxvk {
       m_activeDSTextures       &= ~bit;
     }
     m_activeTextures         &= ~bit;
+    m_activeTargetTextures   &= ~bit;
     if (config::ManagedUploadTrackingEnabled)
       m_activeTexturesToUpload &= ~bit;
     if (config::MipGenTrackingEnabled)
@@ -5114,6 +5215,9 @@ namespace dxvk {
     auto tex = GetCommonTexture(m_state.textures[index]);
     if (tex != nullptr) {
       m_activeTextures |= bit;
+
+      if (unlikely(tex->IsRenderTarget() || tex->IsDepthStencil()))
+        m_activeTargetTextures |= bit;
 
       if (unlikely(config::HazardTrackingEnabled && tex->IsRenderTarget()))
         m_activeRTTextures |= bit;
@@ -5449,6 +5553,13 @@ namespace dxvk {
       }
     }
 
+    // Foveated game render: a foveated depth buffer under an ordinary colour
+    // target (or the reverse) gives a framebuffer of the smaller of the two
+    // sizes and a picture in two different spaces. Counted, not handled.
+    if (unlikely(g_foveation.enabled) && m_state.depthStencil != nullptr && m_state.renderTargets[0] != nullptr
+     && m_state.depthStencil->GetCommonTexture()->IsFoveated() != m_state.renderTargets[0]->GetCommonTexture()->IsFoveated())
+      g_foveationStats.mixedTargets += 1;
+
     // Create and bind the framebuffer object to the context
     EmitCs([
       cAttachments = std::move(attachments)
@@ -5483,6 +5594,20 @@ namespace dxvk {
       vp.MinZ,                 vp.MaxZ,
     };
 
+    // Foveated game render. Through a rate map the viewport and scissor
+    // stay in the game's (logical) pixels. Without one - a full-screen quad
+    // in warped space, or the uniform-scale emulation - they shrink to the
+    // image's real size.
+    const bool foveationScale = m_foveationMode == D3D9FoveationMode::Unmapped
+      || (m_foveationMode == D3D9FoveationMode::Mapped && g_foveation.rateMap == nullptr);
+
+    if (unlikely(foveationScale)) {
+      viewport.x      = float(vp.X) * g_foveation.ScaleX() + cf;
+      viewport.y      = float(vp.Height + vp.Y) * g_foveation.ScaleY() + cf;
+      viewport.width  = float(vp.Width)  * g_foveation.ScaleX();
+      viewport.height = -float(vp.Height) * g_foveation.ScaleY();
+    }
+
     // Scissor rectangles. Vulkan does not provide an easy way
     // to disable the scissor test, so we'll have to set scissor
     // rects that are at least as large as the framebuffer.
@@ -5513,6 +5638,17 @@ namespace dxvk {
       scissor = VkRect2D{
         VkOffset2D { int32_t(vp.X), int32_t(vp.Y) },
         VkExtent2D { vp.Width,      vp.Height     }};
+    }
+
+    if (unlikely(foveationScale)) {
+      const int32_t x0 = g_foveation.DownX(scissor.offset.x);
+      const int32_t y0 = g_foveation.DownY(scissor.offset.y);
+      const int32_t x1 = g_foveation.UpX(scissor.offset.x + int32_t(scissor.extent.width));
+      const int32_t y1 = g_foveation.UpY(scissor.offset.y + int32_t(scissor.extent.height));
+
+      scissor = VkRect2D{
+        VkOffset2D { x0, y0 },
+        VkExtent2D { uint32_t(std::max(x1 - x0, 0)), uint32_t(std::max(y1 - y0, 0)) }};
     }
 
     EmitCs([
@@ -5944,6 +6080,91 @@ namespace dxvk {
 
   uint32_t D3D9DeviceEx::GetInstanceCount() const {
     return std::max(m_state.streamFreq[0] & 0x7FFFFFu, 1u);
+  }
+
+
+  void D3D9DeviceEx::UpdateFoveationForDraw(UINT PrimitiveCount) {
+    D3D9CommonTexture* rt = m_state.renderTargets[0] != nullptr
+      ? m_state.renderTargets[0]->GetCommonTexture()
+      : nullptr;
+
+    // Does the draw read a texture that holds a warped picture?
+    const uint32_t usedSamplerMask = m_psShaderMasks.samplerMask | m_vsShaderMasks.samplerMask;
+    bool warpedSource = false;
+
+    for (uint32_t samplerIdx : bit::BitMask(m_activeTargetTextures & usedSamplerMask)) {
+      D3D9CommonTexture* tex = GetCommonTexture(m_state.textures[samplerIdx]);
+
+      if (tex != nullptr && tex->HasWarpedContent()) {
+        warpedSource = true;
+        break;
+      }
+    }
+
+    // A full-screen pass, as far as can be told from here: at most two
+    // triangles with the depth test off.
+    const bool quad = PrimitiveCount <= 2 && !m_state.renderStates[D3DRS_ZENABLE];
+
+    D3D9FoveationMode mode = D3D9FoveationMode::None;
+
+    if (rt != nullptr && rt->IsFoveated()) {
+      if (warpedSource && quad) {
+        // Warped in, warped out: one texel per pixel, no map.
+        mode = D3D9FoveationMode::Unmapped;
+        g_foveationStats.unmapped += 1;
+      } else {
+        mode = D3D9FoveationMode::Mapped;
+        g_foveationStats.mapped += 1;
+
+        // Geometry that looks up a warped texture by its screen position
+        // (water, refraction) reads the wrong texels. Not handled yet.
+        if (warpedSource)
+          g_foveationStats.hazards += 1;
+      }
+    } else if (rt != nullptr && quad && warpedSource && !rt->HasWarpedContent()) {
+      // Downsample or blur of a warped picture into an ordinary target
+      rt->SetWarpedContent(true);
+      g_foveationStats.tainted += 1;
+    } else if (rt != nullptr && quad && !warpedSource && rt->HasWarpedContent()
+            && !m_state.renderStates[D3DRS_ALPHABLENDENABLE]) {
+      // The target is filled again from something that is not warped
+      rt->SetWarpedContent(false);
+    }
+
+    if (mode != m_foveationMode) {
+      if (mode != D3D9FoveationMode::None && m_foveationMode != D3D9FoveationMode::None)
+        g_foveationStats.modeSwitches += 1;
+
+      m_foveationMode = mode;
+      m_flags.set(D3D9DeviceFlag::DirtyViewportScissor);
+    }
+
+    void* map = mode == D3D9FoveationMode::Mapped ? g_foveation.rateMap : nullptr;
+
+    if (map != m_foveationSentMap) {
+      m_foveationSentMap = map;
+
+      EmitCs([cMap = map] (DxvkContext* ctx) {
+        ctx->setFoveationRateMap(cMap);
+      });
+    }
+  }
+
+
+  void D3D9DeviceEx::SuspendFoveationMap() {
+    // The next draw picks its mode afresh (and its viewport with it)
+    if (m_foveationMode != D3D9FoveationMode::None) {
+      m_foveationMode = D3D9FoveationMode::None;
+      m_flags.set(D3D9DeviceFlag::DirtyViewportScissor);
+    }
+
+    if (m_foveationSentMap != nullptr) {
+      m_foveationSentMap = nullptr;
+
+      EmitCs([] (DxvkContext* ctx) {
+        ctx->setFoveationRateMap(nullptr);
+      });
+    }
   }
 
 

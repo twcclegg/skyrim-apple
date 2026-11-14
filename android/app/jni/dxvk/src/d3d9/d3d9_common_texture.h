@@ -3,6 +3,7 @@
 #include "d3d9_format.h"
 #include "d3d9_util.h"
 #include "d3d9_caps.h"
+#include "d3d9_foveation.h"
 
 #include "../dxvk/dxvk_device.h"
 
@@ -188,6 +189,30 @@ namespace dxvk {
      */
     bool IsShadow() const {
       return m_shadow;
+    }
+
+    /**
+     * \brief Foveated
+     *
+     * A back-buffer-sized render target or depth buffer whose image is
+     * smaller than the size the game was told (d3d9_foveation.h).
+     */
+    bool IsFoveated() const {
+      return m_foveated;
+    }
+
+    /**
+     * \brief Whether the image holds a rate-mapped (warped) picture
+     *
+     * True for foveated textures, and for ordinary render targets that a
+     * full-screen pass filled from one (the bloom and luminance chains).
+     */
+    bool HasWarpedContent() const {
+      return m_foveated || m_warpedContent;
+    }
+
+    void SetWarpedContent(bool warped) {
+      m_warpedContent = warped;
     }
 
     /**
@@ -447,6 +472,9 @@ namespace dxvk {
     bool                          m_systemmemModified = false;
 
     bool                          m_hazardous = false;
+
+    bool                          m_foveated = false;
+    bool                          m_warpedContent = false;
 
     D3D9ColorView                 m_sampleView;
 

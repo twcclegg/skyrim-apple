@@ -58,5 +58,14 @@ target_compile_definitions(base_vertex_fold_smoke PRIVATE DXVK_NATIVE DXVK_WSI_S
 target_compile_definitions(base_vertex_fold_smoke PRIVATE SKYRIM_MOLTENVK_LIBRARY_PATH="${SKYRIM_MOLTENVK_LIBRARY}")
 target_compile_definitions(base_vertex_fold_smoke PRIVATE SKYRIM_GRAPHICS_CONFIG_PATH="${CMAKE_CURRENT_SOURCE_DIR}/probe.conf")
 set_target_properties(base_vertex_fold_smoke PROPERTIES BUILD_RPATH "${MOLTENVK_LIBRARY_DIR}")
+# Foveating the game's own render (docs/handoff/foveated-render.md): the DXVK
+# plumbing under LB_GAME_FOVEATION_EMULATE, no rate map and no MoltenVK patch
+# needed (--off runs the same scene with the switch off).
+add_executable(foveation_smoke foveation_smoke.cpp)
+target_link_libraries(foveation_smoke PRIVATE dxvk_d3d9 SDL2)
+target_compile_definitions(foveation_smoke PRIVATE DXVK_NATIVE DXVK_WSI_SDL2)
+target_compile_definitions(foveation_smoke PRIVATE SKYRIM_MOLTENVK_LIBRARY_PATH="${SKYRIM_MOLTENVK_LIBRARY}")
+target_compile_definitions(foveation_smoke PRIVATE SKYRIM_GRAPHICS_CONFIG_PATH="${CMAKE_CURRENT_SOURCE_DIR}/probe.conf")
+set_target_properties(foveation_smoke PROPERTIES BUILD_RPATH "${MOLTENVK_LIBRARY_DIR}")
 # GPU smoke requires a logged-in WindowServer. Invoke it explicitly; do not
 # automatically launch a window as a side effect of ordinary source checks.
