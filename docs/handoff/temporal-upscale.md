@@ -87,7 +87,7 @@ Tools:
 | --- | --- | --- |
 | `LB_IMMERSIVE_TEMPORAL=1` | compositor | temporal instead of spatial; needs `LB_IMMERSIVE_UPSCALE` |
 | `LB_IMMERSIVE_UPSCALE=<factor>` | compositor | as in PR #13; the output is this times the game's size |
-| `LB_IMMERSIVE_TEMPORAL_SIGNS=jx,jy,mx,my` | compositor | signs for MetalFX's jitter offset and motion vectors; default `-1,-1,1,1`, a guess |
+| `LB_IMMERSIVE_TEMPORAL_SIGNS=jx,jy,mx,my` | compositor | signs for MetalFX's jitter offset and motion vectors; default `1,1,1,1` (the probe on an M5 Mac; was `-1,-1,1,1`, a guess) |
 | `LB_IMMERSIVE_TEMPORAL_AUTOEXPOSURE=1` | compositor | MetalFX's auto exposure (off by default: the picture is already tone-mapped) |
 | `LB_JITTER=<phases>[x<scale>][@<frame>]` | game, for tests | jitter without the compositor; the scale makes the shifts whole pixels |
 | `LB_JITTER=<x>,<y>[@<frame>]` | game, for tests | the same shift every frame |
@@ -205,7 +205,7 @@ Known limits, none of them looked at on a headset:
    through the compositor's own motion pass and the scaler under each choice of signs, and compares with the
    same view rendered at the full size. It prints the best jitter signs (camera still), the best motion signs
    (camera moving), baselines without history and without motion vectors, GPU ms, and which formats the
-   scaler accepts. If the best signs are not `-1 -1` / `+1 +1`, change the defaults in
+   scaler accepts. If the best signs are not `+1 +1` / `+1 +1`, change the defaults in
    `readTemporalConventions`. "NOT CLEAR" means the test did not separate the choices; say so rather than
    picking one.
 4. With game data on the Mac, the real picture: dump frames from the desktop build at half size, standing
