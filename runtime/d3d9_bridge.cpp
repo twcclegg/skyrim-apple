@@ -505,7 +505,7 @@ static void bisect_present(void) {
     }
     g_draw_no = 0;
     if (!g_skip_ranges_read) skip_ranges_read();
-    static const bool fp_skip = getenv("LB_FP_SKIP") != nullptr;
+    static const bool fp_skip = getenv("LB_FP_SKIP") || getenv("LB_STEREO_HYBRID");  // both skip draws
     g_bisect = (g_frame >= g_bisect_from && g_frame < g_bisect_from + 160) || !g_skip_ranges.empty() || fp_skip;
 }
 
@@ -576,6 +576,8 @@ static bool g_passdbg;
  * LB_FP=1, LB_FP_SKIP or LB_STEREO_EYE_UNITS; otherwise it is always off. */
 static float g_fp_near;                // the first-person near plane, learnt from a late pass (0: not yet)
 static void (*g_fp_listener)(int kind);
+static void stereo_fp_changed(int kind);  // stereo captures with the eye offset on first-person draws only, below
+static bool stereo_skip_fp(void);         // stereo captures: a frame drawn with no first-person draws, below
 
 // The kind of the first-person draw being made, from the target bound (FP_NONE outside first-person draws).
 static int fp_kind(void) {
@@ -593,7 +595,10 @@ static void fp_update(void) {
     const int before = fp_kind();
     f.fp = (f.fp_late || f.fp_proj) && t.rt && !t.bb && !hud_screen_in_pass();
     const int now = fp_kind();
-    if (now != before && g_fp_listener) g_fp_listener(now);
+    if (now != before) {
+        stereo_fp_changed(now);
+        if (g_fp_listener) g_fp_listener(now);
+    }
 }
 bool d3d_first_person(void) { return g_pass_frame.fp; }
 extern "C" int skyrim_first_person_pass(void) { return fp_kind(); }
@@ -825,6 +830,7 @@ static bool fp_skip_now(void) {
     }
     const int k = fp_kind();
     if (k == FP_NONE) return false;
+    if (stereo_skip_fp()) return true;
     auto it = frames.find(g_frame + 1);
     return ((it != frames.end() ? it->second : mode) >> k) & 1;
 }
@@ -1131,28 +1137,75 @@ static void camera_log(void) {
  *
  *   LB_STEREO_EYE_UNITS=d   half the eye separation in game units (2.24 = 32 mm at 70 units per metre). Also
  *                           what turns the shader code on inside DXVK (dxvk_stereo.h), so it must be set at launch.
- *   LB_STEREO_FRAMES=list   comma-separated items F, A-B or A-B:S (triplets starting at A, A+S, ... up to B; S
- *                           defaults to 3). Each triplet base F renders frame F from the left eye, F+1 from the
- *                           right eye and F+2 from the centre, and writes <save>/shot-F-L.bmp, shot-F-R.bmp,
- *                           shot-F-C.bmp, depth-F-C.f32 and stereo-F-<eye>.txt (the eye shift and camera used).
+ *   LB_STEREO_FRAMES=list   comma-separated items F, A-B or A-B:S (groups starting at A, A+S, ... up to B; S
+ *                           defaults to, and is at least, the group's length). Each base F starts a group of frames,
+ *                           each drawn one way and written as <save>/shot-F-<slot>.bmp with stereo-F-<slot>.txt (the
+ *                           eye shift and camera used) and, for some, depth-F-<slot>.f32. By default a triplet:
+ *                             L  frame F, the left eye     R  F+1, the right eye     C  F+2, the centre (+ depth)
+ *   LB_STEREO_PASSES=firstperson
+ *                           L and R shift only the first-person draws (d3d_first_person: the mask, prepass and late
+ *                           pass, every kind), with no shift for the rest of the frame: hands, weapon and spell
+ *                           effect truly per eye over the centre eye's world (twcclegg/skyrim-apple#23 chunk 1.2).
+ *                           L and R then write depth too. DXVK reads the same variable: any value but size or all
+ *                           keeps its default pass rule (viewports of the back buffer's aspect), which the
+ *                           first-person draws meet, the 960x540 mask pass included. The mask is shifted with the
+ *                           rest because it is sampled at the hands' screen position when the late pass lights them:
+ *                           left at the centre position, the shifted hands would read the world's shadow there.
+ *   LB_STEREO_HYBRID=1      each group is six frames of one game moment, for judging the first-person hybrid
+ *                           against full true stereo and reprojection (tools/stereo_compare.py --hybrid):
+ *                             L, R, C   as above (C with depth)
+ *                             FL, FR    the left and right eye on first-person draws only, as with
+ *                                       LB_STEREO_PASSES=firstperson (with depth)
+ *                             W         the centre with every first-person draw skipped: the world alone (+ depth)
+ *                           The game clock is held for the group (as LB_VR180 does: 1 us per frame), so animation,
+ *                           effects and eye adaptation should not move between the six frames.
+ *   LB_STEREO_HOLD=1        hold the game clock over plain triplets too.
  *
  * The left eye sits at view-space x = -d. Seen from there a point at view x is at x + d, so its clip x grows by
  * P00*d: it moves right on screen. DXVK applies pos.x -= k, so k = P00 * e with e = -d for the left eye (k < 0,
  * clip x grows) and e = +d for the right eye. P00 = 2 / (tan_right - tan_left) from the world camera's frustum
- * tangents (equal to 1 / tan_right for the game's symmetric frustum).
+ * tangents (equal to 1 / tan_right for the game's symmetric frustum). The first-person camera has the same field
+ * of view (65, docs/perf/LOG.md 2026-11-14), so the same k is right for its draws.
  *
  * The shift for frame N+1 is set right after frame N's Present returns, so the whole of frame N+1, from its
- * first draw, renders from one eye. Without LB_STEREO_EYE_UNITS nothing changes, in DXVK either; with it but no
- * LB_STEREO_FRAMES, the shaders carry the shift with k = 0. */
+ * first draw, renders from one eye; on first-person-only frames it is switched on and off as the first-person flag
+ * changes (stereo_fp_changed), between draws on the thread making the device calls, which DXVK picks up at the next
+ * draw. Without LB_STEREO_EYE_UNITS nothing changes, in DXVK either; with it but no LB_STEREO_FRAMES, the shaders
+ * carry the shift with k = 0. */
 extern "C" void dxvk_stereo_set_clip_shift(float k);  // DXVK (dxvk_stereo.h)
 extern "C" void dxvk_stereo_set_clip_offset(float x, float y, float z, float w);
 extern "C" int dxvk_stereo_enabled(void);
+extern "C" volatile int g_fake_clock_on;  // kernel32.c (rt_game_ns)
+extern "C" volatile uint64_t g_fake_clock_ns;
+extern "C" uint64_t rt_game_ns(void);
+
+struct StereoSlot {
+    const char *tag;  // file name part after the base frame
+    char eye;         // 'L', 'R' or 'C'
+    bool fp_only;     // the shift on first-person draws only
+    bool skip_fp;     // no first-person draws at all
+    bool depth;       // also write the scene's depth target
+};
+static const StereoSlot k_triplet[] = {
+    {"L", 'L', false, false, false}, {"R", 'R', false, false, false}, {"C", 'C', false, false, true}};
+static const StereoSlot k_triplet_fp[] = {
+    {"L", 'L', true, false, true}, {"R", 'R', true, false, true}, {"C", 'C', false, false, true}};
+static const StereoSlot k_hybrid[] = {
+    {"L", 'L', false, false, false}, {"R", 'R', false, false, false}, {"C", 'C', false, false, true},
+    {"FL", 'L', true, false, true},  {"FR", 'R', true, false, true},  {"W", 'C', false, true, true}};
 
 struct StereoState {
     bool init = false, on = false;
     float d = 0;
     std::vector<int> bases;
-    float k_applied = 0;        // the shift the frame being presented was drawn with
+    const StereoSlot *slots = k_triplet;
+    int group = 3;              // frames per group
+    bool hold = false;          // hold the game clock over each group
+    uint64_t hold_t0 = 0;       // the held clock's start
+    bool holding = false;
+    float k_applied = 0;        // the shift the frame being presented was drawn with (first-person draws only on
+    bool fp_only = false;       //   fp_only frames)
+    bool skip_fp = false;       // the frame being drawn skips its first-person draws
     GameCamera cam_applied{};   // the camera k_applied was computed from
     bool cam_applied_valid = false;
 };
@@ -1164,10 +1217,20 @@ static void stereo_init(void) {
     const char *d = getenv("LB_STEREO_EYE_UNITS"), *f = getenv("LB_STEREO_FRAMES");
     if (!d || !f || !*f || atof(d) == 0) return;
     st.d = (float)fabs(atof(d));
+    const char *passes = getenv("LB_STEREO_PASSES"), *hybrid = getenv("LB_STEREO_HYBRID"),
+               *hold = getenv("LB_STEREO_HOLD");
+    if (hybrid && atoi(hybrid)) {
+        st.slots = k_hybrid;
+        st.group = 6;
+        st.hold = true;
+    } else if (passes && !strcmp(passes, "firstperson")) {
+        st.slots = k_triplet_fp;
+    }
+    if (hold && atoi(hold)) st.hold = true;
     for (const char *e = f; e && *e;) {
-        int a = 0, b = 0, step = 3, n = 0;
+        int a = 0, b = 0, step = st.group, n = 0;
         if (sscanf(e, "%d-%d:%d%n", &a, &b, &step, &n) == 3 || sscanf(e, "%d-%d%n", &a, &b, &n) == 2) {
-            if (step < 3) step = 3;  // triplets must not overlap
+            if (step < st.group) step = st.group;  // groups must not overlap
             for (int x = a; x <= b && st.bases.size() < 256; x += step) st.bases.push_back(x);
         } else if (sscanf(e, "%d", &a) == 1) {
             st.bases.push_back(a);
@@ -1176,32 +1239,40 @@ static void stereo_init(void) {
         if (e) e++;
     }
     st.on = !st.bases.empty();
-    LOG("stereo capture: d %.3f units, %zu triplets, DXVK shader shift %s", st.d, st.bases.size(),
+    LOG("stereo capture: d %.3f units, %zu groups of %d (%s%s), DXVK shader shift %s", st.d, st.bases.size(),
+        st.group, st.slots == k_hybrid ? "hybrid: L R C FL FR W" : st.slots == k_triplet_fp ? "first person only"
+                                                                                            : "L R C",
+        st.hold ? ", game clock held" : "",
         dxvk_stereo_enabled() ? "on" : "OFF (LB_STEREO_EYE_UNITS must be set at launch)");
 }
 
-// The eye ('L', 'R', 'C') frame renders from in a stereo triplet, with the triplet's base frame; 0 if none.
-static char stereo_eye(int frame, int *base) {
+// The slot frame renders in a stereo group, with the group's base frame and the slot's index; null if none.
+static const StereoSlot *stereo_slot(int frame, int *base, int *index = nullptr) {
     for (int b : g_stereo.bases) {
-        if (frame == b) { *base = b; return 'L'; }
-        if (frame == b + 1) { *base = b; return 'R'; }
-        if (frame == b + 2) { *base = b; return 'C'; }
+        if (frame >= b && frame < b + g_stereo.group) {
+            *base = b;
+            if (index) *index = frame - b;
+            return &g_stereo.slots[frame - b];
+        }
     }
-    return 0;
+    return nullptr;
 }
 
-static void stereo_write_info(const char *tag, char eye, int base) {
+static void stereo_write_info(const char *tag, const StereoSlot &slot, int base) {
     char path[1100];
     snprintf(path, sizeof path, "%s/stereo-%s.txt", g_save_dir, tag);
     FILE *out = fopen(path, "w");
     if (!out) return;
     const StereoState &st = g_stereo;
+    const char eye = slot.eye;
     const float *f = st.cam_applied.frustum;
     const float p00 = st.cam_applied_valid && f[1] != f[0] ? 2.0f / (f[1] - f[0]) : 0.0f;
-    fprintf(out, "frame %d\nbase %d\neye %c\neye_units %.6f\neye_x %.6f\nclip_shift_k %.9g\np00 %.9g\n", g_frame,
-            base, eye, st.d, eye == 'L' ? -st.d : eye == 'R' ? st.d : 0.0f, st.k_applied, p00);
-    fprintf(out, "passes %s\nmenu_open %d\n", getenv("LB_STEREO_PASSES") ? getenv("LB_STEREO_PASSES") : "screen",
-            menu_open() ? 1 : 0);
+    fprintf(out, "frame %d\nbase %d\neye %c\nslot %s\neye_units %.6f\neye_x %.6f\nclip_shift_k %.9g\np00 %.9g\n",
+            g_frame, base, eye, slot.tag, st.d, eye == 'L' ? -st.d : eye == 'R' ? st.d : 0.0f, st.k_applied, p00);
+    fprintf(out, "passes %s\nfirst_person_only %d\nfirst_person_skipped %d\nfirst_person_near %.9g\nclock_held %d\n"
+            "menu_open %d\n", slot.fp_only ? "firstperson" : getenv("LB_STEREO_PASSES") ? getenv("LB_STEREO_PASSES")
+                                                                                         : "screen",
+            slot.fp_only ? 1 : 0, slot.skip_fp ? 1 : 0, g_fp_near, st.holding ? 1 : 0, menu_open() ? 1 : 0);
     // The camera the shift came from (read at the previous Present) and the camera at this Present.
     auto put_cam = [&](const char *name, const GameCamera &c, bool valid) {
         if (!valid) { fprintf(out, "%s none\n", name); return; }
@@ -1218,26 +1289,35 @@ static void stereo_write_info(const char *tag, char eye, int base) {
     fclose(out);
 }
 
-// Before Present: capture the frame if it belongs to a triplet.
+// Before Present: capture the frame if it belongs to a group.
 static void stereo_before_present(IDirect3DDevice9 *d) {
     if (!g_stereo.init) stereo_init();
     if (!g_stereo.on) return;
     int base = 0;
-    const char eye = stereo_eye(g_frame, &base);
-    if (!eye) return;
+    const StereoSlot *slot = stereo_slot(g_frame, &base);
+    if (!slot) return;
     char tag[32];
-    snprintf(tag, sizeof tag, "%05d-%c", base, eye);
-    shot_write(d, tag, eye == 'C');
-    stereo_write_info(tag, eye, base);
-    LOG("stereo capture: frame %d eye %c k %.6g -> shot-%s.bmp", g_frame, eye, g_stereo.k_applied, tag);
+    snprintf(tag, sizeof tag, "%05d-%s", base, slot->tag);
+    shot_write(d, tag, slot->depth);
+    stereo_write_info(tag, *slot, base);
+    LOG("stereo capture: frame %d slot %s k %.6g%s -> shot-%s.bmp", g_frame, slot->tag, g_stereo.k_applied,
+        slot->fp_only ? " (first person only)" : slot->skip_fp ? " (no first person)" : "", tag);
 }
 
-// After Present: set the eye for the next frame.
+// The first-person flag changed (fp_update): on first-person-only frames the shift follows it.
+static void stereo_fp_changed(int kind) {
+    const StereoState &st = g_stereo;
+    if (st.on && st.fp_only) dxvk_stereo_set_clip_shift(kind != FP_NONE ? st.k_applied : 0.0f);
+}
+static bool stereo_skip_fp(void) { return g_stereo.skip_fp; }
+
+// After Present: set the eye, and the clock, for the next frame.
 static void stereo_after_present(void) {
     StereoState &st = g_stereo;
     if (!st.on) return;
-    int base = 0;
-    const char eye = stereo_eye(g_frame + 1, &base);
+    int base = 0, index = 0;
+    const StereoSlot *slot = stereo_slot(g_frame + 1, &base, &index);
+    const char eye = slot ? slot->eye : 0;
     float k = 0;
     GameCamera cam;
     const bool valid = (eye == 'L' || eye == 'R') && game_camera_read(&cam);
@@ -1249,8 +1329,22 @@ static void stereo_after_present(void) {
         LOG("stereo capture: frame %d eye %c: no world camera, rendering the centre eye", g_frame + 1, eye);
     }
     if (eye) st.cam_applied_valid = valid || (eye == 'C' && game_camera_read(&st.cam_applied));
-    dxvk_stereo_set_clip_shift(k);
     st.k_applied = k;
+    st.fp_only = slot && slot->fp_only;
+    st.skip_fp = slot && slot->skip_fp;
+    // The first-person flag is off between frames (passes_present), so a first-person-only frame starts unshifted.
+    dxvk_stereo_set_clip_shift(st.fp_only && fp_kind() == FP_NONE ? 0.0f : k);
+    if (st.hold) {
+        if (slot && !st.holding) {
+            st.hold_t0 = rt_game_ns();
+            st.holding = true;
+            g_fake_clock_on = 1;
+        } else if (!slot && st.holding) {
+            st.holding = false;
+            g_fake_clock_on = 0;
+        }
+        if (st.holding) g_fake_clock_ns = st.hold_t0 + (uint64_t)index * 1000ull;
+    }
 }
 /* LB_VR180=start:count[:tan] (offline capture, Mac): a stereo 180-degree video, rendered by the game itself.
  *
@@ -1272,9 +1366,6 @@ static void stereo_after_present(void) {
  *
  * LB_VR180_PENDING=n (default 30): before a block starts, wait while more than n shot-*.bmp files are in the save
  * folder, so a stitcher deleting its inputs keeps disk use bounded. */
-extern "C" volatile int g_fake_clock_on;
-extern "C" volatile uint64_t g_fake_clock_ns;
-extern "C" uint64_t rt_game_ns(void);
 struct Vr180 {
     bool init = false, on = false;
     int start = 0, count = 0, pending = 30;
@@ -1415,6 +1506,8 @@ static void vr180_after_present(void) {
 #else
 static void stereo_before_present(IDirect3DDevice9 *) {}
 static void stereo_after_present(void) {}
+static void stereo_fp_changed(int) {}
+static bool stereo_skip_fp(void) { return false; }
 static void vr180_before_present(IDirect3DDevice9 *) {}
 static void vr180_after_present(void) {}
 void vr180_scene_hook(void) {}
