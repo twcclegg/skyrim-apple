@@ -767,6 +767,7 @@ static void camera_log(void) {
  * first draw, renders from one eye. Without LB_STEREO_EYE_UNITS nothing changes, in DXVK either; with it but no
  * LB_STEREO_FRAMES, the shaders carry the shift with k = 0. */
 extern "C" void dxvk_stereo_set_clip_shift(float k);  // DXVK (dxvk_stereo.h)
+extern "C" void dxvk_stereo_set_clip_offset(float x, float y, float z, float w);
 extern "C" int dxvk_stereo_enabled(void);
 
 struct StereoState {
@@ -884,7 +885,11 @@ static void stereo_after_present(void) {
  * How: the game recomputes the world camera's rotation and position during its update every frame, then culls and
  * renders. The override is written at BeginScene, after the update and before culling, so the game culls and
  * renders the turned view natively (shadows, LOD, effects), and the first-person arms stay where they are in the
- * world. The game clock (rt_game_ns, kernel32.c) is scripted from `start` on: it moves 1 us per frame within a
+ * world. The eye's offset is not a camera move: first-person geometry is drawn as if the camera stood at the
+ * game's own camera position, so a moved camera gives the arms, weapon and spell hand no parallax. Instead DXVK
+ * adds the offset to every perspective vertex in clip space (dxvk_stereo_set_clip_offset; it needs
+ * LB_STEREO_EYE_UNITS set at launch, and LB_STEREO_PASSES=size so square shadow maps of another size are left
+ * alone: keep the face size different from iShadowMapResolution). The game clock (rt_game_ns, kernel32.c) is scripted from `start` on: it moves 1 us per frame within a
  * block, so animation, effects and eye adaptation hold still across the 15 renders.
  *
  * LB_VR180_PENDING=n (default 30): before a block starts, wait while more than n shot-*.bmp files are in the save
@@ -957,11 +962,8 @@ extern "C++" void vr180_scene_hook(void) {
     float fw[3], up[3], rt[3];
     world(kFace[face][0], fw); world(kFace[face][1], up); world(kFace[face][2], rt);
     const float rot[9] = {fw[0], up[0], rt[0], fw[1], up[1], rt[1], fw[2], up[2], rt[2]};
-    const float ex = rig == 0 ? -g_vr.e : rig == 1 ? g_vr.e : 0.0f;
-    const float pos[3] = {g_vr.rig.pos[0] + ex * X[0], g_vr.rig.pos[1] + ex * X[1], g_vr.rig.pos[2] + ex * X[2]};
     const float fr[4] = {-g_vr.tan, g_vr.tan, g_vr.tan, -g_vr.tan};
     memcpy(MEM + w + 0x54, rot, sizeof rot);
-    memcpy(MEM + w + 0x78, pos, sizeof pos);
     memcpy(MEM + w + 0xE8, fr, sizeof fr);
     (void)block;
 }
@@ -1014,6 +1016,22 @@ static void vr180_after_present(void) {
         }
     }
     g_fake_clock_ns = g_vr.t0 + (uint64_t)(k / 16) * 41666667ull + (uint64_t)k * 1000ull;
+    {   /* The next frame's eye offset, in the face's view space: t = ex * (rig x axis), and dclip = t * P with the
+         * square frustum (P00 = P11 = 1/tan, P23 = 1). For z, P22 = far / (far - near) would be exact, but the sky
+         * and clouds are drawn pinned to the far plane (z = w), and that pushes them past it (they vanish from one
+         * eye on the left and right faces). Taking P22 as 1 keeps z = w pinned; for everything else the error is
+         * (P22 - 1) * tz, about 1e-4 in clip z. */
+        int slot = 0;
+        const int block = vr180_slot(f, &slot);
+        float off[4] = {0, 0, 0, 0};
+        if (block >= 0 && slot > 0 && g_vr.have_frustum0) {
+            const int rig = (slot - 1) / 5, face = (slot - 1) % 5;
+            const float ex = rig == 0 ? -g_vr.e : rig == 1 ? g_vr.e : 0.0f;
+            const float tx = ex * kFace[face][2][0], ty = ex * kFace[face][1][0], tz = ex * kFace[face][0][0];
+            off[0] = tx / g_vr.tan; off[1] = ty / g_vr.tan; off[2] = tz; off[3] = tz;
+        }
+        dxvk_stereo_set_clip_offset(off[0], off[1], off[2], off[3]);
+    }
     if (k % 16 == 0 && k / 16 < g_vr.count && (k / 16) % 10 == 0) LOG("vr180: block %d of %d", k / 16, g_vr.count);
 }
 #else

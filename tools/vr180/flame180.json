@@ -1,9 +1,10 @@
 {
- "description": "VR180 capture session for tools/stereo_capture.py (one location). The game clock is scripted by LB_VR180, so nothing is slowed with sgtm; tm hides the HUD.",
+ "description": "VR180 capture session for tools/stereo_capture.py (one location). The game clock is scripted by LB_VR180, so nothing is slowed with sgtm; tm hides the HUD. LB_STEREO_PASSES=size keeps DXVK's eye offset off square shadow maps, so the face size (the save folder's iSize, see max_prefs.py) must differ from iShadowMapResolution (4096): use 4032.",
  "eye_units": 2.24,
  "units_per_metre": 70,
  "env": {
-  "LB_VPAD": "0"
+  "LB_VPAD": "0",
+  "LB_STEREO_PASSES": "size"
  },
  "game_files": {
   "stereoequip.txt": [
