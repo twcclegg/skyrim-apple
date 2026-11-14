@@ -107,3 +107,19 @@ rasterization rate map, as the plan already notes for M2.
 ThinLTO (inlining across the 140 generated files removes spill/reload pairs at direct calls), profile-guided
 optimisation, and a linker order file built from a profile to keep the hot few megabytes of the 110 MB of code
 together. Each needs a 20-minute build per try on the M1.
+
+## Headset GPU log lines (stage 0 of #23: measure before optimising)
+
+Two lines report GPU cost on the headset. Neither had ever been read from a headset run when they were added.
+
+- `immersive: compositor gpu X ms per frame, p95 Y ms, max Z ms`, every 5 s, from `ImmersiveScreen.swift`. The
+  compositor's own command buffers, `gpuEndTime - gpuStartTime`. Mean is exact; p95 is read from a 0.25 ms
+  histogram (rounded up to the bin edge, never above the max); the max is exact.
+- `immersive cadence: N game frames over 900 refreshes; held 1: …; replaced unseen: U; game gpu latency mean X ms,
+  max Y ms`, every 900 refreshes, from `ipad/immersive_bridge.mm`. The latency is the time from the game handing a
+  frame to the tap (inside Present) to the first compositor refresh that finds it finished. It is an upper bound
+  on the game frame's GPU time: it includes the GPU working through the compositor's own queued work, and is
+  rounded up to the next refresh (about 11 ms at 90 Hz). Frames pushed out of a full mailbox before any refresh
+  polled them are not counted. The suffix is absent when no frame was observed in the window.
+
+Read them together: if the game latency is far above the compositor's GPU time, the game is the one that is slow.
