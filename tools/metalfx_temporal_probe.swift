@@ -30,7 +30,9 @@ guard arguments.count > 1 else {
     print("usage: temporal_probe <ImmersiveScreen.swift> [frames <dump dir> <first> <last> <out dir> [factor] [jx,jy,mx,my]]")
     exit(2)
 }
-guard let device = MTLCreateSystemDefaultDevice(), let queue = device.makeCommandQueue() else { fatalError("no Metal device") }
+guard let foundDevice = MTLCreateSystemDefaultDevice(), let foundQueue = foundDevice.makeCommandQueue() else { fatalError("no Metal device") }
+// Globals, not the guard's own bindings: a class below can't close over those.
+let device = foundDevice, queue = foundQueue
 print("device: \(device.name); MetalFX temporal supported: \(MTLFXTemporalScalerDescriptor.supportsDevice(device))")
 
 // The compositor's shaders, straight from its source: the motion pass tested here is the one that ships.
