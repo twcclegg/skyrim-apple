@@ -149,6 +149,15 @@ if(TARGET base_vertex_fold_smoke)
   add_test(NAME base_vertex_fold_smoke COMMAND base_vertex_fold_smoke --compare)
   set_tests_properties(base_vertex_fold_smoke PROPERTIES TIMEOUT 120)
 endif()
+if(TARGET stereo_shift_smoke)
+  # DXVK reads both variables once per process, hence two invocations. The executable also sets them from
+  # its flag (and unsets LB_STEREO_PASSES for --passes=default), so a stray shell value cannot leak in.
+  add_test(NAME stereo_shift_smoke COMMAND stereo_shift_smoke --passes=default)
+  set_tests_properties(stereo_shift_smoke PROPERTIES TIMEOUT 60 ENVIRONMENT "LB_STEREO_EYE_UNITS=1")
+  add_test(NAME stereo_shift_smoke_passes_all COMMAND stereo_shift_smoke --passes=all)
+  set_tests_properties(stereo_shift_smoke_passes_all PROPERTIES TIMEOUT 60
+    ENVIRONMENT "LB_STEREO_EYE_UNITS=1;LB_STEREO_PASSES=all")
+endif()
 
 set(SKYRIM_PYTHON "${CMAKE_CURRENT_SOURCE_DIR}/.venv/bin/python" CACHE FILEPATH
   "Isolated Python with capstone and pefile")
