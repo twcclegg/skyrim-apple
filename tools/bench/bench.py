@@ -91,6 +91,15 @@ def key_script(scenario):
             frame += scenario.get("command_gap", 30)
         if scenario.get("console_close", True):  # `coc` closes the console itself; a second ` would reopen it
             entries.append(f"{frame}:`:2")
+    # "console_later": [{"at": frame, "command": text}] - the console reopened after the first command's load (a
+    # `bat` of commands that can't share the first console, e.g. the weather), then closed again.
+    for later in scenario.get("console_later", []):
+        frame = later["at"]
+        entries.append(f"{frame}:`:2")
+        more, frame = typed(later["command"], frame + 20)
+        entries += more
+        entries.append(f"{frame}:Return:2")
+        entries.append(f"{frame + 30}:`:2")
     for held in scenario.get("keys", []):
         entries.append(f"{held['start']}:{held['key']}:{held['frames']}")
     if len(entries) > 256:

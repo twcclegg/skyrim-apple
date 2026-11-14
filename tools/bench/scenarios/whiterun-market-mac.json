@@ -1,5 +1,5 @@
 {
-  "description": "Busier than riverwood-walk: coc into Whiterun's Plains District (the city, with its townspeople), stand 10 s (idle), run up the street to the market (run, about 9 s), then stand in the market turning the view in steps for 20 s (pan). Timed for the macOS native build on the M1: the city is loaded by frame 1500. One console command only: after the first Return the port drops keystrokes until a movement key is pressed, so a second command arrives garbled (observed). L is the scripted look-right key (runtime/input.c).",
+  "description": "Busier than riverwood-walk: coc into Whiterun's Plains District (the city, with its townspeople), stand 10 s (idle), run up the street to the market (run, about 9 s), then stand in the market turning the view in steps for 20 s (pan). Timed for the macOS native build on the M1: the city is loaded by frame 1500. One console command only: after the first Return the port drops keystrokes until a movement key is pressed, so a second command arrives garbled (observed). L is the scripted look-right key (runtime/input.c). At frame 1550 the console is reopened for `bat benchwx` (benchwx.txt: fw then sw 0000081A, SkyrimClear), so every run has the same clear sky: the region's weather is otherwise picked at random per run, and overcast runs draw about 57 more effect draws per frame (measured in Riverwood on the M5).",
   "console_at": 600,
   "console": [
     "coc whiterunorigin"
@@ -235,5 +235,17 @@
     3900,
     4190
   ],
-  "exit_frame": 4300
+  "exit_frame": 4300,
+  "console_later": [
+    {
+      "at": 1550,
+      "command": "bat benchwx"
+    }
+  ],
+  "game_files": {
+    "benchwx.txt": [
+      "fw 0000081A",
+      "sw 0000081A"
+    ]
+  }
 }
