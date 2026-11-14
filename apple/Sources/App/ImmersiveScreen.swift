@@ -40,16 +40,42 @@ extension Notification.Name {
     static let skyrimImmersiveRunning = Notification.Name("SkyrimImmersiveRunning")
 }
 
+/// Compositor GPU time per frame, tallied on the command buffer completion queue and read by the 5 s log. The
+/// p95 comes from a fixed histogram (0.25 ms bins up to 20 ms, the last bin holding everything above), so it is
+/// accurate to a bin and nothing is allocated per frame.
 final class GPUTimeTally: @unchecked Sendable {
+    private static let binSeconds = 0.00025
+    private static let binCount = 80
     private let lock = NSLock()
-    private var total = 0.0, count = 0
+    private var total = 0.0, maximum = 0.0, count = 0
+    private var bins = [Int](repeating: 0, count: GPUTimeTally.binCount)
     func add(_ seconds: Double) {
         guard seconds > 0, seconds < 1 else { return }
-        lock.lock(); total += seconds; count += 1; lock.unlock()
+        let bin = min(Int(seconds / Self.binSeconds), Self.binCount - 1)
+        lock.lock()
+        total += seconds; count += 1; bins[bin] += 1
+        if seconds > maximum { maximum = seconds }
+        lock.unlock()
     }
-    func take() -> (total: Double, count: Int) {
-        lock.lock(); defer { total = 0; count = 0; lock.unlock() }
-        return (total, count)
+    func take() -> (total: Double, count: Int, p95: Double, max: Double) {
+        lock.lock(); defer {
+            total = 0; maximum = 0; count = 0
+            for index in bins.indices { bins[index] = 0 }
+            lock.unlock()
+        }
+        var p95 = 0.0
+        if count > 0 {
+            let target = (count * 95 + 99) / 100
+            var seen = 0
+            for (index, n) in bins.enumerated() {
+                seen += n
+                if seen >= target {
+                    p95 = index == Self.binCount - 1 ? maximum : min(Double(index + 1) * Self.binSeconds, maximum)
+                    break
+                }
+            }
+        }
+        return (total, count, p95, maximum)
     }
 }
 
@@ -713,7 +739,9 @@ final class ImmersiveCompositor: @unchecked Sendable {
             log(String(format: "%.0f Hz presented, %.0f fps from the game", Double(presented) / (now - loggedAt), Double(newFrames) / (now - loggedAt)))
             if let spatial = SpatialEventLog.take() { log("spatial events: \(spatial)") }
             let gpu = gpuTime.take()
-            if gpu.count > 0 { log(String(format: "compositor gpu %.2f ms per frame", gpu.total * 1000 / Double(gpu.count))) }
+            if gpu.count > 0 {
+                log(String(format: "compositor gpu %.2f ms per frame, p95 %.2f ms, max %.2f ms", gpu.total * 1000 / Double(gpu.count), gpu.p95 * 1000, gpu.max * 1000))
+            }
             presented = 0
             newFrames = 0
             loggedAt = now
