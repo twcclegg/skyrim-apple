@@ -876,8 +876,8 @@ static void stereo_after_present(void) {
 }
 /* LB_VR180=start:count[:tan] (offline capture, Mac): a stereo 180-degree video, rendered by the game itself.
  *
- * From frame `start`, every block of 16 frames is one video frame (count blocks). Frame 0 of a block advances the
- * game clock by 1/24 s; frames 1..15 render the same moment from rig L, R, C (eyes at x = -e, +e, 0 along the
+ * From frame `start`, every block of frames is one video frame (count blocks; schedule at vr180_block_frames).
+ * Frame 0 of a block advances the game clock by 1/24 s; the faces then render the same moment from rig L, R, C (eyes at x = -e, +e, 0 along the
  * camera's right axis, e = LB_VR180_EYE units, default 2.24 = 32 mm) and faces 0..4 (front, left, right, up, down;
  * square frustum +-tan, default 1.1). Each face frame writes <save>/shot-B-RK.bmp, stereo-B-RK.txt and, for rig C,
  * depth-B-CK.f32 (B = the block's first frame). tools: scratchpad vr180/stitch, vr180/reproject.
@@ -890,7 +890,7 @@ static void stereo_after_present(void) {
  * adds the offset to every perspective vertex in clip space (dxvk_stereo_set_clip_offset; it needs
  * LB_STEREO_EYE_UNITS set at launch, and LB_STEREO_PASSES=size so square shadow maps of another size are left
  * alone: keep the face size different from iShadowMapResolution). The game clock (rt_game_ns, kernel32.c) is scripted from `start` on: it moves 1 us per frame within a
- * block, so animation, effects and eye adaptation hold still across the 15 renders.
+ * block (rdtsc too, rt_rdtsc in dispatch.c), so animation, effects and eye adaptation hold still across the block.
  *
  * LB_VR180_PENDING=n (default 30): before a block starts, wait while more than n shot-*.bmp files are in the save
  * folder, so a stitcher deleting its inputs keeps disk use bounded. */
@@ -899,7 +899,7 @@ extern "C" volatile uint64_t g_fake_clock_ns;
 extern "C" uint64_t rt_game_ns(void);
 struct Vr180 {
     bool init = false, on = false;
-    int start = 0, count = 0, pending = 30;
+    int start = 0, count = 0, pending = 30, settle = 3, repeat = 2;
     float tan = 1.1f, e = 2.24f;
     uint64_t t0 = 0;
     float frustum0[6];
@@ -909,20 +909,54 @@ struct Vr180 {
     bool rig_valid = false;
 };
 static Vr180 g_vr;
+static int vr180_block_frames(void);
 static void vr180_init(void) {
     g_vr.init = true;
     const char *e = getenv("LB_VR180");
     if (!e || sscanf(e, "%d:%d:%f", &g_vr.start, &g_vr.count, &g_vr.tan) < 2 || g_vr.count <= 0) return;
     if (const char *x = getenv("LB_VR180_EYE")) g_vr.e = (float)atof(x);
     if (const char *x = getenv("LB_VR180_PENDING")) g_vr.pending = atoi(x);
+    if (const char *x = getenv("LB_VR180_SETTLE")) g_vr.settle = atoi(x) < 0 ? 0 : atoi(x);
+    if (const char *x = getenv("LB_VR180_REPEAT")) g_vr.repeat = atoi(x) < 1 ? 1 : atoi(x);
     g_vr.on = true;
-    LOG("vr180: %d blocks from frame %d, tan %.3f, eye %.3f units", g_vr.count, g_vr.start, g_vr.tan, g_vr.e);
+    LOG("vr180: %d blocks from frame %d, tan %.3f, eye %.3f units, %d settle frames, each face rendered %d times "
+        "(%d frames per block)", g_vr.count, g_vr.start, g_vr.tan, g_vr.e, g_vr.settle, g_vr.repeat, vr180_block_frames());
 }
-// Frame f's place: -1 outside, else block index; *slot = 0 (clock frame) or 1..15 (rig*5 + face + 1).
-static int vr180_slot(int f, int *slot) {
-    if (!g_vr.on || f < g_vr.start || f >= g_vr.start + 16 * g_vr.count) return -1;
-    *slot = (f - g_vr.start) % 16;
-    return (f - g_vr.start) / 16;
+/* The block schedule: frame 0 advances the clock by 1/24 s; then LB_VR180_SETTLE frames (default 3) render the
+ * first face without capturing (the first frames after a clock step still differ, about 2% of the picture, while
+ * later ones are identical: measured with LB_VR180_ORDER=same); then each of the 15 faces renders
+ * LB_VR180_REPEAT times (default 2) and the last is captured, so nothing carried over from the previous view
+ * (occlusion results, the other face's state) reaches a capture. */
+static int vr180_block_frames(void) { return 1 + g_vr.settle + 15 * g_vr.repeat; }
+// Frame f's place: -1 outside, else the block index; *slot = 0 for the clock frame, else 1..15 (the face slot);
+// *capture says whether this frame is the one written for its slot.
+static int vr180_slot(int f, int *slot, bool *capture = nullptr) {
+    const int B = vr180_block_frames();
+    if (capture) *capture = false;
+    if (!g_vr.on || f < g_vr.start || f >= g_vr.start + B * g_vr.count) return -1;
+    const int o = (f - g_vr.start) % B;
+    if (o == 0) { *slot = 0; }
+    else if (o <= g_vr.settle) { *slot = 1; }
+    else {
+        const int j = o - 1 - g_vr.settle;
+        *slot = j / g_vr.repeat + 1;
+        if (capture) *capture = j % g_vr.repeat == g_vr.repeat - 1;
+    }
+    return (f - g_vr.start) / B;
+}
+// A face frame's rig and face. Default order: rig-major (L0..L4, R0..R4, C0..C4). LB_VR180_ORDER=face renders
+// each face's L, R and C on consecutive frames, so anything that still changes per rendered frame differs least
+// between the eyes. LB_VR180_ORDER=same renders the centre front face in all 15 slots (shot-B-Sss.bmp): a check
+// that the scripted clock holds everything still.
+static void vr180_rig_face(int slot, int *rig, int *face) {
+    static int face_major = -1;
+    if (face_major < 0) {
+        const char *o = getenv("LB_VR180_ORDER");
+        face_major = o && !strcmp(o, "face") ? 1 : o && !strcmp(o, "same") ? 2 : 0;
+    }
+    if (face_major == 2) { *rig = 2; *face = 0; return; }  // check: the centre front face 15 times (time must hold)
+    if (face_major) { *face = (slot - 1) / 3; *rig = (slot - 1) % 3; }
+    else { *rig = (slot - 1) / 5; *face = (slot - 1) % 5; }
 }
 static const char kRig[3] = {'L', 'R', 'C'};
 // The face basis in rig coordinates (x right, y up, z forward): forward, up, right.
@@ -952,7 +986,7 @@ extern "C++" void vr180_scene_hook(void) {
         g_vr.rig_frame = f;
     }
     if (!g_vr.rig_valid) return;
-    const int rig = (slot - 1) / 5, face = (slot - 1) % 5;
+    int rig, face; vr180_rig_face(slot, &rig, &face);
     // Gamebryo camera: world rotation columns are forward, up, right (world coordinates).
     const float *R = g_vr.rig.rot;
     const float F[3] = {R[0], R[3], R[6]}, U[3] = {R[1], R[4], R[7]}, X[3] = {R[2], R[5], R[8]};
@@ -970,11 +1004,16 @@ extern "C++" void vr180_scene_hook(void) {
 // Before Present: write the face frame's files.
 static void vr180_before_present(IDirect3DDevice9 *d) {
     int slot = 0;
-    const int block = vr180_slot(g_frame, &slot);
-    if (block < 0 || slot == 0) return;
-    const int rig = (slot - 1) / 5, face = (slot - 1) % 5, base = g_vr.start + 16 * block;
+    bool capture = false;
+    const int block = vr180_slot(g_frame, &slot, &capture);
+    if (block < 0 || slot == 0 || !capture) return;
+    int rig, face; vr180_rig_face(slot, &rig, &face);
+    const int base = g_vr.start + vr180_block_frames() * block;
     char tag[32];
-    snprintf(tag, sizeof tag, "%05d-%c%d", base, kRig[rig], face);
+    if (getenv("LB_VR180_ORDER") && !strcmp(getenv("LB_VR180_ORDER"), "same"))
+        snprintf(tag, sizeof tag, "%05d-S%02d", base, slot);
+    else
+        snprintf(tag, sizeof tag, "%05d-%c%d", base, kRig[rig], face);
     shot_write(d, tag, rig == 2);
     char path[1100];
     snprintf(path, sizeof path, "%s/stereo-%s.txt", g_save_dir, tag);
@@ -1008,14 +1047,14 @@ static void vr180_after_present(void) {
     const int f = g_frame + 1;
     if (f < g_vr.start) return;
     if (!g_fake_clock_on) { g_vr.t0 = rt_game_ns(); g_fake_clock_ns = g_vr.t0; g_fake_clock_on = 1; }
-    const int k = f - g_vr.start;
-    if (k % 16 == 0 && k / 16 < g_vr.count && g_vr.pending > 0) {
+    const int k = f - g_vr.start, B = vr180_block_frames();
+    if (k % B == 0 && k / B < g_vr.count && g_vr.pending > 0) {
         for (int waited = 0; vr180_pending_shots() > g_vr.pending; waited++) {
-            if (waited % 60 == 0) LOG("vr180: block %d waits for the stitcher (%d shots pending)", k / 16, vr180_pending_shots());
+            if (waited % 60 == 0) LOG("vr180: block %d waits for the stitcher (%d shots pending)", k / B, vr180_pending_shots());
             usleep(500000);
         }
     }
-    g_fake_clock_ns = g_vr.t0 + (uint64_t)(k / 16) * 41666667ull + (uint64_t)k * 1000ull;
+    g_fake_clock_ns = g_vr.t0 + (uint64_t)(k / B) * 41666667ull + (uint64_t)k * 1000ull;
     {   /* The next frame's eye offset, in the face's view space: t = ex * (rig x axis), and dclip = t * P with the
          * square frustum (P00 = P11 = 1/tan, P23 = 1). For z, P22 = far / (far - near) would be exact, but the sky
          * and clouds are drawn pinned to the far plane (z = w), and that pushes them past it (they vanish from one
@@ -1025,14 +1064,14 @@ static void vr180_after_present(void) {
         const int block = vr180_slot(f, &slot);
         float off[4] = {0, 0, 0, 0};
         if (block >= 0 && slot > 0 && g_vr.have_frustum0) {
-            const int rig = (slot - 1) / 5, face = (slot - 1) % 5;
+            int rig, face; vr180_rig_face(slot, &rig, &face);
             const float ex = rig == 0 ? -g_vr.e : rig == 1 ? g_vr.e : 0.0f;
             const float tx = ex * kFace[face][2][0], ty = ex * kFace[face][1][0], tz = ex * kFace[face][0][0];
             off[0] = tx / g_vr.tan; off[1] = ty / g_vr.tan; off[2] = tz; off[3] = tz;
         }
         dxvk_stereo_set_clip_offset(off[0], off[1], off[2], off[3]);
     }
-    if (k % 16 == 0 && k / 16 < g_vr.count && (k / 16) % 10 == 0) LOG("vr180: block %d of %d", k / 16, g_vr.count);
+    if (k % B == 0 && k / B < g_vr.count && (k / B) % 10 == 0) LOG("vr180: block %d of %d", k / B, g_vr.count);
 }
 #else
 static void stereo_before_present(IDirect3DDevice9 *) {}

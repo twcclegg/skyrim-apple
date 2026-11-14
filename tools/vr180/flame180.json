@@ -50,9 +50,9 @@
     }
    ],
    "triplets": [
-    5100
+    7260
    ],
-   "exit_frame": 5130,
+   "exit_frame": 7290,
    "crops": {
     "hands": [
      0.45,
@@ -79,7 +79,7 @@
      0.35
     ]
    },
-   "vr180": "LB_VR180=3150:120:1.1 (120 blocks = 5 s at 24 fps, frames 3150-5069)"
+   "vr180": "LB_VR180=3150:120:1.1 (120 blocks = 5 s at 24 fps; 34 frames per block with the default 3 settle frames and 2 renders per face: frames 3150-7229)"
   }
  ]
 }

@@ -245,8 +245,9 @@ void rt_cpuid(CPU *c, uint32_t *eax, uint32_t *ebx, uint32_t *ecx, uint32_t *edx
     }
 }
 
+/* Nanoseconds as the time-stamp counter. Follows the scripted game clock of offline captures (LB_VR180,
+ * rt_game_ns in kernel32.c) like the Windows timers, so code timed by rdtsc also holds still within a block. */
+uint64_t rt_game_ns(void);
 uint64_t rt_rdtsc(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000000000ull + ts.tv_nsec;
+    return rt_game_ns();
 }
