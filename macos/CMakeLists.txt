@@ -200,6 +200,15 @@ if(SKYRIM_BUILD_GAME)
   add_executable(skyrim_macos "${SKYRIM_ROOT}/runtime/main.c"
     $<TARGET_OBJECTS:skyrim_generated>)
   target_link_libraries(skyrim_macos PRIVATE skyrim_runtime)
+  # The fixed rate map for foveating the game's own render (docs/handoff/foveated-render.md). It registers
+  # itself and does nothing without LB_GAME_FOVEATION_MAP; the map only reaches Metal through a MoltenVK
+  # built with that note's patch (SKYRIM_MOLTENVK_ROOT).
+  target_sources(skyrim_macos PRIVATE "${SKYRIM_ROOT}/runtime/foveation_provider.mm")
+  # Compiled as C++ with -x objective-c++: enabling CMake's OBJCXX language for the project would also
+  # change how the bundled SDL's Objective-C sources are compiled.
+  set_source_files_properties("${SKYRIM_ROOT}/runtime/foveation_provider.mm" PROPERTIES
+    LANGUAGE CXX COMPILE_OPTIONS "-xobjective-c++;-fobjc-arc")
+  target_link_libraries(skyrim_macos PRIVATE "-framework Metal" "-framework Foundation")
   add_dependencies(skyrim_macos verify_game_inputs)
   set_property(TARGET skyrim_macos APPEND PROPERTY LINK_DEPENDS
     "${SKYRIM_GEN_DIR}/input-manifest.json"
