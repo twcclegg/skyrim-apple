@@ -14,6 +14,7 @@
 #include "x86.h"
 
 #ifdef GAME_SKYRIM
+void f_C8EB60_guest(CPU *c);
 void f_40A4B0_guest(CPU *c);
 void f_ABED70_guest(CPU *c);
 
@@ -33,59 +34,21 @@ static inline int g3_overlap(uint32_t a, uint32_t la, uint32_t b, uint32_t lb) {
  * last stored product and the last translation difference.
  *
  * Without overlap (always, in the game) everything is loaded first and stored after; if out overlaps an input or
- * the argument area, or an input overlaps the slots the guest writes, the guest's exact access order is used. */
-#ifndef G3_C8EB60_SLOW_ONLY
-#define G3_C8EB60_SLOW_ONLY 0  /* 1: test the exact-order path on every run */
-#endif
-/* The guest's own order of loads and stores (esp = the entry esp; the guest's rot slot is esp+8 throughout). */
-static void c8eb60_slow(CPU *c) {
-    uint32_t esp = c->r[4], t1 = (c->top - 1) & 7, t2 = (c->top - 2) & 7, t3 = (c->top - 3) & 7;
-    uint32_t rot = M32(esp + 8);
-    M32(esp + 8) = M32(rot);
-    double r0 = (double)MF32(esp + 8);
-    uint32_t out = M32(esp + 4);
-    double s = (double)MF32(esp + 16);
-    M32(esp - 4) = c->r[6];                                 /* push esi */
-    MF32(out) = (float)(r0 * s);
-    double p;
-#define G3_ELEM(src, dst) M32(esp + 8) = M32(rot + (src)); p = (double)MF32(esp + 8) * s; MF32(out + (dst)) = (float)p
-    G3_ELEM(0x0C, 0x04);
-    M32(esp + 8) = M32(rot + 0x18); p = (double)MF32(esp + 8) * s; M32(out + 0x0C) = 0; MF32(out + 0x08) = (float)p;
-    G3_ELEM(0x04, 0x10);
-    G3_ELEM(0x10, 0x14);
-    M32(esp + 8) = M32(rot + 0x1C); p = (double)MF32(esp + 8); M32(out + 0x1C) = 0; p = p * s;
-    MF32(out + 0x18) = (float)p;
-    G3_ELEM(0x08, 0x20);
-    M32(esp + 8) = M32(rot + 0x14); p = (double)MF32(esp + 8);
-    c->r[6] = M32(esp - 4);                                 /* pop esi */
-    p = p * s; MF32(out + 0x24) = (float)p;
-#undef G3_ELEM
-    M32(esp + 8) = M32(rot + 0x20);
-    double q = s * (double)MF32(esp + 8);
-    uint32_t tr = M32(esp + 12);
-    M32(out + 0x2C) = 0;
-    MF32(out + 0x28) = (float)q;
-    double w = (double)MF32(tr) - (double)MF32(0x1B913FCu);
-    MF32(out + 0x30) = (float)w;
-    w = (double)MF32(tr + 4) - (double)MF32(0x1B91400u);
-    MF32(out + 0x34) = (float)w;
-    w = (double)MF32(tr + 8) - (double)MF32(0x1B91404u);
-    M32(out + 0x3C) = 0x3F800000u;
-    MF32(out + 0x38) = (float)w;
-    c->st[t3] = s; c->st[t2] = p; c->st[t1] = w;
-    c->r[0] = out; c->r[1] = tr; c->r[2] = 0; c->r[4] = esp + 4;
-}
+ * the argument area, or an input overlaps the slots the guest writes, the lifted body runs instead. So does a NaN
+ * scale: a product of two NaNs keeps one of the two payloads, and which one depends on the operand order the
+ * compiler picks for a multiplication it treats as commutative, in the lifted body as here. */
 void f_C8EB60(CPU *c) {
     uint32_t esp = c->r[4], out = M32(esp + 4), rot = M32(esp + 8), tr = M32(esp + 12);
-    if (G3_C8EB60_SLOW_ONLY || g3_overlap(out, 0x40, rot, 0x24) || g3_overlap(out, 0x40, tr, 0xC) ||
+    float scale = MF32(esp + 16);
+    if (scale != scale || g3_overlap(out, 0x40, rot, 0x24) || g3_overlap(out, 0x40, tr, 0xC) ||
         g3_overlap(out, 0x40, esp - 4, 0x18) || g3_overlap(out, 0x40, 0x1B913FCu, 0xC) ||
         g3_overlap(rot, 0x24, esp - 4, 0x10) || g3_overlap(tr, 0xC, esp - 4, 0x10) ||
         g3_overlap(esp - 4, 0x10, 0x1B913FCu, 0xC)) {
-        c8eb60_slow(c);
+        f_C8EB60_guest(c);
         return;
     }
     uint32_t t1 = (c->top - 1) & 7, t2 = (c->top - 2) & 7, t3 = (c->top - 3) & 7;
-    double s = (double)MF32(esp + 16);
+    double s = (double)scale;
     uint32_t rb[9];
     float r[9];
     for (int k = 0; k < 9; k++) { rb[k] = M32(rot + 4 * k); r[k] = g3_f32(rb[k]); }
