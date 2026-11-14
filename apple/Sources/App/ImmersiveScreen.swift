@@ -447,13 +447,13 @@ final class ImmersiveCompositor: @unchecked Sendable {
     /// What MetalFX is told about a frame's shift and motion, as multipliers on this file's own conventions (a
     /// shift moves the picture right and down; motion points from where a pixel is to where it was, in the
     /// frame's pixels, y down). LB_IMMERSIVE_TEMPORAL_SIGNS=<jitter x>,<jitter y>,<motion x>,<motion y> overrides
-    /// the signs and LB_IMMERSIVE_TEMPORAL_AUTOEXPOSURE=1 lets MetalFX set its own exposure. The defaults are a
-    /// reading of Apple's documentation that has not been run: tools/metalfx_temporal_probe.swift finds the
-    /// right ones on a Mac.
+    /// the signs and LB_IMMERSIVE_TEMPORAL_AUTOEXPOSURE=1 lets MetalFX set its own exposure. The defaults are what
+    /// tools/metalfx_temporal_probe.swift measured on a Mac (M5, macOS 27), on its made-up scene and on frames
+    /// the game dumped; the opposite jitter signs comb every edge. Not run on a headset.
     private var temporalConventions: (jitter: SIMD2<Float>, motion: SIMD2<Float>, autoExposure: Bool)?
     private func readTemporalConventions() -> (jitter: SIMD2<Float>, motion: SIMD2<Float>, autoExposure: Bool) {
         if let temporalConventions { return temporalConventions }
-        var signs: [Float] = [-1, -1, 1, 1]
+        var signs: [Float] = [1, 1, 1, 1]
         if let raw = getenv("LB_IMMERSIVE_TEMPORAL_SIGNS") {
             let given = String(cString: raw).split(separator: ",").compactMap { Float($0) }
             if given.count == 4 { signs = given }

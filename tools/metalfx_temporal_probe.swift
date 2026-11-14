@@ -260,7 +260,7 @@ if arguments.count > 2 {
     }
     let dumps = URL(fileURLWithPath: arguments[3]), out = URL(fileURLWithPath: arguments[6])
     let factor = arguments.count > 7 ? Float(arguments[7]) ?? 2 : 2
-    var signs: [Float] = [-1, -1, 1, 1]
+    var signs: [Float] = [1, 1, 1, 1]
     if arguments.count > 8 {
         let given = arguments[8].split(separator: ",").compactMap { Float($0) }
         if given.count == 4 { signs = given }
@@ -518,7 +518,7 @@ func camera(_ frame: Int, moving: Bool) -> View {
 }
 
 struct Trial {
-    var jitterSign = SIMD2<Float>(-1, -1)
+    var jitterSign = SIMD2<Float>(1, 1)
     var motionSign = SIMD2<Float>(1, 1)
     var moving = false
     var noHistory = false
@@ -582,7 +582,7 @@ _ = report("no history (every frame starts afresh)", Trial(jitterSign: best.jitt
 print("best motion signs: \(name(best.motionSign))\(bestScore - unmoved < 1 ? "  (NOT CLEAR: under 1 dB better than no motion vectors)" : "")")
 _ = report("the best, with MetalFX's auto exposure", Trial(jitterSign: best.jitterSign, motionSign: best.motionSign, moving: true, autoExposure: true))
 print("""
-ImmersiveScreen.swift readTemporalConventions defaults to jitter -1 -1, motion +1 +1. If the best above differ,
+ImmersiveScreen.swift readTemporalConventions defaults to jitter +1 +1, motion +1 +1. If the best above differ,
 change the defaults there (or set LB_IMMERSIVE_TEMPORAL_SIGNS=\(Int(best.jitterSign.x)),\(Int(best.jitterSign.y)),\(Int(best.motionSign.x)),\(Int(best.motionSign.y))).
 """)
 
