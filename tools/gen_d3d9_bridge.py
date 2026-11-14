@@ -129,6 +129,9 @@ IFACES = {
 # Methods whose return type is not HRESULT/DWORD-like and need a cast.
 VOID_RET = {"PreLoad", "GenerateMipSubLevels"}
 
+# The argument holding the primitive count of each draw call, for LB_PASSES (d3d_passes_draw).
+DRAW_PRIMS = {"DrawPrimitive": 3, "DrawIndexedPrimitive": 6, "DrawPrimitiveUP": 2, "DrawIndexedPrimitiveUP": 4}
+
 
 def gen():
     o = []
@@ -156,6 +159,7 @@ def gen():
             o.append("    if (g_d3d_trace) d3d_trace(c, \"%s::%s\", %d);" % (iface, name, len(args)))
             if name.startswith("Draw") and not name.endswith("Patch"):
                 o.append("    g_d3d_draws++;")
+                o.append("    if (g_d3d_passes) d3d_passes_draw(ARG(%d));" % DRAW_PRIMS[name])
                 o.append("    if (g_bisect && d3d_skip_draw()) { RET(0, %d); return; }" % (len(args) + 1))
             call = []
             post = []

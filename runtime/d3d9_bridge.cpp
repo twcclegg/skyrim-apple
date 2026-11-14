@@ -362,6 +362,8 @@ void B_IDirect3D9_GetAdapterDisplayMode(CPU *c) {
     RET(0, 3);
 }
 
+static void passes_init(IDirect3DDevice9 *d);  // LB_PASSES, below
+
 void B_IDirect3D9_CreateDevice(CPU *c) {
     auto *d3d = (IDirect3D9 *)com_host(ARG(0));
     D3DPRESENT_PARAMETERS pp;
@@ -377,6 +379,7 @@ void B_IDirect3D9_CreateDevice(CPU *c) {
     pp_to_guest(&pp, ARG(5));
     if (SUCCEEDED(hr)) { g_bb_w = pp.BackBufferWidth; g_bb_h = pp.BackBufferHeight; }
     if (SUCCEEDED(hr)) { extern void hud_screen_device(IDirect3DDevice9 *); hud_screen_device(dev); }
+    if (SUCCEEDED(hr)) passes_init(dev);
     if (ARG(6)) M32(ARG(6)) = SUCCEEDED(hr) ? d3d9_wrap(dev, IFACE_IDirect3DDevice9) : 0;
     LOG("CreateDevice -> %08x", (uint32_t)hr);
     RET(hr, 7);
@@ -416,6 +419,7 @@ void B_IDirect3DDevice9_Reset(CPU *c) {
     rt_host_affinity_end();
     pp_to_guest(&pp, ARG(1));
     if (SUCCEEDED(hr)) { g_bb_w = pp.BackBufferWidth; g_bb_h = pp.BackBufferHeight; }
+    if (SUCCEEDED(hr) && g_d3d_passes) d3d_passes_target(d);  // Reset binds the back buffer again
     LOG("Reset %ux%u -> %08x", pp.BackBufferWidth, pp.BackBufferHeight, (uint32_t)hr);
     RET(hr, 2);
 }
@@ -469,6 +473,167 @@ static void bisect_present(void) {
     }
     g_draw_no = 0;
     g_bisect = g_frame >= g_bisect_from && g_frame < g_bisect_from + 160;
+}
+
+// LB_PASSES=1 logs, at each Present, the frame's draw calls and primitives by the kind of pass they belong to, so
+// we can tell how much of a frame a second eye would have to draw again (twcclegg/skyrim-apple#23):
+//   pass <frame> shadow=<draws>/<prims> refl=.. main=.. depth=.. fp=.. mask=.. fx=.. post=.. ui=.. other=.. rt=<changes>
+// <frame> is the one in the same frame's "ft" line (LB_FRAMETIMES), the classes add up to its draw count, and rt
+// counts changes of render target 0. LB_PASSES=2 also logs each run of draws of one class into one target, in the
+// LB_D3DTRACE frames (without it, the first frame), to check the classes against a real frame:
+//   passdbg <frame> <class> <w>x<h> fmt=<D3DFORMAT> ds=<depth-stencil bound> draws=<n> prims=<n>
+// Off, it costs one branch per draw call, target change and Clear.
+int g_d3d_passes;
+enum PassClass {
+    PASS_SHADOW, PASS_REFL, PASS_MAIN, PASS_DEPTH, PASS_FP, PASS_MASK, PASS_FX, PASS_POST, PASS_UI, PASS_OTHER, PASS_COUNT
+};
+static const char *const k_pass_names[PASS_COUNT] = {"shadow", "refl", "main", "depth", "fp",
+                                                     "mask",   "fx",   "post", "ui",    "other"};
+struct PassTotals { int draws; uint32_t prims; };  // per class and frame (a GPU time per class would go here too)
+struct PassTarget { void *rt; uint32_t w, h, fmt; bool ds, bb; };  // what draws go to now (rt: identity only)
+struct PassFrame {
+    PassTotals cls[PASS_COUNT];
+    int rt_changes;
+    bool seen_main, seen_depth, seen_bb;  // a main / depth / back buffer draw happened this frame
+    void *main_rt, *depth_rt;             // the targets of those main and depth draws
+    bool fp_main, fp_depth;               // a depth-only Clear on them since they were bound (first person)
+};
+struct PassRun { int cls; int draws; uint32_t prims; PassTarget t; };  // LB_PASSES=2: draws since the last line
+static PassTarget g_pass_target;
+static PassFrame g_pass_frame;
+static PassRun g_pass_run = {-1, 0, 0, {}};
+static bool g_passdbg;
+
+// The class of a draw, from the targets bound and what the frame drew before. Sizes are relative to the back
+// buffer (CreateDevice/Reset), never absolute. First match wins. "Seen" means it matches the Riverwood frame
+// traced with LB_D3DTRACE (docs/perf/LOG.md, 2026-11-10); everything else is unverified, check it with LB_PASSES=2.
+//   ui      a menu drawn into the second screen's image (hud_screen.cpp, Android dual screen only), or a draw into
+//           the back buffer after its first one: the HUD and menus over the final image (unverified)
+//   post    the first draw into the back buffer, if it is a quad (<= 2 primitives): the final image (unverified)
+//   fp      the main or depth target, after a Clear of depth without colour since it was bound, once that target's
+//           own pass was seen this frame: the first-person arms and weapon (unverified)
+//   depth   an R32F colour target of back-buffer size: the scene's depth drawn again (seen, 638 draws)
+//   main    an A16B16G16R16F target of back-buffer size with a depth-stencil bound, before the depth pass (size and
+//           format seen, 620 draws; the depth-stencil and "before" unverified)
+//   fx      the same target after the depth pass (unverified)
+//   shadow  a depth-stencil bound, target not of back-buffer aspect: the 512x1024 shadow map, also the two 512x512
+//           targets of the traced frame (unverified)
+//   refl    a depth-stencil bound, back-buffer aspect but smaller: the reflection (960x540 at 1280x720 seen; that
+//           it has a depth-stencil and the shadow mask has none is unverified)
+//   post    no depth-stencil and <= 2 primitives: full-screen quads, the luminance chain and filters (unverified)
+//   mask    no depth-stencil, back-buffer aspect but smaller: the deferred sun-shadow mask (unverified)
+//   fx      any other draw into a back-buffer-sized target after the depth pass (unverified)
+//   other   the rest
+static int pass_class(uint32_t prims) {
+    const PassTarget &t = g_pass_target;
+    PassFrame &f = g_pass_frame;
+    bool bb_size = g_bb_w && t.w == g_bb_w && t.h == g_bb_h;
+    int64_t skew = (int64_t)t.w * g_bb_h - (int64_t)t.h * g_bb_w;  // within a pixel of height: back-buffer aspect
+    bool bb_aspect = g_bb_w && t.w && (skew < 0 ? -skew : skew) <= (int64_t)g_bb_w;
+    bool smaller = t.w < g_bb_w;
+    if (hud_screen_in_pass()) return PASS_UI;
+    if (t.bb) {
+        bool first = !f.seen_bb;
+        f.seen_bb = true;
+        return first && prims <= 2 ? PASS_POST : PASS_UI;
+    }
+    if (t.rt && ((t.rt == f.main_rt && f.fp_main) || (t.rt == f.depth_rt && f.fp_depth))) return PASS_FP;
+    if (bb_size && t.fmt == D3DFMT_R32F) {
+        f.seen_depth = true;
+        f.depth_rt = t.rt;
+        return PASS_DEPTH;
+    }
+    if (bb_size && t.fmt == D3DFMT_A16B16G16R16F && t.ds) {
+        if (f.seen_depth) return PASS_FX;
+        f.seen_main = true;
+        f.main_rt = t.rt;
+        return PASS_MAIN;
+    }
+    if (t.ds && !bb_aspect) return PASS_SHADOW;
+    if (t.ds && smaller) return PASS_REFL;
+    if (!t.ds && prims <= 2) return PASS_POST;
+    if (!t.ds && bb_aspect && smaller) return PASS_MASK;
+    if (bb_size && f.seen_depth) return PASS_FX;
+    return PASS_OTHER;
+}
+
+static void passdbg_flush(void) {
+    const PassRun &r = g_pass_run;
+    if (r.cls >= 0 && r.draws)
+        LOG("passdbg %d %s %ux%u fmt=%u ds=%d draws=%d prims=%u", platform_frame_count(), k_pass_names[r.cls], r.t.w,
+            r.t.h, r.t.fmt, r.t.ds ? 1 : 0, r.draws, r.prims);
+    g_pass_run = {-1, 0, 0, {}};
+}
+
+void d3d_passes_draw(uint32_t prims) {
+    int k = pass_class(prims);
+    g_pass_frame.cls[k].draws++;
+    g_pass_frame.cls[k].prims += prims;
+    if (!g_passdbg) return;
+    PassRun &r = g_pass_run;
+    if (k != r.cls || g_pass_target.rt != r.t.rt || g_pass_target.ds != r.t.ds) {
+        passdbg_flush();
+        r.cls = k;
+        r.t = g_pass_target;
+    }
+    r.draws++;
+    r.prims += prims;
+}
+
+void d3d_passes_target(IDirect3DDevice9 *d) {
+    IDirect3DSurface9 *rt = nullptr, *ds = nullptr, *bb = nullptr;
+    D3DSURFACE_DESC desc = {};
+    d->GetRenderTarget(0, &rt);
+    d->GetDepthStencilSurface(&ds);
+    d->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb);
+    if (rt) rt->GetDesc(&desc);
+    if ((void *)rt != g_pass_target.rt) {
+        g_pass_frame.rt_changes++;
+        g_pass_frame.fp_main = g_pass_frame.fp_depth = false;
+    }
+    g_pass_target = {rt, desc.Width, desc.Height, (uint32_t)desc.Format, ds != nullptr, rt && rt == bb};
+    if (rt) rt->Release();
+    if (ds) ds->Release();
+    if (bb) bb->Release();
+}
+
+void d3d_passes_clear(uint32_t flags) {
+    if (!(flags & D3DCLEAR_ZBUFFER) || (flags & D3DCLEAR_TARGET)) return;
+    PassFrame &f = g_pass_frame;
+    void *rt = g_pass_target.rt;
+    if (rt && rt == f.main_rt && f.seen_main) f.fp_main = true;
+    if (rt && rt == f.depth_rt && f.seen_depth) f.fp_depth = true;
+}
+
+// After CreateDevice: reads the switch once and learns the targets the device starts with.
+static void passes_init(IDirect3DDevice9 *d) {
+    static bool read;
+    if (!read) {
+        read = true;
+        const char *e = getenv("LB_PASSES");
+        g_d3d_passes = e ? atoi(e) : 0;
+        // without an LB_D3DTRACE range, LB_PASSES=2 looks at the first frame
+        g_passdbg = g_d3d_passes == 2 && !getenv("LB_D3DTRACE");
+        if (g_d3d_passes) LOG("LB_PASSES=%d: draws per pass class logged at each Present", g_d3d_passes);
+    }
+    if (!g_d3d_passes) return;
+    d3d_passes_target(d);
+    g_pass_frame.rt_changes = 0;
+}
+
+// At Present: the frame's line, then a new frame. LB_PASSES=2 follows the LB_D3DTRACE frames (g_d3d_trace is
+// already set for the next one).
+static void passes_present(void) {
+    if (!g_d3d_passes) return;
+    passdbg_flush();
+    char line[512];
+    int n = snprintf(line, sizeof line, "pass %d", platform_frame_count());
+    for (int i = 0; i < PASS_COUNT && n < (int)sizeof line; i++)
+        n += snprintf(line + n, sizeof line - n, " %s=%d/%u", k_pass_names[i], g_pass_frame.cls[i].draws,
+                      g_pass_frame.cls[i].prims);
+    LOG("%s rt=%d", line, g_pass_frame.rt_changes);
+    g_pass_frame = PassFrame();
+    g_passdbg = g_d3d_passes == 2 && g_d3d_trace;
 }
 
 // LB_SHOT=F[,F...]: write the backbuffer about to be presented on those
@@ -1072,6 +1237,7 @@ void B_IDirect3DDevice9_Present(CPU *c) {
 #endif
     platform_present_draws(g_d3d_draws);
     g_d3d_draws = 0;
+    passes_present();
     platform_present_begin();
     HRESULT hr = d->Present((const RECT *)GPTR(ARG(1)), dst, nullptr, (const RGNDATA *)GPTR(ARG(4)));
     platform_present_end();
