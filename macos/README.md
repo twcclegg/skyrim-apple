@@ -114,7 +114,11 @@ the [Simulator notes](../simulator/README.md) for commands and details.
   `depth_compare_smoke` checks the Apple shadow-compare path (PCF ramp,
   projected lookups, point step, reference clamp). `base_vertex_fold_smoke
   --compare` draws natively and with the Simulator's base-vertex fold forced
-  and requires identical pixels.
+  and requires identical pixels. `stereo_shift_smoke` (and
+  `stereo_shift_smoke_passes_all`, with `LB_STEREO_PASSES=all`) checks DXVK's
+  stereo clip-space offset: perspective draws move by the expected pixels and
+  keep the documented depth, w == 1 draws and off-aspect viewports do not move,
+  and the fixed-function gap is reported as INFO.
 - Authored PE32 test instructions pass actual recursive discovery, C generation,
   native compilation and expected-result checks. These include calls, integer
   flags, unaligned memory, SSE, x87, atomic operations and Windows FS-relative
