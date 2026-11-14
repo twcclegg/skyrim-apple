@@ -41,6 +41,10 @@ typedef struct skyrim_immersive_frame {
      * columns are forward, up, right; position; frustum tangents left, right, top, bottom; near; far. */
     float camera[18];
     int has_camera;
+    /* How far the frame was shifted for temporal upscaling (skyrim_camera_jitter), in its own pixels right and
+     * down; the camera above is without the shift. has_jitter = 0 and 0, 0 for a frame that wasn't. */
+    float jitter[2];
+    int has_jitter;
 } skyrim_immersive_frame;
 void skyrim_immersive_start(void);
 void skyrim_immersive_stop(void);
@@ -51,6 +55,13 @@ void skyrim_immersive_release(void *state, uint32_t slot);
 void skyrim_head_set(float yaw, float pitch, int on);
 /* The game heading (radians, clockwise from north) that head yaw 0 maps to; *valid = 0 until steering anchors. */
 float skyrim_head_offset(int *valid);
+/* runtime/d3d9_bridge.cpp, for temporal upscaling (docs/handoff/temporal-upscale.md); both from any thread.
+ * Shifts the world camera by a different fraction of a pixel each frame, over a sequence of `phases` positions;
+ * 0 stops it. Takes effect a frame or two later; each frame carries its own shift (jitter above). */
+void skyrim_camera_jitter(int phases);
+/* Added to the mip level the game's textures are sampled at: log2(render size / shown size), so -1 when the
+ * picture is shown at twice the size it was rendered at. 0 = as the game sets it. */
+void skyrim_texture_bias(float levels);
 #endif
 
 #endif

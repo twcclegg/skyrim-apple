@@ -29,8 +29,11 @@ typedef struct skyrim_immersive_frame {
     void *depth_texture;
     float camera[18];
     int has_camera;
+    float jitter[2];
+    int has_jitter;
 } skyrim_immersive_frame;
 int skyrim_frame_camera(float out[18]);  /* runtime/d3d9_bridge.cpp */
+int skyrim_frame_jitter(float out[2]);
 }
 
 namespace {
@@ -43,7 +46,9 @@ struct Entry {
     uint64_t depth = 0;
     uint32_t slot = 0, width = 0, height = 0, format = 0;
     float camera[18] = {};
+    float jitter[2] = {};
     bool has_camera = false;
+    bool has_jitter = false;
     bool valid = false;
 };
 
@@ -75,6 +80,7 @@ Entry entry_of(const skyrim_present_tap_frame *frame) {
     entry.format = frame->vk_format;
     entry.depth = frame->depth_vk_image;
     entry.has_camera = skyrim_frame_camera(entry.camera) != 0;  /* called inside this frame's Present */
+    entry.has_jitter = skyrim_frame_jitter(entry.jitter) != 0;
     entry.valid = true;
     return entry;
 }
@@ -212,5 +218,7 @@ extern "C" int skyrim_immersive_acquire(skyrim_immersive_frame *out) {
     out->depth_texture = (__bridge void *)depth_texture(g_shown);
     memcpy(out->camera, g_shown.camera, sizeof out->camera);
     out->has_camera = g_shown.has_camera ? 1 : 0;
+    memcpy(out->jitter, g_shown.jitter, sizeof out->jitter);
+    out->has_jitter = g_shown.has_jitter ? 1 : 0;
     return 1;
 }

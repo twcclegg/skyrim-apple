@@ -95,6 +95,38 @@ private struct QuadUniforms {
     var sharpen: Float
 }
 
+/// The game camera a frame was rendered with (skyrim_immersive_frame.camera), without its temporal shift.
+private struct GameView {
+    var forward, up, right, position: SIMD3<Float>
+    /// Tangents left, right, top, bottom.
+    var frustum: SIMD4<Float>
+    var near, far: Float
+    init(_ c: [Float]) {
+        forward = SIMD3(c[0], c[3], c[6])
+        up = SIMD3(c[1], c[4], c[7])
+        right = SIMD3(c[2], c[5], c[8])
+        position = SIMD3(c[9], c[10], c[11])
+        frustum = SIMD4(c[12], c[13], c[14], c[15])
+        near = c[16]
+        far = c[17]
+    }
+}
+
+/// For temporal_fragment; the layout matches TemporalUniforms in the shader source (176 bytes).
+private struct TemporalUniforms {
+    var forward, up, right, frustum: SIMD4<Float>
+    var beforeForward, beforeUp, beforeRight, beforeFrustum: SIMD4<Float>
+    /// This frame's camera position minus that of the frame before.
+    var moved: SIMD4<Float>
+    var nearFar: SIMD2<Float>
+    /// This frame's shift, in its pixels right and down.
+    var jitter: SIMD2<Float>
+    var size: SIMD2<Float>
+    var decode: UInt32
+    /// 1: there is no frame before to compare with; write no motion.
+    var still: UInt32
+}
+
 /// Runs on its own thread for as long as the layer lives: presents at the display's rate, showing the newest finished
 /// game frame and repeating the last one when the game hasn't produced another.
 final class ImmersiveCompositor: @unchecked Sendable {
@@ -206,6 +238,56 @@ final class ImmersiveCompositor: @unchecked Sendable {
         if (u.decode) c = select(pow((c + 0.055) / 1.055, 2.4), c / 12.92, c <= 0.04045);
         return float4(c, 1);
     }
+
+    // Temporal upscaling (LB_IMMERSIVE_TEMPORAL). One pass over a new game frame, at its own size, makes what the
+    // MetalFX temporal scaler takes: the picture in linear light, how far each pixel has moved since the frame
+    // before, and its depth as a depth texture. Only the camera's movement is known, so a pixel is taken to show
+    // a point that stood still: the point is found from the pixel's depth and this frame's camera, and looked up
+    // in the camera of the frame before. tools/taa_sim.py reproject does the same sums on dumped frames.
+    struct TemporalUniforms {
+        float4 forward; float4 up; float4 right; float4 frustum;
+        float4 beforeForward; float4 beforeUp; float4 beforeRight; float4 beforeFrustum;
+        float4 moved; float2 nearFar; float2 jitter; float2 size; uint decode; uint still;
+    };
+    struct TemporalVertex { float4 position [[position]]; };
+    struct TemporalOut { float4 color [[color(0)]]; float4 motion [[color(1)]]; float depth [[depth(any)]]; };
+    vertex TemporalVertex temporal_vertex(uint id [[vertex_id]]) {
+        TemporalVertex out;
+        out.position = float4(float2((id << 1) & 2, id & 2) * 2 - 1, 0, 1);
+        return out;
+    }
+    fragment TemporalOut temporal_fragment(TemporalVertex in [[stage_in]], texture2d<float> image [[texture(0)]],
+                                           texture2d<float> depth [[texture(1)]],
+                                           constant TemporalUniforms &u [[buffer(0)]]) {
+        uint2 at = uint2(in.position.xy);
+        float3 c = image.read(at).rgb;
+        if (u.decode) c = select(pow((c + 0.055) / 1.055, 2.4), c / 12.92, c <= 0.04045);
+        float d = depth.read(at).r;
+        TemporalOut out;
+        out.color = float4(c, 1);
+        out.depth = d;
+        out.motion = float4(0);
+        if (u.still == 0) {
+            // The pixel's centre with this frame's shift taken out, in pixels from the top left.
+            float2 here = in.position.xy - u.jitter;
+            float2 uv = here / u.size;
+            // D3D depth (0 near to 1 far) to distance along the camera's forward axis, then the point the pixel
+            // shows, relative to the camera of the frame before.
+            float z = u.nearFar.x * u.nearFar.y / (u.nearFar.y - d * (u.nearFar.y - u.nearFar.x));
+            float x = z * mix(u.frustum.x, u.frustum.y, uv.x);
+            float y = z * mix(u.frustum.z, u.frustum.w, uv.y);
+            float3 seen = u.moved.xyz + u.forward.xyz * z + u.right.xyz * x + u.up.xyz * y;
+            float ahead = dot(seen, u.beforeForward.xyz);
+            if (ahead > 0) {
+                float2 was = float2(
+                    (dot(seen, u.beforeRight.xyz) / ahead - u.beforeFrustum.x) / (u.beforeFrustum.y - u.beforeFrustum.x),
+                    (u.beforeFrustum.z - dot(seen, u.beforeUp.xyz) / ahead) / (u.beforeFrustum.z - u.beforeFrustum.w));
+                // From where the pixel is to where it was, in this frame's pixels, neither frame's shift in it.
+                out.motion.xy = was * u.size - here;
+            }
+        }
+        return out;
+    }
     """
 
     /// Distance to the screen and its width, in meters.
@@ -250,16 +332,20 @@ final class ImmersiveCompositor: @unchecked Sendable {
     /// LB_IMMERSIVE_UPSCALE=<factor> (1.25 to 3, for example 2): the game image goes through a MetalFX spatial
     /// upscale to factor times its size before it is drawn, so the game can render small (LB_WINDOW) and still
     /// be shown sharp. Unset, 0 or 1: off. LB_IMMERSIVE_SHARPEN=<0 to 1>: sharpening when the image is drawn,
-    /// with or without the upscale; off by default. Both are read once the game is presenting.
-    private var imageSettings: (upscale: Float, sharpen: Float)?
-    private func readImageSettings() -> (upscale: Float, sharpen: Float) {
+    /// with or without the upscale; off by default. LB_IMMERSIVE_TEMPORAL=1 with an upscale factor: the upscale
+    /// is MetalFX's temporal one, built from several game frames (temporalUpscale below). All are read once the
+    /// game is presenting.
+    private var imageSettings: (upscale: Float, sharpen: Float, temporal: Bool)?
+    private func readImageSettings() -> (upscale: Float, sharpen: Float, temporal: Bool) {
         if let imageSettings { return imageSettings }
         func number(_ name: String) -> Float { getenv(name).flatMap { Float(String(cString: $0)) } ?? 0 }
         var upscale = number("LB_IMMERSIVE_UPSCALE")
         upscale = upscale > 1 ? min(max(upscale, 1.25), 3) : 0
-        let settings = (upscale: upscale, sharpen: min(max(number("LB_IMMERSIVE_SHARPEN"), 0), 1))
+        let settings = (upscale: upscale, sharpen: min(max(number("LB_IMMERSIVE_SHARPEN"), 0), 1),
+                        temporal: upscale > 0 && number("LB_IMMERSIVE_TEMPORAL") == 1)
         imageSettings = settings
-        log("image: upscale \(settings.upscale > 0 ? "x\(settings.upscale)" : "off"), sharpen \(settings.sharpen)")
+        let kind = settings.temporal ? "temporal" : "spatial"
+        log("image: upscale \(settings.upscale > 0 ? "x\(settings.upscale) \(kind)" : "off"), sharpen \(settings.sharpen)")
         return settings
     }
     #if canImport(MetalFX)
@@ -326,6 +412,235 @@ final class ImmersiveCompositor: @unchecked Sendable {
         #else
         upscaleUnavailable = true
         log("upscale: MetalFX is not in this SDK (visionOS Simulator); drawing the game image as it is")
+        return nil
+        #endif
+    }
+
+    // Temporal upscaling (LB_IMMERSIVE_TEMPORAL=1 with LB_IMMERSIVE_UPSCALE=<factor>, docs/handoff/temporal-upscale.md).
+    // The game renders small and shifts its camera by a different fraction of a pixel each frame; MetalFX's
+    // temporal scaler adds the frames up into a picture factor times the size, following the camera's movement
+    // through the motion and depth temporal_fragment writes. Frames without a camera (menus, loading) go through
+    // the spatial scaler instead, and the next frame with one starts afresh.
+    #if canImport(MetalFX)
+    private var temporalScaler: (any MTLFXTemporalScaler)?
+    #endif
+    private var temporalPipeline: (any MTLRenderPipelineState)?
+    private var temporalDepthState: (any MTLDepthStencilState)?
+    private var temporalInputs: (color: any MTLTexture, motion: any MTLTexture, depth: any MTLTexture)?
+    private var temporalOutput: (any MTLTexture)?
+    private var temporalFrom: (width: Int, height: Int)?
+    private var temporalUnavailable = false
+    /// The camera of the last game frame that went through the scaler; nil when the next one starts afresh.
+    private var temporalBefore: GameView?
+    /// Whether the game frame on show went through the scaler (a repeated frame is drawn from its output again).
+    private var temporalShown = false
+    /// New frames in a row that had a camera but no usable depth.
+    private var temporalMissing = 0
+    private var temporalFrames = 0, temporalRestarts = 0
+    /// What MetalFX is told about a frame's shift and motion, as multipliers on this file's own conventions (a
+    /// shift moves the picture right and down; motion points from where a pixel is to where it was, in the
+    /// frame's pixels, y down). LB_IMMERSIVE_TEMPORAL_SIGNS=<jitter x>,<jitter y>,<motion x>,<motion y> overrides
+    /// the signs and LB_IMMERSIVE_TEMPORAL_AUTOEXPOSURE=1 lets MetalFX set its own exposure. The defaults are a
+    /// reading of Apple's documentation that has not been run: tools/metalfx_temporal_probe.swift finds the
+    /// right ones on a Mac.
+    private var temporalConventions: (jitter: SIMD2<Float>, motion: SIMD2<Float>, autoExposure: Bool)?
+    private func readTemporalConventions() -> (jitter: SIMD2<Float>, motion: SIMD2<Float>, autoExposure: Bool) {
+        if let temporalConventions { return temporalConventions }
+        var signs: [Float] = [-1, -1, 1, 1]
+        if let raw = getenv("LB_IMMERSIVE_TEMPORAL_SIGNS") {
+            let given = String(cString: raw).split(separator: ",").compactMap { Float($0) }
+            if given.count == 4 { signs = given }
+        }
+        let automatic = getenv("LB_IMMERSIVE_TEMPORAL_AUTOEXPOSURE").map { String(cString: $0) == "1" } ?? false
+        let conventions = (jitter: SIMD2(signs[0], signs[1]), motion: SIMD2(signs[2], signs[3]), autoExposure: automatic)
+        temporalConventions = conventions
+        return conventions
+    }
+
+    /// Stops the temporal upscale for good and has the game draw unshifted frames again.
+    private func temporalGiveUp(_ why: String) {
+        temporalUnavailable = true
+        temporalShown = false
+        temporalBefore = nil
+        temporalInputs = nil
+        temporalOutput = nil
+        #if canImport(MetalFX)
+        temporalScaler = nil
+        #endif
+        skyrim_camera_jitter(0)
+        skyrim_texture_bias(0)
+        log("temporal: \(why); using the spatial upscale")
+    }
+
+    #if canImport(MetalFX)
+    /// The scaler, its textures and the pass that feeds it, for game frames of this size. The game is only asked
+    /// to shift its camera once all of them exist, so a scaler that can't be made never leaves a shifted picture.
+    private func makeTemporal(width: Int, height: Int, factor: Float) -> Bool {
+        temporalScaler = nil
+        temporalInputs = nil
+        temporalOutput = nil
+        temporalBefore = nil
+        guard MTLFXTemporalScalerDescriptor.supportsDevice(device) else {
+            temporalGiveUp("MetalFX temporal scaling is not supported on this device")
+            return false
+        }
+        let conventions = readTemporalConventions()
+        let description = MTLFXTemporalScalerDescriptor()
+        description.inputWidth = width
+        description.inputHeight = height
+        description.outputWidth = Int((Float(width) * factor).rounded())
+        description.outputHeight = Int((Float(height) * factor).rounded())
+        description.colorTextureFormat = .rgba16Float
+        description.depthTextureFormat = .depth32Float
+        description.motionTextureFormat = .rg16Float
+        description.outputTextureFormat = .rgba16Float
+        description.isAutoExposureEnabled = conventions.autoExposure
+        guard let made = description.makeTemporalScaler(device: device) else {
+            temporalGiveUp("no MetalFX temporal scaler for \(width)x\(height) -> \(description.outputWidth)x\(description.outputHeight)")
+            return false
+        }
+        func target(_ format: MTLPixelFormat, _ width: Int, _ height: Int, _ usage: MTLTextureUsage) -> (any MTLTexture)? {
+            let wanted = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: format, width: width, height: height, mipmapped: false)
+            wanted.usage = usage
+            wanted.storageMode = .private
+            return device.makeTexture(descriptor: wanted)
+        }
+        guard let color = target(.rgba16Float, width, height, made.colorTextureUsage.union([.renderTarget, .shaderRead])),
+              let motion = target(.rg16Float, width, height, made.motionTextureUsage.union([.renderTarget, .shaderRead])),
+              let depth = target(.depth32Float, width, height, made.depthTextureUsage.union([.renderTarget, .shaderRead])),
+              let output = target(.rgba16Float, description.outputWidth, description.outputHeight,
+                                  made.outputTextureUsage.union(.shaderRead)) else {
+            temporalGiveUp("no textures for \(width)x\(height) -> \(description.outputWidth)x\(description.outputHeight)")
+            return false
+        }
+        if temporalPipeline == nil || temporalDepthState == nil {
+            do {
+                let library = try device.makeLibrary(source: Self.shaders, options: nil)
+                let pass = MTLRenderPipelineDescriptor()
+                pass.vertexFunction = library.makeFunction(name: "temporal_vertex")
+                pass.fragmentFunction = library.makeFunction(name: "temporal_fragment")
+                pass.colorAttachments[0].pixelFormat = .rgba16Float
+                pass.colorAttachments[1].pixelFormat = .rg16Float
+                pass.depthAttachmentPixelFormat = .depth32Float
+                temporalPipeline = try device.makeRenderPipelineState(descriptor: pass)
+            } catch {
+                temporalGiveUp("no pipeline for the motion pass: \(error)")
+                return false
+            }
+            let always = MTLDepthStencilDescriptor()
+            always.depthCompareFunction = .always
+            always.isDepthWriteEnabled = true
+            temporalDepthState = device.makeDepthStencilState(descriptor: always)
+            guard temporalDepthState != nil else {
+                temporalGiveUp("no depth state for the motion pass")
+                return false
+            }
+        }
+        temporalScaler = made
+        temporalInputs = (color, motion, depth)
+        temporalOutput = output
+        temporalFrom = (width, height)
+        // MetalFX suggests 8 positions times the area ratio. Textures are sampled as if the game rendered at
+        // the size shown, or they come out a mip level too soft.
+        let phases = Int32((8 * factor * factor).rounded())
+        skyrim_camera_jitter(phases)
+        skyrim_texture_bias(-log2(factor))
+        log("temporal: MetalFX temporal \(width)x\(height) -> \(output.width)x\(output.height), \(phases) jitter positions, texture bias \(-log2(factor)), signs jitter \(conventions.jitter.x) \(conventions.jitter.y) motion \(conventions.motion.x) \(conventions.motion.y), auto exposure \(conventions.autoExposure ? "on" : "off")")
+        return true
+    }
+    #endif
+
+    /// The game image after the MetalFX temporal upscale, in linear light (no sRGB decode left to do), encoded
+    /// into `commands` when the frame is new. nil when it is off, can't be made (logged once), or this frame has
+    /// no camera or depth to follow; the caller then uses the spatial upscale or the image as it is.
+    private func temporalUpscale(_ texture: any MTLTexture, depth sceneDepth: (any MTLTexture)?, game: skyrim_immersive_frame,
+                                 factor: Float, commands: any MTLCommandBuffer) -> (any MTLTexture)? {
+        guard factor > 1, !temporalUnavailable else { return nil }
+        #if canImport(MetalFX)
+        if game.is_new == 0 { return temporalShown ? temporalOutput : nil }
+        temporalShown = false
+        guard game.has_camera != 0 else {
+            // A menu or a loading screen. The runtime doesn't shift the camera under a menu either.
+            temporalBefore = nil
+            temporalMissing = 0
+            return nil
+        }
+        guard let sceneDepth, sceneDepth.width == texture.width, sceneDepth.height == texture.height else {
+            temporalBefore = nil
+            temporalMissing += 1
+            if temporalMissing >= 120 { temporalGiveUp("120 frames with a camera but no scene depth the picture's size") }
+            return nil
+        }
+        temporalMissing = 0
+        if temporalScaler == nil || temporalFrom?.width != texture.width || temporalFrom?.height != texture.height {
+            guard makeTemporal(width: texture.width, height: texture.height, factor: factor) else { return nil }
+        }
+        guard let scaler = temporalScaler, let inputs = temporalInputs, let output = temporalOutput,
+              let pipeline = temporalPipeline, let depthState = temporalDepthState else { return nil }
+
+        let view = GameView(withUnsafeBytes(of: game.camera) { Array($0.bindMemory(to: Float.self)) })
+        // Start afresh after a frame without a camera, and after a jump no walk or turn makes (a door, fast
+        // travel): what the scaler has added up is of another place.
+        var before = temporalBefore
+        if let was = before, length(view.position - was.position) > 1000 || dot(view.forward, was.forward) < 0.5 { before = nil }
+        let restart = before == nil
+        let from = before ?? view
+        var uniforms = TemporalUniforms(forward: SIMD4(view.forward, 0), up: SIMD4(view.up, 0), right: SIMD4(view.right, 0),
+                                        frustum: view.frustum,
+                                        beforeForward: SIMD4(from.forward, 0), beforeUp: SIMD4(from.up, 0),
+                                        beforeRight: SIMD4(from.right, 0), beforeFrustum: from.frustum,
+                                        moved: SIMD4(view.position - from.position, 0),
+                                        nearFar: SIMD2(view.near, view.far),
+                                        jitter: SIMD2(game.jitter.0, game.jitter.1),
+                                        size: SIMD2(Float(texture.width), Float(texture.height)),
+                                        decode: game.needs_srgb_decode != 0 ? 1 : 0, still: restart ? 1 : 0)
+        let pass = MTLRenderPassDescriptor()
+        pass.colorAttachments[0].texture = inputs.color
+        pass.colorAttachments[0].loadAction = .dontCare
+        pass.colorAttachments[0].storeAction = .store
+        pass.colorAttachments[1].texture = inputs.motion
+        pass.colorAttachments[1].loadAction = .dontCare
+        pass.colorAttachments[1].storeAction = .store
+        pass.depthAttachment.texture = inputs.depth
+        pass.depthAttachment.loadAction = .dontCare
+        pass.depthAttachment.storeAction = .store
+        guard let encoder = commands.makeRenderCommandEncoder(descriptor: pass) else {
+            temporalBefore = nil
+            return nil
+        }
+        encoder.setRenderPipelineState(pipeline)
+        encoder.setDepthStencilState(depthState)
+        encoder.setCullMode(.none)
+        encoder.setFragmentBytes(&uniforms, length: MemoryLayout<TemporalUniforms>.stride, index: 0)
+        encoder.setFragmentTexture(texture, index: 0)
+        encoder.setFragmentTexture(sceneDepth, index: 1)
+        encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
+        encoder.endEncoding()
+
+        let conventions = readTemporalConventions()
+        scaler.colorTexture = inputs.color
+        scaler.depthTexture = inputs.depth
+        scaler.motionTexture = inputs.motion
+        scaler.outputTexture = output
+        scaler.inputContentWidth = texture.width
+        scaler.inputContentHeight = texture.height
+        scaler.jitterOffsetX = conventions.jitter.x * game.jitter.0
+        scaler.jitterOffsetY = conventions.jitter.y * game.jitter.1
+        scaler.motionVectorScaleX = conventions.motion.x
+        scaler.motionVectorScaleY = conventions.motion.y
+        scaler.isDepthReversed = false  // D3D depth: 0 near, 1 far
+        scaler.preExposure = 1
+        scaler.reset = restart
+        scaler.encode(commandBuffer: commands)
+
+        temporalBefore = view
+        temporalShown = true
+        temporalFrames += 1
+        if restart { temporalRestarts += 1 }
+        return output
+        #else
+        temporalUnavailable = true
+        log("temporal: MetalFX is not in this SDK (visionOS Simulator); using the image as it is")
         return nil
         #endif
     }
@@ -414,6 +729,8 @@ final class ImmersiveCompositor: @unchecked Sendable {
         skyrim_sdl_set_window_ghost(0)
         DispatchQueue.main.async { NotificationCenter.default.post(name: .skyrimImmersiveRunning, object: false) }
         if headMode { skyrim_head_set(0, 0, 0) }
+        skyrim_camera_jitter(0)
+        skyrim_texture_bias(0)
         lastCommands?.waitUntilCompleted()
         skyrim_immersive_stop()
         session.stop()
@@ -511,14 +828,22 @@ final class ImmersiveCompositor: @unchecked Sendable {
             log("game texture \(texture.width)x\(texture.height), same Metal device as the layer: \(texture.device === device)")
         }
 
-        // The image the screen is drawn from: the game frame, or its MetalFX upscale.
+        // The image the screen is drawn from: the game frame, or its MetalFX upscale (temporal if asked for and
+        // the frame has a camera, spatial otherwise).
         var image = texture
         var sharpen: Float = 0
+        var decode = game.needs_srgb_decode != 0
         if let texture {
             let imageSettings = readImageSettings()
             sharpen = imageSettings.sharpen
-            image = upscale(texture, isNew: game.is_new != 0, encoded: game.needs_srgb_decode != 0,
-                            factor: imageSettings.upscale, commands: commands) ?? texture
+            if imageSettings.temporal, let sharp = temporalUpscale(texture, depth: depthTexture, game: game,
+                                                                   factor: imageSettings.upscale, commands: commands) {
+                image = sharp
+                decode = false
+            } else {
+                image = upscale(texture, isNew: game.is_new != 0, encoded: game.needs_srgb_decode != 0,
+                                factor: imageSettings.upscale, commands: commands) ?? texture
+            }
         }
 
         var publishedHead = false
@@ -574,7 +899,7 @@ final class ImmersiveCompositor: @unchecked Sendable {
                     var uniforms = QuadUniforms(viewProjection: drawable.computeProjection(convention: .rightUpBack, viewIndex: index) * viewMatrix,
                                                 model: model,
                                                 halfSize: halfSize ?? SIMD2(Self.width / 2, Self.width / 2 / aspect),
-                                                decode: game.needs_srgb_decode != 0 ? 1 : 0,
+                                                decode: decode ? 1 : 0,
                                                 hasDepth: useDepth ? 1 : 0,
                                                 grid: SIMD2(Self.gridColumns, Self.gridRows),
                                                 eyeBack: eyeBack, nearUnits: settings.near, unitsPerMeter: settings.units,
@@ -612,6 +937,9 @@ final class ImmersiveCompositor: @unchecked Sendable {
             if let spatial = SpatialEventLog.take() { log("spatial events: \(spatial)") }
             let gpu = gpuTime.take()
             if gpu.count > 0 { log(String(format: "compositor gpu %.2f ms per frame", gpu.total * 1000 / Double(gpu.count))) }
+            if temporalFrames > 0 { log("temporal: \(temporalFrames) frames upscaled, \(temporalRestarts) fresh starts") }
+            temporalFrames = 0
+            temporalRestarts = 0
             presented = 0
             newFrames = 0
             loggedAt = now
