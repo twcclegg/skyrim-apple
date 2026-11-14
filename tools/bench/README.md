@@ -38,6 +38,23 @@ depth-stencil is bound, depth-only clears, quads); the rules and which of them a
 first frame without it), one `passdbg <frame> <class> <w>x<h> fmt=<n> ds=<0|1> draws=<n> prims=<n>` line per run
 of draws of one class into one target, to check the rules against a real frame.
 
+## GPU busy time and per-pass-class counts
+
+Both are optional; a log without them parses as before.
+
+- GPU busy: runs set `LB_POWER_LOG_S=2` (unless the scenario or `--env` sets it), so the game prints
+  `dxvk: gpu busy <N>%, <X> ms per frame over <F> frames` every 2 s on stderr. `summary.json` gets a top-level
+  `gpu` object: `{"windows", "frames", "gpu_busy_ms", "gpu_busy_pct"}`, both means weighted by each window's frame
+  count. These lines carry no frame numbers, so they can't be tied to phases: the figure covers the whole run
+  (loading and menus included). `compare` prints it as one line.
+- Pass classes: with `LB_PASSES=1` (add `--env LB_PASSES=1`) the game prints one line per frame,
+  `pass <frame> shadow=<draws>/<prims> refl=... main=620/41233/3.21 ... rt=<n>`. Every `key=a/b[/c]` is parsed
+  generically, so new classes or the third number (GPU ms) need no parser change. Each phase (and `overall`)
+  gets `passes`: `{class: {"frames", "draws_mean", "prims_mean", "gpu_ms_mean"}}`; `gpu_ms_mean` appears only when
+  the lines carry it, and a single-number key such as `rt` gives `{"frames", "value_mean"}`. Screenshot frames are
+  excluded, as for frame times. `compare` prints a per-class table (draws, prims, GPU ms; baseline->candidate and
+  the ratio) per phase when both runs have `passes`. Pass lines are read from the game log and the console.
+
 ## Scenarios
 
 JSON in `scenarios/`. From the main menu they open the console, type commands (`tgm`, then `coc <cell>`, which
