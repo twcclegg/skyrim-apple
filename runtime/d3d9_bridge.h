@@ -29,7 +29,8 @@ bool d3d_skip_draw(void);
 void d3d_trace(CPU *c, const char *name, int nargs);
 
 /* LB_PASSES (d3d9_bridge.cpp): draws and primitives per kind of pass, logged at each Present. 0 off, 1 the
- * per-frame "pass" line, 2 also "passdbg" lines. The hooks are called only while it is on. */
+ * per-frame "pass" line, 2 also "passdbg" lines. The hooks are called only while it is on. LB_PASSES_GPU=1 adds
+ * "passgpu" lines with GPU ms per class from timestamp queries. */
 extern int g_d3d_passes;
 void d3d_passes_draw(uint32_t prims);          // every Draw*Primitive*, with its primitive count
 void d3d_passes_target(IDirect3DDevice9 *d);   // after the render target 0 or the depth-stencil surface changed

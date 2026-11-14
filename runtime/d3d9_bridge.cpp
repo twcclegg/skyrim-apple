@@ -565,8 +565,139 @@ static void passdbg_flush(void) {
     g_pass_run = {-1, 0, 0, {}};
 }
 
+// LB_PASSES_GPU=1 (with LB_PASSES) adds GPU milliseconds per class from Direct3D 9 timestamp queries, which DXVK
+// turns into vkCmdWriteTimestamp (MoltenVK: Metal counter sample buffers). A timestamp ("mark") is issued at the
+// first change of target or draw of a frame, at each change of render target 0 or depth-stencil, at each change of
+// class between draws, and at Present; the time from one mark to the next goes to the class of the first draw after
+// the first mark (a span with no draw goes to "other"). The queries are read without flushing a few frames later,
+// and each frame gets one line once its last timestamp is in:
+//   passgpu <frame> shadow=<ms> refl=.. main=.. depth=.. fp=.. mask=.. fx=.. post=.. ui=.. other=.. total=<ms>
+//           marks=<n> zero=<n>
+// <frame> is the one of the frame's "pass" line (tools/bench/bench.py merges the two), total is the sum of the
+// classes (first mark to last), marks the timestamps of the frame (past GPU_MARKS the last span takes the rest of
+// the frame), zero counts spans that read exactly 0 (the GPU resolves timestamps at encoder boundaries: a class sharing an encoder with the next
+// reads 0 and the next absorbs it). GPU idle inside a frame (waiting for the CPU to submit) is counted in the span
+// it falls in; the Present blit after the last mark is not counted. LB_PASSES_GPU=2 also logs every span of one
+// frame in every 300 ("passgpudbg <frame> <i> <class> <ms>") to see the granularity.
+static int g_passes_gpu;
+static IDirect3DDevice9 *g_pass_dev;  // the real device (CreateDevice), not AddRef'd
+static double g_gpu_tick_ms;          // ms per timestamp tick
+enum { GPU_MARKS = 384, GPU_RING = 8, GPU_UNRESOLVED = -1, GPU_END = -2 };
+struct GpuFrame {
+    IDirect3DQuery9 *q[GPU_MARKS];
+    int8_t cls[GPU_MARKS];  // class of the span that starts at mark i
+    int marks, frame;
+    bool pending;           // issued, waiting to be read
+};
+static GpuFrame g_gpu_ring[GPU_RING];
+static int g_gpu_cur, g_gpu_drops;  // ring slot being recorded, frames dropped unread
+
+static void gpu_mark(int cls) {
+    GpuFrame &g = g_gpu_ring[g_gpu_cur];
+    if (g.pending) return;  // the ring is full of unread frames: this one goes unmeasured
+    if (g.marks >= GPU_MARKS) return;
+    IDirect3DQuery9 *&q = g.q[g.marks];
+    if (!q && FAILED(g_pass_dev->CreateQuery(D3DQUERYTYPE_TIMESTAMP, &q))) { q = nullptr; return; }
+    q->Issue(D3DISSUE_END);
+    g.cls[g.marks++] = (int8_t)cls;
+}
+
+// A draw of class k: the open span takes it, or a new span starts if it was another class.
+static void gpu_draw(int k) {
+    GpuFrame &g = g_gpu_ring[g_gpu_cur];
+    if (!g.marks) { gpu_mark(k); return; }
+    int8_t &last = g.cls[g.marks - 1];
+    if (last == GPU_UNRESOLVED) last = (int8_t)k;
+    else if (last != k) gpu_mark(k);
+}
+
+// The target changed: a new span whose class is that of its first draw (one mark for several changes in a row).
+static void gpu_target(void) {
+    GpuFrame &g = g_gpu_ring[g_gpu_cur];
+    if (!g.marks || g.cls[g.marks - 1] != GPU_UNRESOLVED) gpu_mark(GPU_UNRESOLVED);
+}
+
+// Reads every frame whose timestamps are all in, oldest first; a frame still out when the ring comes round to it
+// again is dropped.
+static void gpu_collect(void) {
+    for (int n = 1; n <= GPU_RING; n++) {
+        GpuFrame &g = g_gpu_ring[(g_gpu_cur + n) % GPU_RING];  // oldest first
+        if (!g.pending) continue;
+        UINT64 last = 0;
+        if (g.q[g.marks - 1]->GetData(&last, sizeof last, 0) != S_OK) return;  // later frames are not in either
+        double ms[PASS_COUNT] = {}, total = 0;
+        int zero = 0;
+        UINT64 prev = 0;
+        static int dbg_count;
+        bool dbg = g_passes_gpu == 2 && dbg_count++ % 300 == 0;
+        for (int i = 0; i < g.marks; i++) {
+            UINT64 t = 0;
+            if (g.q[i]->GetData(&t, sizeof t, 0) != S_OK) t = prev;
+            if (i) {
+                double d = t >= prev ? (double)(t - prev) * g_gpu_tick_ms : 0;
+                int c = g.cls[i - 1] >= 0 ? g.cls[i - 1] : PASS_OTHER;
+                ms[c] += d;
+                total += d;
+                zero += t == prev;
+                if (dbg) LOG("passgpudbg %d %d %s %.4f", g.frame, i - 1, k_pass_names[c], d);
+            }
+            prev = t;
+        }
+        char line[512];
+        int len = snprintf(line, sizeof line, "passgpu %d", g.frame);
+        for (int i = 0; i < PASS_COUNT && len < (int)sizeof line; i++)
+            len += snprintf(line + len, sizeof line - len, " %s=%.3f", k_pass_names[i], ms[i]);
+        LOG("%s total=%.3f marks=%d zero=%d", line, total, g.marks, zero);
+        g.pending = false;
+        g.marks = 0;
+    }
+}
+
+// At Present, before the real one: the frame's last mark, then the next slot.
+static void gpu_present(int frame) {
+    GpuFrame &g = g_gpu_ring[g_gpu_cur];
+    if (g.marks && !g.pending) {
+        if (g.marks >= GPU_MARKS) g.marks--;  // the end mark replaces the last span
+        gpu_mark(GPU_END);
+        g.frame = frame;
+        g.pending = g.marks > 1;
+        if (!g.pending) g.marks = 0;
+    }
+    gpu_collect();
+    g_gpu_cur = (g_gpu_cur + 1) % GPU_RING;
+    GpuFrame &next = g_gpu_ring[g_gpu_cur];
+    if (next.pending) {  // still unread after GPU_RING frames: give up on it
+        next.pending = false;
+        next.marks = 0;
+        if (g_gpu_drops++ < 10 || g_gpu_drops % 100 == 0) LOG("passgpu: frame %d dropped unread (%d so far)", next.frame, g_gpu_drops);
+    }
+}
+
+static void gpu_init(IDirect3DDevice9 *d) {
+    const char *e = getenv("LB_PASSES_GPU");
+    g_passes_gpu = e ? atoi(e) : 0;
+    if (!g_passes_gpu) return;
+    g_pass_dev = d;
+    IDirect3DQuery9 *fq = nullptr;
+    UINT64 freq = 0;
+    if (SUCCEEDED(d->CreateQuery(D3DQUERYTYPE_TIMESTAMPFREQ, &fq))) {
+        fq->Issue(D3DISSUE_END);
+        for (int i = 0; i < 100 && fq->GetData(&freq, sizeof freq, D3DGETDATA_FLUSH) == S_FALSE; i++) usleep(1000);
+        fq->Release();
+    }
+    if (!freq) {
+        LOG("LB_PASSES_GPU: no timestamp frequency; GPU time per class off");
+        g_passes_gpu = 0;
+        return;
+    }
+    g_gpu_tick_ms = 1000.0 / (double)freq;
+    LOG("LB_PASSES_GPU=%d: GPU ms per pass class from timestamp queries (%llu ticks per second)", g_passes_gpu,
+        (unsigned long long)freq);
+}
+
 void d3d_passes_draw(uint32_t prims) {
     int k = pass_class(prims);
+    if (g_passes_gpu) gpu_draw(k);
     g_pass_frame.cls[k].draws++;
     g_pass_frame.cls[k].prims += prims;
     if (!g_passdbg) return;
@@ -591,6 +722,7 @@ void d3d_passes_target(IDirect3DDevice9 *d) {
         g_pass_frame.rt_changes++;
         g_pass_frame.fp_main = g_pass_frame.fp_depth = false;
     }
+    if (g_passes_gpu && ((void *)rt != g_pass_target.rt || (ds != nullptr) != g_pass_target.ds)) gpu_target();
     g_pass_target = {rt, desc.Width, desc.Height, (uint32_t)desc.Format, ds != nullptr, rt && rt == bb};
     if (rt) rt->Release();
     if (ds) ds->Release();
@@ -615,6 +747,7 @@ static void passes_init(IDirect3DDevice9 *d) {
         // without an LB_D3DTRACE range, LB_PASSES=2 looks at the first frame
         g_passdbg = g_d3d_passes == 2 && !getenv("LB_D3DTRACE");
         if (g_d3d_passes) LOG("LB_PASSES=%d: draws per pass class logged at each Present", g_d3d_passes);
+        if (g_d3d_passes) gpu_init(d);
     }
     if (!g_d3d_passes) return;
     d3d_passes_target(d);
@@ -632,6 +765,7 @@ static void passes_present(void) {
         n += snprintf(line + n, sizeof line - n, " %s=%d/%u", k_pass_names[i], g_pass_frame.cls[i].draws,
                       g_pass_frame.cls[i].prims);
     LOG("%s rt=%d", line, g_pass_frame.rt_changes);
+    if (g_passes_gpu) gpu_present(platform_frame_count());
     g_pass_frame = PassFrame();
     g_passdbg = g_d3d_passes == 2 && g_d3d_trace;
 }
