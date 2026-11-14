@@ -11,6 +11,7 @@
 void shadow_flush(void *obj);
 void shadow_forget(void *obj);
 #include "d3d9_bridge.h"
+#include "jitter.h"
 void bc_forget(void *obj);
 bool bc_lock(void *tex, uint32_t sub, uint32_t w, uint32_t h, const RECT *r, DWORD flags, uint32_t out,
              const std::function<HRESULT(D3DLOCKED_RECT *, const RECT *)> &lock, HRESULT *hr);
@@ -402,6 +403,52 @@ void B_IDirect3DDevice9_CreateAdditionalSwapChain(CPU *c) {
     RET(hr, 3);
 }
 
+/* Texture detail for a picture drawn smaller than it is shown. The game picks each texture's level of detail for
+ * the size it renders at, so a half-size render that is scaled up afterwards shows textures a level too blurred,
+ * and no upscaler can put back what was never sampled. The bias (in levels: -1 is one level sharper, right for
+ * a picture scaled up 2x; log2 of render size over shown size in general) is added to whatever the game sets on
+ * each sampler. Textures without smaller levels (render targets, the interface) are not affected.
+ *   LB_TEXTURE_BIAS=<levels>   desktop tests; the compositor asks by itself (skyrim_texture_bias) */
+static std::atomic<float> g_texture_bias{0};
+static float g_texture_bias_applied, g_game_bias[16];
+extern "C" void skyrim_texture_bias(float levels) { g_texture_bias.store(levels < -3 ? -3 : levels > 3 ? 3 : levels); }
+static uint32_t float_bits(float value) {
+    uint32_t bits;
+    memcpy(&bits, &value, 4);
+    return bits;
+}
+void B_IDirect3DDevice9_SetSamplerState(CPU *c) {
+    auto *d = (IDirect3DDevice9 *)com_host(ARG(0));
+    if (g_d3d_trace) d3d_trace(c, "IDirect3DDevice9::SetSamplerState", 3);
+    uint32_t sampler = ARG(1), value = ARG(3);
+    /* GET4 and GET1 are a vendor switch that travels in this state, not a bias. */
+    if (ARG(2) == D3DSAMP_MIPMAPLODBIAS && sampler < 16 && value != MAKEFOURCC('G', 'E', 'T', '4') &&
+        value != MAKEFOURCC('G', 'E', 'T', '1')) {
+        memcpy(&g_game_bias[sampler], &value, 4);
+        value = float_bits(g_game_bias[sampler] + g_texture_bias_applied);
+    }
+    RET((uint32_t)d->SetSamplerState(sampler, (D3DSAMPLERSTATETYPE)ARG(2), value), 4);
+}
+/* Once a frame, at Present: a changed bias goes to every sampler. */
+static void texture_bias_frame(IDirect3DDevice9 *d) {
+    static bool read;
+    if (!read) {
+        read = true;
+        if (getenv("LB_TEXTURE_BIAS")) skyrim_texture_bias((float)atof(getenv("LB_TEXTURE_BIAS")));
+    }
+    float bias = g_texture_bias.load();
+    if (bias == g_texture_bias_applied) return;
+    g_texture_bias_applied = bias;
+    for (uint32_t sampler = 0; sampler < 16; sampler++)
+        d->SetSamplerState(sampler, D3DSAMP_MIPMAPLODBIAS, float_bits(g_game_bias[sampler] + bias));
+    fprintf(stderr, "texture bias %.2f levels\n", bias);
+}
+/* A reset device has every sampler back at no bias. */
+static void texture_bias_reset(void) {
+    memset(g_game_bias, 0, sizeof g_game_bias);
+    g_texture_bias_applied = 0;
+}
+
 void B_IDirect3DDevice9_Reset(CPU *c) {
     auto *d = (IDirect3DDevice9 *)com_host(ARG(0));
     D3DPRESENT_PARAMETERS pp;
@@ -413,6 +460,7 @@ void B_IDirect3DDevice9_Reset(CPU *c) {
     pp_to_guest(&pp, ARG(1));
     if (SUCCEEDED(hr)) { g_bb_w = pp.BackBufferWidth; g_bb_h = pp.BackBufferHeight; }
     LOG("Reset %ux%u -> %08x", pp.BackBufferWidth, pp.BackBufferHeight, (uint32_t)hr);
+    texture_bias_reset();
     RET(hr, 2);
 }
 
@@ -468,7 +516,7 @@ static void bisect_present(void) {
 }
 
 // LB_SHOT=F[,F...]: write the backbuffer about to be presented on those
-// frames to <save>/shot-<frame>.bmp. Off unless set; for headless verification
+// frames to <save>/shot-<frame>.bmp. F may be a range, A-B. Off unless set; for headless verification
 // where no screen capture permission exists.
 // With LB_SHOT, the scene's depth target of the same frame goes to <save>/depth-<frame>.f32: width and height
 // as two uint32, then rows of float32 exactly as the game wrote them. Input for trying depth-based stereo off
@@ -479,7 +527,6 @@ void d3d_scene_depth_reset(void);
 extern "C" void skyrim_present_tap_set_depth(void *surface);  // DXVK present tap (skyrim_present_tap.h)
 #endif
 
-#if defined(__APPLE__)
 /* Whether a menu is up (TESV 1.9.32.0.8): the menu manager singleton's menu stack count (+0x9C; 1 is the HUD) and
  * its count of open menus that pause the game (+0xC8). With a menu up the immersive screen gets no depth and
  * shows the frame flat, so menus and their text aren't bent by the scene behind them. Changes are logged with
@@ -498,7 +545,6 @@ static bool menu_open(void) {
     return open;
 }
 extern "C" int skyrim_menu_open(void) { return menu_open() ? 1 : 0; }
-#endif
 
 static void shot_depth(IDirect3DDevice9 *d) {
     IDirect3DSurface9 *depth = d3d_scene_depth_target(), *copy = nullptr;
@@ -528,18 +574,20 @@ static void shot_depth(IDirect3DDevice9 *d) {
 }
 
 static void shot_before_present(IDirect3DDevice9 *d) {
-    static int frames[16], count = -1;
+    static int frames[16][2], count = -1;
     if (count < 0) {
         count = 0;
         const char *e = getenv("LB_SHOT");
         while (e && *e && count < 16) {
-            frames[count++] = atoi(e);
+            frames[count][0] = frames[count][1] = atoi(e);
+            sscanf(e, "%d-%d", &frames[count][0], &frames[count][1]);
+            count++;
             e = strchr(e, ',');
             if (e) e++;
         }
     }
     int wanted = 0;
-    for (int i = 0; i < count; i++) wanted |= frames[i] == g_frame;
+    for (int i = 0; i < count; i++) wanted |= g_frame >= frames[i][0] && g_frame <= frames[i][1];
     if (!wanted) return;
     shot_depth(d);
     IDirect3DSurface9 *back = nullptr, *copy = nullptr;
@@ -632,10 +680,104 @@ static bool game_camera_read(GameCamera *out) {
  * the present tap's callback, which runs inside Present on this thread). */
 static GameCamera g_frame_camera;
 static bool g_frame_camera_valid;
+static float g_frame_jitter[2];
 extern "C" int skyrim_frame_camera(float out[18]) {
     if (!g_frame_camera_valid) return 0;
     memcpy(out, &g_frame_camera, sizeof g_frame_camera);
     return 1;
+}
+/* How far the frame being presented was shifted for temporal upscaling, in pixels right and down; the camera
+ * above is without the shift. Returns 0 (and writes 0, 0) for a frame that wasn't shifted. */
+extern "C" int skyrim_frame_jitter(float out[2]) {
+    out[0] = g_frame_jitter[0];
+    out[1] = g_frame_jitter[1];
+    return out[0] != 0 || out[1] != 0;
+}
+
+/* Sub-pixel jitter of the world camera for temporal upscaling (runtime/jitter.h). The world camera's
+ * NiCamera::UpdateWorldData (0xAB8F30, a virtual) rebuilds its world-to-clip matrix from its transform and frustum,
+ * and runs after every change of the frustum (the FOV routine 0xB17960 sets the frustum, then updates the
+ * camera). Its vtable slot is pointed at camera_update, which shifts the world camera's frustum before the
+ * rebuild. The camera is updated once a frame before anything is drawn (measured in Riverwood: one call a
+ * frame, and the picture and the scene depth both move by exactly the shift, the compass and crosshair not at
+ * all); the frustum itself stays as it was left unless the field of view changes, so jitter_apply takes the
+ * last shift out before putting this frame's in. Nothing is patched until jitter is asked for, and nothing is
+ * shifted while a menu is up.
+ *   LB_JITTER=<phases>[x<scale>]  jitter over that many positions (desktop tests; the compositor asks by itself);
+ *                        the scale multiplies the shifts into whole pixels a screenshot can show
+ *   LB_JITTER=<x>,<y>    the same shift in pixels every frame, to see it
+ *   either may end in @<frame> to start at that frame
+ *   LB_JITTER_LOG=1      a "jit" line per frame: the shift, and how often the camera was updated and shifted */
+#define NICAMERA_UPDATE_WORLD_DATA 0xAB8F30
+static uint32_t world_camera(void) {
+    uint32_t root = M32(0x1B2E8BC);
+    if (root < 0x10000) return 0;
+    uint32_t w = M32(root + 0xB8);
+    return w < 0x10000 ? 0 : w;
+}
+static int g_jitter_calls, g_jitter_shifts;
+static void camera_update(CPU *c) {
+    uint32_t camera = c->r[1];
+    if (camera && camera == world_camera()) {
+        float frustum[4];
+        memcpy(frustum, MEM + camera + 0xE8, sizeof frustum);
+        g_jitter_calls++;
+        /* No shift while a menu is up (a size of 0 asks for none): the frame carries no camera then, so the
+         * compositor can't use the shift, and a paused scene behind a menu would shimmer. */
+        if (jitter_apply(frustum, menu_open() ? 0 : g_bb_w, g_bb_h)) {
+            memcpy(MEM + camera + 0xE8, frustum, sizeof frustum);
+            g_jitter_shifts++;
+        }
+    }
+    uint32_t update = ARG(1);  /* thiscall with one argument, the update's context */
+    c->r[1] = camera;
+    uint32_t result = rt_invoke(c, NICAMERA_UPDATE_WORLD_DATA, 1, &update);
+    RET(result, 1);
+}
+extern "C" void skyrim_camera_jitter(int phases) { jitter_configure(phases); }
+/* Once per frame, at Present: hook the camera when jitter is first wanted, and move on to the next position. */
+static void camera_jitter_frame(void) {
+    static int state = -1;  /* -1 not read, 0 not hooked, 1 hooked, 2 can't */
+    static const char *wanted;
+    static int from;
+    if (state < 0) {
+        state = 0;
+        wanted = getenv("LB_JITTER");
+        if (wanted && strchr(wanted, '@')) from = atoi(strchr(wanted, '@') + 1);
+    }
+    if (wanted && g_frame >= from) {
+        float x = 0, y = 0;
+        if (sscanf(wanted, "%f,%f", &x, &y) == 2) jitter_fixed(x, y);
+        else {
+            const char *scale = strchr(wanted, 'x');
+            jitter_configure(atoi(wanted));
+            if (scale) jitter_test_scale((float)atof(scale + 1));
+        }
+        wanted = nullptr;
+    }
+    if (state == 0 && jitter_on()) {
+        uint32_t camera = world_camera();
+        if (camera) {
+            uint32_t table = M32(camera);
+            state = 2;
+            for (int slot = 0; table >= 0x10000 && slot < 96; slot++) {
+                if (M32(table + 4 * slot) != NICAMERA_UPDATE_WORLD_DATA) continue;
+                M32(table + 4 * slot) = rt_thunk(camera_update, "camera_update");
+                state = 1;
+                fprintf(stderr, "jitter: world camera %08x, vtable %08x slot %d hooked\n", camera, table, slot);
+                break;
+            }
+            if (state == 2) fprintf(stderr, "jitter: no UpdateWorldData in the world camera's vtable %08x; off\n", table);
+        }
+    }
+    if (state == 1 && getenv("LB_JITTER_LOG")) {
+        float pixels[2];
+        jitter_pixels(pixels);
+        fprintf(stderr, "jit %d: %.4f %.4f px, %d camera updates, %d shifted\n", g_frame, pixels[0], pixels[1],
+                g_jitter_calls, g_jitter_shifts);
+    }
+    g_jitter_calls = g_jitter_shifts = 0;
+    jitter_next_frame();
 }
 
 /* LB_FOV: the game's field of view in degrees at its 4:3 reference (65 by default, about 81 degrees across at
@@ -657,14 +799,16 @@ static void camera_log(void) {
     if (every <= 0 || g_frame % every) return;
     GameCamera cam;
     if (!game_camera_read(&cam)) { fprintf(stderr, "cam %d: none\n", g_frame); return; }
+    float shift[2];
+    jitter_remove(cam.frustum, shift);
     const float *r = cam.rot, *f = cam.frustum;
     uint32_t pc = M32(0x12E7288);
     float fov = 0, fov1 = 0;
     if (pc >= 0x10000) { memcpy(&fov, MEM + pc + 0xAC, 4); memcpy(&fov1, MEM + pc + 0xB0, 4); }
-    fprintf(stderr, "cam %d: rot [%.3f %.3f %.3f | %.3f %.3f %.3f | %.3f %.3f %.3f] pos %.1f %.1f %.1f "
-            "frustum l %.3f r %.3f t %.3f b %.3f near %.2f far %.0f fov %.1f/%.1f\n", g_frame,
+    fprintf(stderr, "cam %d: rot [%.6f %.6f %.6f | %.6f %.6f %.6f | %.6f %.6f %.6f] pos %.3f %.3f %.3f "
+            "frustum l %.6f r %.6f t %.6f b %.6f near %.2f far %.0f fov %.1f/%.1f jitter %.4f %.4f\n", g_frame,
             r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8], cam.pos[0], cam.pos[1], cam.pos[2],
-            f[0], f[1], f[2], f[3], f[4], f[5], fov, fov1);
+            f[0], f[1], f[2], f[3], f[4], f[5], fov, fov1, shift[0], shift[1]);
 }
 
 void B_IDirect3DDevice9_Present(CPU *c) {
@@ -690,6 +834,8 @@ void B_IDirect3DDevice9_Present(CPU *c) {
     /* With a menu up the world camera isn't what's on screen (the journal, for one, renders through another
      * camera), so the frame carries none and the compositor shows it on its fixed screen. */
     g_frame_camera_valid = !menu_open() && game_camera_read(&g_frame_camera);
+    g_frame_jitter[0] = g_frame_jitter[1] = 0;
+    if (g_frame_camera_valid) jitter_remove(g_frame_camera.frustum, g_frame_jitter);
     game_fov_apply();
     skyrim_present_tap_set_depth(menu_open() ? nullptr : d3d_scene_depth_target());
 #endif
@@ -700,6 +846,8 @@ void B_IDirect3DDevice9_Present(CPU *c) {
     skyrim_present_tap_set_depth(nullptr);
     d3d_scene_depth_reset();
 #endif
+    camera_jitter_frame();
+    texture_bias_frame(d);
     pace_present();
     platform_present_hook();
     bisect_present();

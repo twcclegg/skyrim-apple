@@ -63,7 +63,7 @@ IFACES = {
         ("EndStateBlock", "O:IDirect3DStateBlock9"), ("SetClipStatus", "p"), ("GetClipStatus", "p"),
         ("GetTexture", "u O:IDirect3DBaseTexture9"), ("SetTexture", "u o:IDirect3DBaseTexture9"),
         ("GetTextureStageState", "u u p"), ("SetTextureStageState", "u u u"),
-        ("GetSamplerState", "u u p"), ("SetSamplerState", "u u u"), ("ValidateDevice", "p"),
+        ("GetSamplerState", "u u p"), ("SetSamplerState", "X"), ("ValidateDevice", "p"),
         ("SetPaletteEntries", "u p"), ("GetPaletteEntries", "u p"), ("SetCurrentTexturePalette", "u"),
         ("GetCurrentTexturePalette", "p"), ("SetScissorRect", "X"), ("GetScissorRect", "X"),
         ("SetSoftwareVertexProcessing", "u"), ("GetSoftwareVertexProcessing", ""), ("SetNPatchMode", "f"),

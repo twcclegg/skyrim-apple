@@ -455,13 +455,6 @@ static void B_IDirect3DDevice9_GetSamplerState(CPU *c) {
     RET((uint32_t)r, 4);
 }
 
-static void B_IDirect3DDevice9_SetSamplerState(CPU *c) {
-    IDirect3DDevice9 *self = (IDirect3DDevice9 *)com_host(ARG(0));
-    if (g_d3d_trace) d3d_trace(c, "IDirect3DDevice9::SetSamplerState", 3);
-    auto r = bridge_call(self, &IDirect3DDevice9::SetSamplerState, ARG(1), ARG(2), ARG(3));
-    RET((uint32_t)r, 4);
-}
-
 static void B_IDirect3DDevice9_ValidateDevice(CPU *c) {
     IDirect3DDevice9 *self = (IDirect3DDevice9 *)com_host(ARG(0));
     if (g_d3d_trace) d3d_trace(c, "IDirect3DDevice9::ValidateDevice", 1);
@@ -1574,6 +1567,7 @@ void B_IDirect3DDevice9_SetDepthStencilSurface(CPU *c);
 void B_IDirect3DDevice9_Clear(CPU *c);
 void B_IDirect3DDevice9_SetViewport(CPU *c);
 void B_IDirect3DDevice9_GetViewport(CPU *c);
+void B_IDirect3DDevice9_SetSamplerState(CPU *c);
 void B_IDirect3DDevice9_SetScissorRect(CPU *c);
 void B_IDirect3DDevice9_GetScissorRect(CPU *c);
 void B_IDirect3DDevice9_GetNPatchMode(CPU *c);
