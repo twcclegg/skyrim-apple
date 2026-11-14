@@ -292,6 +292,7 @@ static void B_IDirect3DDevice9_EndScene(CPU *c) {
 static void B_IDirect3DDevice9_SetTransform(CPU *c) {
     IDirect3DDevice9 *self = (IDirect3DDevice9 *)com_host(ARG(0));
     if (g_d3d_trace) d3d_trace(c, "IDirect3DDevice9::SetTransform", 2);
+    if (g_d3d_passes && ARG(1) == D3DTS_PROJECTION && ARG(2)) d3d_passes_projection((const float *)GPTR(ARG(2)));
     auto r = bridge_call(self, &IDirect3DDevice9::SetTransform, ARG(1), GPTR(ARG(2)));
     RET((uint32_t)r, 3);
 }
