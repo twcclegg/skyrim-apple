@@ -1629,7 +1629,8 @@ static void shot_depth(IDirect3DDevice9 *d, const char *tag) {
 
 static void shot_write(IDirect3DDevice9 *d, const char *tag, bool depth);
 
-static void shot_before_present(IDirect3DDevice9 *d) {
+// Whether LB_SHOT names this frame.
+static bool shot_frame_wanted(int frame) {
     static int frames[16], count = -1;
     if (count < 0) {
         count = 0;
@@ -1640,9 +1641,23 @@ static void shot_before_present(IDirect3DDevice9 *d) {
             if (e) e++;
         }
     }
-    int wanted = 0;
-    for (int i = 0; i < count; i++) wanted |= frames[i] == g_frame;
-    if (!wanted) return;
+    for (int i = 0; i < count; i++) if (frames[i] == frame) return true;
+    return false;
+}
+
+// LB_STEREO_ALTERNATE with LB_STEREO_EYE_UNITS set (Apple only): the stereo section below then names LB_SHOT's
+// files by eye, so the plain shot is skipped.
+static bool stereo_alternate_env(void) {
+#if defined(__APPLE__)
+    const char *a = getenv("LB_STEREO_ALTERNATE"), *d = getenv("LB_STEREO_EYE_UNITS");
+    return a && atoi(a) != 0 && d && atof(d) != 0;
+#else
+    return false;
+#endif
+}
+
+static void shot_before_present(IDirect3DDevice9 *d) {
+    if (stereo_alternate_env() || !shot_frame_wanted(g_frame)) return;
     char tag[32];
     snprintf(tag, sizeof tag, "%05d", g_frame);
     shot_write(d, tag, true);
@@ -1860,6 +1875,16 @@ extern "C" int skyrim_frame_camera(float out[18]) {
     return 1;
 }
 
+/* The eye of the frame being presented, filled at Present from the shift that frame was actually drawn with:
+ * -1 left, +1 right, 0 centre (no shift: stereo off, a centre frame, a menu, no camera). k_out, if given, gets the
+ * clip-space shift k (DXVK pos.x -= k) applied to that frame. */
+static int g_frame_eye;
+static float g_frame_eye_k;
+extern "C" int skyrim_frame_eye(float *k_out) {
+    if (k_out) *k_out = g_frame_eye_k;
+    return g_frame_eye;
+}
+
 /* LB_FOV: the game's field of view in degrees at its 4:3 reference (65 by default, about 81 degrees across at
  * 16:9), written to PlayerCamera worldFOV (+0xAC) and firstPersonFOV (+0xB0) as the console's fov command
  * does. Head tracking wants it wider than the headset shows. */
@@ -1918,6 +1943,16 @@ static void camera_log(void) {
  *                           The game clock is held for the group (as LB_VR180 does: 1 us per frame), so animation,
  *                           effects and eye adaptation should not move between the six frames.
  *   LB_STEREO_HOLD=1        hold the game clock over plain triplets too.
+ *
+ *   LB_STEREO_ALTERNATE=1   continuous mode for measuring and judging, instead of LB_STEREO_FRAMES (which is then
+ *                           ignored): frames render from the left eye when their number is even and from the right
+ *                           eye when odd, all the time, with no screenshots. While a menu is open the shift is 0.
+ *                           skyrim_frame_eye() reports the eye and shift of the frame being presented. LB_SHOT=F,...
+ *                           then writes shot-<base>-<L|R>.bmp, depth-<base>-<L|R>.f32 and stereo-<base>-<L|R>.txt
+ *                           per listed frame, base being the even frame of the pair (LB_SHOT=F,F+1 with F even
+ *                           gives the L/R pair). tools/stereo_compare.py --shots --base F also needs the centre
+ *                           frame: LB_STEREO_CENTRE=F+2 (comma-separated list) renders that frame with no shift as
+ *                           eye C (base = frame - 2), so LB_SHOT=F,F+1,F+2 gives a complete triplet.
  *
  * The left eye sits at view-space x = -d. Seen from there a point at view x is at x + d, so its clip x grows by
  * P00*d: it moves right on screen. DXVK applies pos.x -= k, so k = P00 * e with e = -d for the left eye (k < 0,
@@ -2083,7 +2118,7 @@ static const StereoSlot k_hybrid[] = {
     {"FL", 'L', true, false, true},  {"FR", 'R', true, false, true},  {"W", 'C', false, true, true}};
 
 struct StereoState {
-    bool init = false, on = false;
+    bool init = false, on = false, alternate = false;
     float d = 0;
     std::vector<int> bases;
     const StereoSlot *slots = k_triplet;
@@ -2094,6 +2129,8 @@ struct StereoState {
     float k_applied = 0;        // the shift the frame being presented was drawn with (first-person draws only on
     bool fp_only = false;       //   fp_only frames)
     bool skip_fp = false;       // the frame being drawn skips its first-person draws
+    std::vector<int> centres;   // alternate mode: frames rendered unshifted (LB_STEREO_CENTRE)
+    int eye_applied = 0;        // -1/0/+1: the eye the frame being presented was drawn from
     GameCamera cam_applied{};   // the camera k_applied was computed from
     bool cam_applied_valid = false;
 };
@@ -2104,6 +2141,23 @@ static void stereo_init(void) {
     StereoState &st = g_stereo;
     st.init = true;
     const char *d = getenv("LB_STEREO_EYE_UNITS"), *f = getenv("LB_STEREO_FRAMES");
+    const char *alt = getenv("LB_STEREO_ALTERNATE"), *cen = getenv("LB_STEREO_CENTRE");
+    st.alternate = alt && atoi(alt) != 0;
+    if (!d || atof(d) == 0) return;
+    if (st.alternate) {
+        st.d = (float)fabs(atof(d));
+        for (const char *e = cen; e && *e;) {
+            int a = 0;
+            if (sscanf(e, "%d", &a) == 1 && st.centres.size() < 256) st.centres.push_back(a);
+            e = strchr(e, ',');
+            if (e) e++;
+        }
+        st.on = true;
+        LOG("stereo alternate: left eye on even frames, right on odd, eye separation %.3f units (half %.3f each "
+            "side), %zu centre frames, DXVK shader shift %s", 2 * st.d, st.d, st.centres.size(),
+            dxvk_stereo_enabled() ? "on" : "OFF (LB_STEREO_EYE_UNITS must be set at launch)");
+        return;
+    }
     if (!d || atof(d) == 0) return;
     if (!f || !*f) {
         // No capture frames: live single-pass stereo (LB_STEREO_MULTIVIEW=1) shifts every frame's eyes.
@@ -2144,8 +2198,20 @@ static void stereo_init(void) {
         dxvk_stereo_enabled() ? "on" : "OFF (LB_STEREO_EYE_UNITS must be set at launch)");
 }
 
+// Alternate mode (LB_STEREO_ALTERNATE): every frame is one of these, each written with depth when LB_SHOT lists it.
+static const StereoSlot k_alt_slots[] = {
+    {"L", 'L', false, false, true}, {"R", 'R', false, false, true}, {"C", 'C', false, false, true}};
+
 // The slot frame renders in a stereo group, with the group's base frame and the slot's index; null if none.
 static const StereoSlot *stereo_slot(int frame, int *base, int *index = nullptr) {
+    if (g_stereo.alternate) {
+        if (index) *index = 0;
+        for (int c : g_stereo.centres)
+            if (frame == c) { *base = c - 2; return &k_alt_slots[2]; }
+        if (frame & 1) { *base = frame - 1; return &k_alt_slots[1]; }
+        *base = frame;
+        return &k_alt_slots[0];
+    }
     for (int b : g_stereo.bases) {
         if (frame >= b && frame < b + g_stereo.group) {
             *base = b;
@@ -2194,6 +2260,7 @@ static void stereo_before_present(IDirect3DDevice9 *d) {
     int base = 0;
     const StereoSlot *slot = stereo_slot(g_frame, &base);
     if (!slot) return;
+    if (g_stereo.alternate && !shot_frame_wanted(g_frame)) return;
     char tag[32];
     snprintf(tag, sizeof tag, "%05d-%s", base, slot->tag);
     shot_write(d, tag, slot->depth);
@@ -2327,13 +2394,15 @@ static void stereo_after_present(void) {
     const StereoSlot *slot = stereo_slot(g_frame + 1, &base, &index);
     const char eye = slot ? slot->eye : 0;
     float k = 0;
+    int ev = 0;
     GameCamera cam;
-    const bool valid = (eye == 'L' || eye == 'R') && game_camera_read(&cam);
+    const bool menu = st.alternate && menu_open();  // alternate mode: no shift under a menu
+    const bool valid = !menu && (eye == 'L' || eye == 'R') && game_camera_read(&cam);
     if (valid) {
         const float l = cam.frustum[0], r = cam.frustum[1];
-        if (r > l) k = 2.0f / (r - l) * (eye == 'L' ? -st.d : st.d);
+        if (r > l) { k = 2.0f / (r - l) * (eye == 'L' ? -st.d : st.d); ev = eye == 'L' ? -1 : 1; }
         st.cam_applied = cam;
-    } else if (eye == 'L' || eye == 'R') {
+    } else if (!st.alternate && (eye == 'L' || eye == 'R')) {
         LOG("stereo capture: frame %d eye %c: no world camera, rendering the centre eye", g_frame + 1, eye);
     } else if (!eye && stereo_live_multiview() && game_camera_read(&cam)) {
         // Live single-pass stereo (LB_STEREO_MULTIVIEW=1, no capture frame): view 0 (layer 0) the left eye, view 1
@@ -2408,6 +2477,7 @@ static void stereo_after_present(void) {
         }
         if (st.holding) g_fake_clock_ns = st.hold_t0 + (uint64_t)index * 1000ull;
     }
+    st.eye_applied = ev;
 }
 /* LB_VR180=start:count[:tan] (offline capture, Mac): a stereo 180-degree video, rendered by the game itself.
  *
@@ -2612,6 +2682,8 @@ void B_IDirect3DDevice9_Present(CPU *c) {
     { std::lock_guard<std::mutex> hold(g_stereo_eyes_lock); g_eyes_presented = g_frame_camera_valid ? g_eyes_drawing : StereoEyes(); }
     // Where the camera was when, so the compositor can keep the player's movement going between frames.
     motion_camera(motion_now(), g_frame_camera_valid ? g_frame_camera.pos : nullptr);
+    g_frame_eye = g_stereo.on ? g_stereo.eye_applied : 0;  // set after the previous Present for this frame
+    g_frame_eye_k = g_stereo.on ? g_stereo.k_applied : 0.0f;
     game_fov_apply();
     dxvk_present_tap_set_depth(menu_open() ? nullptr : d3d_scene_depth_target());
 #endif
