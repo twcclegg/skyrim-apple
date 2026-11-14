@@ -66,7 +66,9 @@ def main():
     picked = sorted(lift.HOST_OVERRIDES_SKYRIM.get("exe", ()))
     rt = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "runtime")
     guest = {fa: t.lift_one(fa, funcs[fa], set(funcs), False) for fa in picked if fa not in ABI}
-    native = {fa: ["static void t_%X(CPU *c) { f_%X(c); }" % (fa, fa)] for fa in picked if fa not in ABI}
+    # the native side also gets the lifted body as f_<addr>_guest, for replacements that hand rare inputs to it
+    native = {fa: [re.sub(r"^static void t_%X\(" % fa, "void f_%X_guest(" % fa, guest[fa][0])] + guest[fa][1:]
+              + ["static void t_%X(CPU *c) { f_%X(c); }" % (fa, fa)] for fa in picked if fa not in ABI}
     for fa in picked:
         if fa in ABI:
             guest[fa], native[fa] = abi_variants(fa, funcs, set(funcs))
