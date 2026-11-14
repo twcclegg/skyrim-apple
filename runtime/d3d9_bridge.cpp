@@ -27,6 +27,7 @@ bool bc_surface_target(void *surf, void **tex, uint32_t *sub);
 #include <unordered_map>
 #include <vector>
 #include <map>
+#include <string>
 
 // ---------------------------------------------------------------- registry
 namespace {
@@ -424,13 +425,16 @@ void B_IDirect3DDevice9_Reset(CPU *c) {
     RET(hr, 2);
 }
 
-// LB_D3DTRACE=from:to logs every generated bridge call made during those
+// LB_D3DTRACE=from:to[,from:to...] logs every generated bridge call made during those
 // frames (counted by Present) to stderr.
 int g_d3d_trace;
-static int g_frame, g_trace_from = -1, g_trace_to = -1;
+static int g_frame, g_trace_from = -1;
 
+static void trace_camera_changed(void);
 void d3d_trace(CPU *c, const char *name, int nargs) {
-    fprintf(stderr, "D3D %d %s", g_frame, name);
+    trace_camera_changed();
+    if (strstr(name, "Draw")) fprintf(stderr, "D3D %d #%d %s", g_frame, g_d3d_draws, name);
+    else fprintf(stderr, "D3D %d %s", g_frame, name);
     for (int i = 1; i <= nargs; i++) fprintf(stderr, " %x", ARG(i));
     if (strstr(name, "ConstantF") && ARG(2))
         for (uint32_t i = 0; i < ARG(3) * 4 && i < 64; i++)
@@ -446,7 +450,35 @@ void d3d_trace(CPU *c, const char *name, int nargs) {
 int g_bisect, g_d3d_draws;
 static int g_bisect_from = -1, g_draw_no;
 
+// LB_SKIP_DRAWS=F:A-B[,F:A-B...]: on frame F (the frame being drawn, as in LB_SHOT and LB_D3DTRACE: the number its
+// Present will have) skip draws A to B, counted from 0 at the frame's first draw (the #n of LB_D3DTRACE's lines).
+// With LB_SHOT=F the picture shows what those draws contributed. Experiments only.
+struct SkipRange { int frame, from, to; };
+static std::vector<SkipRange> g_skip_ranges;
+static bool g_skip_ranges_read;
+static void skip_ranges_read(void) {
+    g_skip_ranges_read = true;
+    for (const char *e = getenv("LB_SKIP_DRAWS"); e && *e;) {
+        SkipRange r = {};
+        int n = sscanf(e, "%d:%d-%d", &r.frame, &r.from, &r.to);
+        if (n == 2) r.to = r.from;
+        if (n >= 2) g_skip_ranges.push_back(r);
+        e = strchr(e, ',');
+        if (e) e++;
+    }
+    if (!g_skip_ranges.empty()) LOG("LB_SKIP_DRAWS: %zu ranges", g_skip_ranges.size());
+}
+static bool skip_ranges_hit(void) {
+    const int frame = g_frame + 1, draw = g_d3d_draws - 1;  // g_d3d_draws already counts this draw
+    for (const SkipRange &r : g_skip_ranges)
+        if (r.frame == frame && draw >= r.from && draw <= r.to) return true;
+    return false;
+}
+static bool fp_skip_now(void);  // LB_FP_SKIP, below
+
 bool d3d_skip_draw(void) {
+    if (!g_skip_ranges.empty() && skip_ranges_hit()) return true;
+    if (fp_skip_now()) return true;
     int k = g_frame - g_bisect_from;
     return k >= 0 && !(k & 1) && g_draw_no++ == k / 2;
 }
@@ -472,7 +504,9 @@ static void bisect_present(void) {
 #endif
     }
     g_draw_no = 0;
-    g_bisect = g_frame >= g_bisect_from && g_frame < g_bisect_from + 160;
+    if (!g_skip_ranges_read) skip_ranges_read();
+    static const bool fp_skip = getenv("LB_FP_SKIP") != nullptr;
+    g_bisect = (g_frame >= g_bisect_from && g_frame < g_bisect_from + 160) || !g_skip_ranges.empty() || fp_skip;
 }
 
 // LB_PASSES=1 logs, at each Present, the frame's draw calls and primitives by the kind of pass they belong to, so
@@ -482,8 +516,13 @@ static void bisect_present(void) {
 // counts changes of render target 0. LB_PASSES=2 also logs each run of draws of one class into one target, in the
 // LB_D3DTRACE frames (without it, the first frame), to check the classes against a real frame:
 //   passdbg <frame> <class> <w>x<h> fmt=<D3DFORMAT> ds=<depth-stencil bound> draws=<n> prims=<n>
-// Off, it costs one branch per draw call, target change and Clear.
+// and, every frame, a line on the first-person pass (d3d_first_person):
+//   fpdbg <frame> runs=<n> mask=<draws> prepass=<draws> colour=<draws> other=<draws> depth=<draws>
+//         draws=#<first>-#<last> near=<first-person near plane> [UNEXPECTED]
+// Off, it costs one branch per draw call, target change and Clear. g_d3d_passes turns the hooks on: also without
+// LB_PASSES when the first-person flag is wanted (LB_FP=1, LB_FP_SKIP, or LB_STEREO_EYE_UNITS set), then with no logs.
 int g_d3d_passes;
+static int g_passes_log;  // LB_PASSES: 0 no lines, 1 pass lines, 2 also passdbg and fpdbg lines
 enum PassClass {
     PASS_SHADOW, PASS_REFL, PASS_MAIN, PASS_DEPTH, PASS_FP, PASS_MASK, PASS_FX, PASS_POST, PASS_UI, PASS_OTHER, PASS_COUNT
 };
@@ -495,8 +534,14 @@ struct PassFrame {
     PassTotals cls[PASS_COUNT];
     int rt_changes;
     bool seen_main, seen_depth, seen_bb;  // a main / depth / back buffer draw happened this frame
-    void *main_rt, *depth_rt;             // the targets of those main and depth draws
-    bool fp_main, fp_depth;               // a depth-only Clear on them since they were bound (first person)
+    // First-person detection (d3d_first_person, below)
+    bool fp_late;                         // in the late pass: after its Clear of depth only, until its projection ends
+    bool fp_late_confirmed;               // ... and its projection was seen to be the first-person one
+    bool fp_proj;                         // the projection set last is the first-person one
+    bool fp;                              // fp_late || fp_proj, and a target that allows it
+    bool fp_last_draw;                    // the frame's previous draw was a first-person one
+    int fp_runs, fp_kind_draws[FP_KINDS]; // runs of consecutive first-person draws; draws by kind (index = kind)
+    int fp_first, fp_last;                // frame draw numbers (#n of LB_D3DTRACE) of the first and last of them
 };
 struct PassRun { int cls; int draws; uint32_t prims; PassTarget t; };  // LB_PASSES=2: draws since the last line
 static PassTarget g_pass_target;
@@ -504,14 +549,64 @@ static PassFrame g_pass_frame;
 static PassRun g_pass_run = {-1, 0, 0, {}};
 static bool g_passdbg;
 
+/* First-person draws (twcclegg/skyrim-apple#23, stage 1): the arms, the weapon, the spell hand and the hand's effect,
+ * drawn with the game's first-person camera, whose projection has its own near plane (5; the world's is 15). Traced in
+ * Riverwood (TESV 1.9.32.0.8, low preset, 1280x720) with empty hands, a sword, and a sword plus Flames, a frame draws
+ * the first-person meshes in three places, each time after a SetTransform(D3DTS_PROJECTION) with that near plane:
+ *   mask     into the 960x540 pass (the "refl" class), first depth only, then writing red only: the hands in what
+ *            looks like the screen-space sun-shadow mask (10 draws with a sword: 5 + 5)
+ *   prepass  first thing in the main pass on the scene target, colour writes off: the hands' depth, so the world is not
+ *            drawn behind them (5 draws). Skipping the late pass leaves flat silhouettes in the clear colour there.
+ *   late     after the world's effects and the sun's first occlusion query, still before tone mapping:
+ *              Clear(ZBUFFER only, z 1)   on the scene target; its colour (the world) stays
+ *              colour  the meshes with lighting, then the hand's effect (Flames: 3 more additive draws)
+ *              other   with Flames, one draw into a cleared A8R8G8B8 target of back-buffer size (the fire's)
+ *              Clear(ZBUFFER only) on the scene's R32F depth target, which keeps the world's depth (not cleared)
+ *              depth   the opaque meshes again (5), writing their depth over the world's
+ *            then the scene target with the world's projection again (the sun's second query) and the post chain.
+ * The flag is on during the late pass (from its Clear of depth only into a back-buffer-sized target, once the main
+ * pass has drawn, until a projection with another near plane or a target that is not back-buffer-sized), and
+ * whenever the projection set last has the near plane learnt from the late pass and not the world camera's. So the
+ * mask and prepass draws are caught only once a late pass was seen (from the second first-person frame on).
+ * Third person has no such Clear and no such projection. The loading screen's model has a Clear of depth only but the
+ * world's near plane, and is not counted. The game keeps drawing the first-person pass under menus that show the
+ * world (the Tab menu), so the flag is on there too.
+ * The flag is set and cleared on the thread making the device calls, between draws, so code on the bridge's draw path
+ * (DXVK per-draw state, a stereo shift) can read it for the draw being made. It needs the pass hooks: LB_PASSES,
+ * LB_FP=1, LB_FP_SKIP or LB_STEREO_EYE_UNITS; otherwise it is always off. */
+static float g_fp_near;                // the first-person near plane, learnt from a late pass (0: not yet)
+static void (*g_fp_listener)(int kind);
+
+// The kind of the first-person draw being made, from the target bound (FP_NONE outside first-person draws).
+static int fp_kind(void) {
+    const PassFrame &f = g_pass_frame;
+    if (!f.fp) return FP_NONE;
+    const PassTarget &t = g_pass_target;
+    if (t.w != g_bb_w || t.h != g_bb_h) return FP_MASK;
+    if (t.fmt == D3DFMT_R32F) return FP_DEPTH;
+    if (t.fmt != D3DFMT_A16B16G16R16F) return FP_OTHER;
+    return f.fp_late ? FP_COLOUR : FP_PREPASS;
+}
+static void fp_update(void) {
+    PassFrame &f = g_pass_frame;
+    const PassTarget &t = g_pass_target;
+    const int before = fp_kind();
+    f.fp = (f.fp_late || f.fp_proj) && t.rt && !t.bb && !hud_screen_in_pass();
+    const int now = fp_kind();
+    if (now != before && g_fp_listener) g_fp_listener(now);
+}
+bool d3d_first_person(void) { return g_pass_frame.fp; }
+extern "C" int skyrim_first_person_pass(void) { return fp_kind(); }
+extern "C" void skyrim_first_person_listen(void (*fn)(int kind)) { g_fp_listener = fn; }
+
 // The class of a draw, from the targets bound and what the frame drew before. Sizes are relative to the back
 // buffer (CreateDevice/Reset), never absolute. First match wins. "Seen" means it matches the Riverwood frame
 // traced with LB_D3DTRACE (docs/perf/LOG.md, 2026-11-10); everything else is unverified, check it with LB_PASSES=2.
 //   ui      a menu drawn into the second screen's image (hud_screen.cpp, Android dual screen only), or a draw into
 //           the back buffer after its first one: the HUD and menus over the final image (unverified)
 //   post    the first draw into the back buffer, if it is a quad (<= 2 primitives): the final image (unverified)
-//   fp      the main or depth target, after a Clear of depth without colour since it was bound, once that target's
-//           own pass was seen this frame: the first-person arms and weapon (unverified)
+//   fp      a first-person draw (d3d_first_person, above; seen in Riverwood with empty hands, a sword and Flames),
+//           whatever the target: the late pass, and its prepass and mask draws otherwise counted as main and refl
 //   depth   an R32F colour target of back-buffer size: the scene's depth drawn again (seen, 638 draws)
 //   main    an A16B16G16R16F target of back-buffer size with a depth-stencil bound, before the depth pass (size and
 //           format seen, 620 draws; the depth-stencil and "before" unverified)
@@ -537,18 +632,16 @@ static int pass_class(uint32_t prims) {
         f.seen_bb = true;
         return first && prims <= 2 ? PASS_POST : PASS_UI;
     }
-    if (t.rt && ((t.rt == f.main_rt && f.fp_main) || (t.rt == f.depth_rt && f.fp_depth))) return PASS_FP;
     if (bb_size && t.fmt == D3DFMT_R32F) {
         f.seen_depth = true;
-        f.depth_rt = t.rt;
-        return PASS_DEPTH;
+        return f.fp ? PASS_FP : PASS_DEPTH;
     }
     if (bb_size && t.fmt == D3DFMT_A16B16G16R16F && t.ds) {
-        if (f.seen_depth) return PASS_FX;
+        if (f.seen_depth) return f.fp ? PASS_FP : PASS_FX;
         f.seen_main = true;
-        f.main_rt = t.rt;
-        return PASS_MAIN;
+        return f.fp ? PASS_FP : PASS_MAIN;
     }
+    if (f.fp) return PASS_FP;
     if (t.ds && !bb_aspect) return PASS_SHADOW;
     if (t.ds && smaller) return PASS_REFL;
     if (!t.ds && prims <= 2) return PASS_POST;
@@ -567,8 +660,16 @@ static void passdbg_flush(void) {
 
 void d3d_passes_draw(uint32_t prims) {
     int k = pass_class(prims);
-    g_pass_frame.cls[k].draws++;
-    g_pass_frame.cls[k].prims += prims;
+    PassFrame &f = g_pass_frame;
+    f.cls[k].draws++;
+    f.cls[k].prims += prims;
+    if (f.fp) {
+        if (!f.fp_runs) f.fp_first = g_d3d_draws - 1;  // g_d3d_draws already counts this draw
+        if (!f.fp_last_draw) f.fp_runs++;
+        f.fp_last = g_d3d_draws - 1;
+        f.fp_kind_draws[fp_kind()]++;
+    }
+    f.fp_last_draw = f.fp;
     if (!g_passdbg) return;
     PassRun &r = g_pass_run;
     if (k != r.cls || g_pass_target.rt != r.t.rt || g_pass_target.ds != r.t.ds) {
@@ -587,34 +688,76 @@ void d3d_passes_target(IDirect3DDevice9 *d) {
     d->GetDepthStencilSurface(&ds);
     d->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb);
     if (rt) rt->GetDesc(&desc);
-    if ((void *)rt != g_pass_target.rt) {
-        g_pass_frame.rt_changes++;
-        g_pass_frame.fp_main = g_pass_frame.fp_depth = false;
-    }
+    if ((void *)rt != g_pass_target.rt) g_pass_frame.rt_changes++;
     g_pass_target = {rt, desc.Width, desc.Height, (uint32_t)desc.Format, ds != nullptr, rt && rt == bb};
+    const PassTarget &t = g_pass_target;
+    // the late first-person pass goes on into other back-buffer-sized targets, and ends at any other
+    if (g_pass_frame.fp_late && (!rt || t.bb || t.w != g_bb_w || t.h != g_bb_h)) g_pass_frame.fp_late = false;
+    fp_update();
     if (rt) rt->Release();
     if (ds) ds->Release();
     if (bb) bb->Release();
 }
 
+// A Clear of depth without colour into a back-buffer-sized target, once the main pass has drawn: the late
+// first-person pass may start (d3d_first_person). Its projection confirms it (d3d_passes_projection).
 void d3d_passes_clear(uint32_t flags) {
     if (!(flags & D3DCLEAR_ZBUFFER) || (flags & D3DCLEAR_TARGET)) return;
+    const PassTarget &t = g_pass_target;
     PassFrame &f = g_pass_frame;
-    void *rt = g_pass_target.rt;
-    if (rt && rt == f.main_rt && f.seen_main) f.fp_main = true;
-    if (rt && rt == f.depth_rt && f.seen_depth) f.fp_depth = true;
+    if (!t.rt || t.bb || !g_bb_w || t.w != g_bb_w || t.h != g_bb_h || !f.seen_main || f.fp_late) return;
+    f.fp_late = true;
+    f.fp_late_confirmed = false;
+    fp_update();
 }
 
-// After CreateDevice: reads the switch once and learns the targets the device starts with.
+// The world camera's near plane (NiCamera W, see game_camera_read below), or 0.
+static float world_near(void) {
+    uint32_t root = M32(0x1B2E8BC), w = root >= 0x10000 ? M32(root + 0xB8) : 0;
+    float v = 0;
+    if (w >= 0x10000) memcpy(&v, MEM + w + 0xF8, 4);
+    return v;
+}
+
+// SetTransform(D3DTS_PROJECTION), m the guest's row-major matrix (row vectors): perspective has _34 = 1, and its near
+// plane is -_43 / _33. In the late pass the first projection confirms the pass (a near plane other than the world's)
+// and teaches the first-person near plane; a later one with another near plane ends it. Outside it, the projection
+// is a first-person one when its near plane is the one learnt.
+void d3d_passes_projection(const float *m) {
+    PassFrame &f = g_pass_frame;
+    const float near_plane = m[11] == 1.0f && m[10] != 0.0f ? -m[14] / m[10] : 0.0f;  // 0: not perspective
+    const float world = world_near();
+    auto same = [](float a, float b) { return a > 0 && b > 0 && fabsf(a - b) <= 1e-3f * b; };
+    if (f.fp_late && !f.fp_late_confirmed) {
+        if (near_plane <= 0 || same(near_plane, world)) {
+            f.fp_late = false;  // not the first-person camera (the loading screen's model has the world's)
+        } else {
+            f.fp_late_confirmed = true;
+            if (!same(near_plane, g_fp_near)) {
+                LOG("first-person near plane %g (world %g)", near_plane, world);
+                g_fp_near = near_plane;
+            }
+        }
+    } else if (f.fp_late && !same(near_plane, g_fp_near)) {
+        f.fp_late = false;
+    }
+    f.fp_proj = same(near_plane, g_fp_near) && !same(near_plane, world);
+    fp_update();
+}
+
+// After CreateDevice: reads the switches once and learns the targets the device starts with.
 static void passes_init(IDirect3DDevice9 *d) {
     static bool read;
     if (!read) {
         read = true;
-        const char *e = getenv("LB_PASSES");
-        g_d3d_passes = e ? atoi(e) : 0;
+        const char *e = getenv("LB_PASSES"), *fp = getenv("LB_FP"), *eye = getenv("LB_STEREO_EYE_UNITS");
+        g_passes_log = e ? atoi(e) : 0;
+        const bool fp_wanted = (fp && atoi(fp)) || getenv("LB_FP_SKIP") || (eye && atof(eye) != 0);
+        g_d3d_passes = g_passes_log || fp_wanted;
         // without an LB_D3DTRACE range, LB_PASSES=2 looks at the first frame
-        g_passdbg = g_d3d_passes == 2 && !getenv("LB_D3DTRACE");
-        if (g_d3d_passes) LOG("LB_PASSES=%d: draws per pass class logged at each Present", g_d3d_passes);
+        g_passdbg = g_passes_log == 2 && !getenv("LB_D3DTRACE");
+        if (g_passes_log) LOG("LB_PASSES=%d: draws per pass class logged at each Present", g_passes_log);
+        else if (fp_wanted) LOG("first-person pass detection on (LB_FP, LB_FP_SKIP or LB_STEREO_EYE_UNITS)");
     }
     if (!g_d3d_passes) return;
     d3d_passes_target(d);
@@ -625,7 +768,20 @@ static void passes_init(IDirect3DDevice9 *d) {
 // already set for the next one).
 static void passes_present(void) {
     if (!g_d3d_passes) return;
+    g_pass_frame.fp_late = g_pass_frame.fp_proj = false;
+    fp_update();
+    if (!g_passes_log) { g_pass_frame = PassFrame(); return; }
     passdbg_flush();
+    const PassFrame &f = g_pass_frame;
+    if (g_passes_log == 2) {
+        // Seen in first person: 3 runs (mask, prepass, late), colour >= depth > 0, prepass = depth. Anything with
+        // first-person draws but no colour draws, or more than 3 runs, is flagged.
+        const int *k = f.fp_kind_draws;
+        const bool odd = f.fp_runs && (!k[FP_COLOUR] || k[FP_DEPTH] > k[FP_COLOUR] || f.fp_runs > 3);
+        LOG("fpdbg %d runs=%d mask=%d prepass=%d colour=%d other=%d depth=%d draws=#%d-#%d near=%g%s",
+            platform_frame_count(), f.fp_runs, k[FP_MASK], k[FP_PREPASS], k[FP_COLOUR], k[FP_OTHER], k[FP_DEPTH],
+            f.fp_runs ? f.fp_first : -1, f.fp_runs ? f.fp_last : -1, g_fp_near, odd ? " UNEXPECTED" : "");
+    }
     char line[512];
     int n = snprintf(line, sizeof line, "pass %d", platform_frame_count());
     for (int i = 0; i < PASS_COUNT && n < (int)sizeof line; i++)
@@ -633,7 +789,44 @@ static void passes_present(void) {
                       g_pass_frame.cls[i].prims);
     LOG("%s rt=%d", line, g_pass_frame.rt_changes);
     g_pass_frame = PassFrame();
-    g_passdbg = g_d3d_passes == 2 && g_d3d_trace;
+    g_passdbg = g_passes_log == 2 && g_d3d_trace;
+}
+
+// LB_FP_SKIP=MODE (every frame) or MODE@F[,MODE@F...] (only frames F, numbered as LB_SHOT numbers them): skip
+// first-person draws. MODE is all, late (colour, other and depth: the visible pass and its depth), colour (colour and
+// other), depth, prepass or mask; several joined by +, e.g. prepass+mask. Experiments: with LB_SHOT the picture
+// shows what those draws contribute.
+static bool fp_skip_now(void) {
+    static int mode = -1;               // every frame: bit per FP_* kind
+    static std::map<int, int> frames;   // or per frame
+    if (mode < 0) {
+        mode = 0;
+        auto parse = [](const char *m, const char *end) {
+            int bits = 0;
+            while (m < end) {
+                const char *plus = (const char *)memchr(m, '+', end - m);
+                const std::string w(m, plus ? plus : end);
+                bits |= w == "all" ? ~0 : w == "late" ? (1 << FP_COLOUR | 1 << FP_OTHER | 1 << FP_DEPTH)
+                        : w == "colour" ? (1 << FP_COLOUR | 1 << FP_OTHER) : w == "depth" ? 1 << FP_DEPTH
+                        : w == "prepass" ? 1 << FP_PREPASS : w == "mask" ? 1 << FP_MASK : 0;
+                m = plus ? plus + 1 : end;
+            }
+            return bits;
+        };
+        const char *e = getenv("LB_FP_SKIP");
+        for (const char *item = e; item && *item;) {
+            const char *comma = strchr(item, ','), *end = comma ? comma : item + strlen(item);
+            const char *at = (const char *)memchr(item, '@', end - item);
+            if (at) frames[atoi(at + 1)] = parse(item, at);
+            else mode = parse(item, end);
+            item = comma ? comma + 1 : nullptr;
+        }
+        if (e) LOG("LB_FP_SKIP: every frame %x, %zu frames listed", mode, frames.size());
+    }
+    const int k = fp_kind();
+    if (k == FP_NONE) return false;
+    auto it = frames.find(g_frame + 1);
+    return ((it != frames.end() ? it->second : mode) >> k) & 1;
 }
 
 // LB_SHOT=F[,F...]: write the backbuffer about to be presented on those
@@ -871,6 +1064,26 @@ static bool game_camera_read(GameCamera *out) {
     memcpy(out->pos, MEM + w + 0x78, sizeof out->pos);
     memcpy(out->frustum, MEM + w + 0xE8, sizeof out->frustum);
     return true;
+}
+
+/* LB_D3DTRACE: the world camera's frustum (tangents l r t b, near, far) and the PlayerCamera FOVs, at a call that
+ * may start a pass (Clear), and whenever they change between two traced calls. */
+static float g_trace_cam[8];
+void d3d_trace_camera(const char *why) {
+    float v[8] = {};
+    uint32_t root = M32(0x1B2E8BC), w = root >= 0x10000 ? M32(root + 0xB8) : 0, pc = M32(0x12E7288);
+    if (w >= 0x10000) memcpy(v, MEM + w + 0xE8, 24);
+    if (pc >= 0x10000) { memcpy(v + 6, MEM + pc + 0xAC, 4); memcpy(v + 7, MEM + pc + 0xB0, 4); }
+    memcpy(g_trace_cam, v, sizeof v);
+    fprintf(stderr, "D3D %d camera(%s) l %.4f r %.4f t %.4f b %.4f near %.3f far %.0f fov %.1f/%.1f\n", g_frame, why,
+            v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]);
+}
+static void trace_camera_changed(void) {
+    float v[8] = {};
+    uint32_t root = M32(0x1B2E8BC), w = root >= 0x10000 ? M32(root + 0xB8) : 0, pc = M32(0x12E7288);
+    if (w >= 0x10000) memcpy(v, MEM + w + 0xE8, 24);
+    if (pc >= 0x10000) { memcpy(v + 6, MEM + pc + 0xAC, 4); memcpy(v + 7, MEM + pc + 0xB0, 4); }
+    if (memcmp(v, g_trace_cam, sizeof v)) d3d_trace_camera("changed");
 }
 
 /* The camera of the frame being presented, for the immersive compositor (ipad/immersive_bridge.mm reads it from
@@ -1209,14 +1422,20 @@ void vr180_scene_hook(void) {}
 
 void B_IDirect3DDevice9_Present(CPU *c) {
     auto *d = (IDirect3DDevice9 *)com_host(ARG(0));
+    static std::vector<std::pair<int, int>> trace_ranges;  // LB_D3DTRACE=from:to[,from:to...]
     if (g_trace_from < 0) {
-        const char *e = getenv("LB_D3DTRACE");
         g_trace_from = 1 << 30;
-        if (e) sscanf(e, "%d:%d", &g_trace_from, &g_trace_to);
+        for (const char *e = getenv("LB_D3DTRACE"); e && *e;) {
+            int a = 0, b = 0;
+            if (sscanf(e, "%d:%d", &a, &b) == 2) trace_ranges.push_back({a, b});
+            e = strchr(e, ',');
+            if (e) e++;
+        }
     }
     g_frame++;
     camera_log();
-    g_d3d_trace = g_frame >= g_trace_from && g_frame <= g_trace_to;
+    g_d3d_trace = 0;
+    for (const auto &r : trace_ranges) g_d3d_trace |= g_frame >= r.first && g_frame <= r.second;
     if (g_d3d_trace) fprintf(stderr, "D3D %d Present\n", g_frame);
     extern void touch_draw(IDirect3DDevice9 *d);
     touch_draw(d);

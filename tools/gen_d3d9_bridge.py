@@ -157,6 +157,9 @@ def gen():
                 o.append("    { extern void vr180_scene_hook(void); vr180_scene_hook(); }")
             o.append("    %s *self = (%s *)com_host(ARG(0));" % (iface, iface))
             o.append("    if (g_d3d_trace) d3d_trace(c, \"%s::%s\", %d);" % (iface, name, len(args)))
+            if iface == "IDirect3DDevice9" and name == "SetTransform":
+                # LB_PASSES / first-person detection: the projection's near plane (d3d_passes_projection)
+                o.append("    if (g_d3d_passes && ARG(1) == D3DTS_PROJECTION && ARG(2)) d3d_passes_projection((const float *)GPTR(ARG(2)));")
             if name.startswith("Draw") and not name.endswith("Patch"):
                 o.append("    g_d3d_draws++;")
                 o.append("    if (g_d3d_passes) d3d_passes_draw(ARG(%d));" % DRAW_PRIMS[name])

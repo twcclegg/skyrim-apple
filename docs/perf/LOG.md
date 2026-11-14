@@ -296,3 +296,42 @@ tear handling, and flat menus).
 - **CPU:** the process used 43–70% of one core, the main thread 21–28%. Thermal state stayed nominal.
 - **Thomas's verdict:** "Much better." His screenshots show clean edges on a rock and the sword at the
   reduced depth, and a flat main menu.
+
+## 2026-11-14 — the first-person draws (M5, Riverwood, low preset, 1280×720; twcclegg/skyrim-apple#23 chunk 1.1)
+
+Traced with `LB_D3DTRACE` (now with draw numbers, viewports, the world camera at each Clear, and several frame
+ranges) in three states: empty hands (`riverwood-walk-mac`), and an iron sword with Flames readied (scripted with
+`tools/stereo_capture.py` and a private config, world slowed with `sgtm 0.02`). Checked by skipping draws
+(`LB_FP_SKIP`, below) and comparing `LB_SHOT` pictures of neighbouring frames.
+
+- **What marks them:** the first-person camera's projection. The game sets `D3DTS_PROJECTION` before each pass
+  even with shaders; the first-person one has near plane 5 (`_43 = -5.00007`), the world's 15. The world
+  NiCamera's frustum is unchanged meanwhile (near 15), so reading it does not help. Same field of view here (65).
+- **Three places per frame, the same meshes each time** (sword and Flames: 10 + 5 + 14 = 29 draws; empty hands:
+  10 + 5 + 10 = 25, nothing visible on screen):
+  - *mask:* in the 960×540 pass (the `refl` class), depth only, then red only. Skipping them changes only the
+    shading on the hands and sword, so this pass is most likely the screen-space sun-shadow mask, not a reflection.
+  - *prepass:* first in the main pass, colour writes off: the hands' depth, so the world is not drawn behind them.
+    Skipping it changes nothing visible (the late pass covers the area).
+  - *late pass:* after the world's effects and the sun's first occlusion query, before tone mapping:
+    `Clear(ZBUFFER)` on the 16-bit float scene target (the world's colour stays), the projection with near 5,
+    the lit meshes (5) and **the flame (3 additive draws) inside the same run**, with Flames also one draw into a
+    cleared back-buffer-sized A8R8G8B8 target; then `Clear(ZBUFFER)` on the R32F depth target, whose colour (the
+    world's depth) is **not** cleared, and the 5 opaque meshes again, writing their depth over the world's. Then
+    the scene target with the world's projection (the sun's second query) and the post chain.
+- **Skipping everything first-person** removes the hands, sword and flame and the glow above the hand; nothing else
+  changes beyond frame-to-frame foliage noise. Skipping only the late pass leaves flat silhouettes in the clear
+  colour (the prepass kept the world out). The flame's light on the ground is world shading and stays.
+- **Third person:** no Clear of depth only and no near-5 projection: 0 first-person draws. **Tab menu in first
+  person:** the game keeps drawing all 29. **Loading screen:** it has a Clear of depth only before its model, but
+  with the world's near plane; not counted.
+- **Detector** (`d3d_first_person()`, `skyrim_first_person_pass()` with the kind, `skyrim_first_person_listen()`):
+  on from such a Clear until a projection with another near plane or a target that is not back-buffer-sized, which
+  learns the near plane; elsewhere on whenever the projection set last has that near plane. `LB_PASSES` counts all
+  of them as `fp` (they were `main`, `refl` and `fx`), and `LB_PASSES=2` logs an `fpdbg` line per frame. Class
+  totals still equal the `ft` draw count (checked on 1,847-, 1,852-, 1,947- and 2,075-draw frames).
+- **The 57 missing effect draws in alternate-eye mode are the weather, not stereo.** On this branch, plain mono
+  runs gave 146 (`fp` now 10 of them) or 203 effect draws per frame depending on the run, and so did
+  `LB_STEREO_EYE_UNITS=2.24` alone; the 203 runs have an overcast, cloudy sky in their screenshots, the 146 runs
+  (including the alternate-eye one) a clear one. Which draws they are is not pinned down: the cloudy run's 180-draw
+  effects run is mostly one alpha-blended shader without depth writes (142 draws); no clear-sky trace was taken.
