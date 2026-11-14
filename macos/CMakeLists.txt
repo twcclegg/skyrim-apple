@@ -149,6 +149,22 @@ if(TARGET stereo_shift_smoke)
   set_tests_properties(stereo_shift_smoke_passes_all PROPERTIES TIMEOUT 60
     ENVIRONMENT "LB_STEREO_EYE_UNITS=1;LB_STEREO_PASSES=all")
 endif()
+if(TARGET stereo_multiview_smoke)
+  # LB_STEREO_MULTIVIEW is read once per process: one invocation with it, one without. The executable sets or
+  # unsets it (and LB_STEREO_EYE_UNITS=1) from its flag, so the ENVIRONMENT lines only document the intent.
+  add_test(NAME stereo_multiview_smoke COMMAND stereo_multiview_smoke --multiview=on)
+  set_tests_properties(stereo_multiview_smoke PROPERTIES TIMEOUT 60
+    ENVIRONMENT "LB_STEREO_EYE_UNITS=1;LB_STEREO_MULTIVIEW=1")
+  add_test(NAME stereo_multiview_smoke_off COMMAND stereo_multiview_smoke --multiview=off)
+  set_tests_properties(stereo_multiview_smoke_off PROPERTIES TIMEOUT 60 ENVIRONMENT "LB_STEREO_EYE_UNITS=1")
+endif()
+if(TARGET stereo_shift_smoke)
+  # The existing offset test with multiview on: the back buffer is one layer, so every pass there is mono and
+  # must behave exactly as without multiview (view 0's offset, two-layer automatic depth buffer).
+  add_test(NAME stereo_shift_smoke_multiview_mono COMMAND stereo_shift_smoke --passes=default)
+  set_tests_properties(stereo_shift_smoke_multiview_mono PROPERTIES TIMEOUT 60
+    ENVIRONMENT "LB_STEREO_EYE_UNITS=1;LB_STEREO_MULTIVIEW=1")
+endif()
 
 set(SKYRIM_PYTHON "${CMAKE_CURRENT_SOURCE_DIR}/.venv/bin/python" CACHE FILEPATH
   "Isolated Python with capstone and pefile")
