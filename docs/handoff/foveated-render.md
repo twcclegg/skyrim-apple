@@ -353,7 +353,10 @@ Needs the compositor change (section 5) on top of #13/#14. One build, switches i
 
 Record frame rate and the compositor's GPU time for each; write down which map was preferred.
 
-## Appendix: the MoltenVK patch (against v1.4.2, never compiled)
+## Appendix: the MoltenVK patch (against v1.4.2)
+
+Compiled and run on an M5 Mac (macOS 27, Xcode 27.2) on 2026-11-14, after one change there: the render pass
+descriptor's `renderTargetWidth/Height` are set to the map's screen size.
 
 MoltenVK is Apache-2.0. The struct layout and `sType` match `DxvkFoveationRateMapInfo` in
 `android/app/jni/dxvk/src/dxvk/dxvk_context_state.h`.
@@ -431,19 +434,26 @@ diff --git a/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.mm b/MoltenVK/MoltenVK/
 index 8c24deb..7337901 100644
 --- a/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.mm
 +++ b/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.mm
-@@ -835,6 +835,11 @@ void MVKCommandEncoder::beginMetalRenderPass(MVKCommandUse cmdUse) {
+@@ -835,6 +835,18 @@ void MVKCommandEncoder::beginMetalRenderPass(MVKCommandUse cmdUse) {
  		[mtlRPDesc setSamplePositions: sampPosns.data() count: sampPosns.size()];
  	}
  
 +#if !MVK_TVOS
 +	// skyrim-apple: the attachments are the map's physical size; viewports stay in the map's screen space.
-+	if (_skyrimRateMap) { mtlRPDesc.rasterizationRateMap = (id<MTLRasterizationRateMap>)_skyrimRateMap; }
++	// With a map Metal takes renderTargetWidth/Height in screen space too (measured on an M5: left at the
++	// physical size, everything beyond that rectangle of the screen is not drawn).
++	if (_skyrimRateMap) {
++		MTLSize screen = [(id<MTLRasterizationRateMap>)_skyrimRateMap screenSize];
++		mtlRPDesc.rasterizationRateMap = (id<MTLRasterizationRateMap>)_skyrimRateMap;
++		mtlRPDesc.renderTargetWidth = screen.width;
++		mtlRPDesc.renderTargetHeight = screen.height;
++	}
 +#endif
 +
      _mtlRenderEncoder = [_mtlCmdBuffer renderCommandEncoderWithDescriptor: mtlRPDesc];
  	retainIfImmediatelyEncoding(_mtlRenderEncoder);
  	_cmdBuffer->setMetalObjectLabel(_mtlRenderEncoder, getMTLRenderCommandEncoderName(cmdUse));
-@@ -918,6 +923,20 @@ VkRect2D MVKCommandEncoder::clipToRenderArea(VkRect2D rect) {
+@@ -918,6 +930,20 @@ VkRect2D MVKCommandEncoder::clipToRenderArea(VkRect2D rect) {
  	uint32_t raBottom = max(_renderArea.offset.y, 0);
  	uint32_t raTop = raBottom + _renderArea.extent.height;
  
@@ -464,7 +474,7 @@ index 8c24deb..7337901 100644
  	rect.offset.x      = mvkClamp<uint32_t>(rect.offset.x, raLeft, max(raRight - 1, raLeft));
  	rect.offset.y      = mvkClamp<uint32_t>(rect.offset.y, raBottom, max(raTop - 1, raBottom));
  	rect.extent.width  = min<uint32_t>(rect.extent.width, raRight - rect.offset.x);
-@@ -1041,6 +1060,7 @@ void MVKCommandEncoder::endRenderpass() {
+@@ -1041,6 +1067,7 @@ void MVKCommandEncoder::endRenderpass() {
  	}
  	_attachments.clear();
  	_renderSubpassIndex = 0;
