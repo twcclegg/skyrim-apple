@@ -10,6 +10,8 @@ A scenario (scenarios/*.json) is frame-timed scripted input for the runtime's LB
 the main menu (`coc` into a cell gives the default character in the same place every run, without anyone's save),
 keys held for a route, screenshots (LB_SHOT) to check the run went where intended, and named phases whose frame
 times are summarized separately. The runtime logs each frame (LB_FRAMETIMES=1) and quits at LB_EXIT_FRAME.
+Taking a screenshot stalls its frame for 50-300 ms (a GPU readback and two files written), so those frames are left
+out of the statistics and listed in the summary's meta as screenshot_frames.
 
 The app must already be installed with the game files in place; this tool never installs anything. On a device the
 headset has to be worn and awake, because visionOS suspends apps when it isn't. Results go to bench-results/
@@ -46,8 +48,9 @@ def _bundle_id():
 
 BUNDLE = _bundle_id()
 FRAME_MS = 1000.0 / 60.0
-FT = re.compile(r"^ft (\d+) ([\d.]+) ([\d.]+)(?: ([\d.]+))?$")
+FT = re.compile(r"^ft (\d+) ([\d.]+) ([\d.]+)(?: ([\d.]+))?(?: (\d+))?$")
 SHOT = re.compile(r"^LB_SHOT frame (\d+) \d+x\d+ -> (.+)$")
+SHOT_ANY = re.compile(r"^LB_SHOT frame \d+ ")  # any screenshot line: the next frame time logged includes its stall
 CONTAINER = re.compile(r"/Containers/Data/Application/[0-9A-F-]+/(.+)$")
 NOTABLE = ("native: thermal", "bench:", "immersive:", "pointer:", "fatal", "device lost", "rt_unimpl", "quit requested")
 
@@ -262,10 +265,11 @@ def percentile(values, p):
 
 
 def stats(frames):
-    """frames: list of (frame, ms, present_ms, work_ms or None)."""
+    """frames: list of (frame, ms, present_ms, work_ms or None, draw calls or None)."""
     times = [f[1] for f in frames if f[1] > 0]
     presents = [f[2] for f in frames]
     work = [f[3] for f in frames if f[1] > 0 and f[3] is not None]
+    draws = [f[4] for f in frames if f[1] > 0 and f[4] is not None]
     if not times:
         return {"frames": 0}
     total = sum(times)
@@ -286,24 +290,47 @@ def stats(frames):
         **({"work_mean_ms": round(sum(work) / len(work), 3), "work_median_ms": round(statistics.median(work), 3),
             "work_p95_ms": round(percentile(work, 95), 2), "work_p99_ms": round(percentile(work, 99), 2)}
            if work else {}),
+        **({"draws_mean": round(sum(draws) / len(draws), 1), "draws_p95": round(percentile(draws, 95))}
+           if draws else {}),
     }
 
 
+def paging_counters():
+    """macOS swap-ins, swap-outs and page-outs since boot, in MB; None where vm_stat isn't available."""
+    try:
+        out = subprocess.run(["vm_stat"], capture_output=True, text=True, timeout=10).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    page = re.search(r"page size of (\d+) bytes", out)
+    counts = {k: re.search(rf"^{k}:\s+(\d+)", out, re.M) for k in ("Swapins", "Swapouts", "Pageouts")}
+    if not page or not all(counts.values()):
+        return None
+    return {k.lower(): int(m[1]) * int(page[1]) / 2**20 for k, m in counts.items()}
+
+
 def parse_log(text, scenario=None):
-    frames, shots, notes = [], {}, []
+    frames, shots, notes, stalled, pending = [], {}, [], {}, False
     for line in text.splitlines():
         m = FT.match(line)
         if m:
-            frames.append((int(m[1]), float(m[2]), float(m[3]), float(m[4]) if m[4] else None))
+            frames.append((int(m[1]), float(m[2]), float(m[3]), float(m[4]) if m[4] else None,
+                           int(m[5]) if m[5] else None))
+            if pending:
+                stalled[int(m[1])] = float(m[2])
+                pending = False
             continue
+        if SHOT_ANY.match(line):
+            pending = True
         m = SHOT.match(line)
         if m:
             shots[int(m[1])] = m[2]
         if line.startswith(NOTABLE) or any(n in line for n in NOTABLE[3:]):
             notes.append(line)
-    summary = {"overall": stats(frames)}
+    timed = [f for f in frames if f[0] not in stalled]
+    summary = {"overall": stats(timed)}
     for name, (start, end) in (scenario or {}).get("phases", {}).items():
-        summary[name] = stats([f for f in frames if start <= f[0] < end])
+        summary[name] = stats([f for f in timed if start <= f[0] < end])
+    summary["meta"] = {"screenshot_frames": stalled}
     exited = any("exit frame" in n and "reached" in n for n in notes)
     return frames, shots, notes, summary, exited
 
@@ -344,7 +371,11 @@ def execute(scenario, args):
     timeout = scenario["exit_frame"] / 20 + 240  # a third of real time, plus loading
     started = datetime.now(timezone.utc)
     print(f"bench: running {scenario['name']} to frame {scenario['exit_frame']} (timeout {timeout:.0f} s)")
+    paging = paging_counters() if isinstance(target, Mac) else None
     console = target.launch(env, timeout)
+    if paging:
+        after = paging_counters()
+        paging = {k: round(after[k] - v) for k, v in paging.items()} if after else None
     logs = sorted(set(target.list_files("Documents/SkyrimLogs")) - before)
     if not logs:
         fail(f"the run wrote no new log. Console:\n{console[-2000:]}")
@@ -364,16 +395,21 @@ def execute(scenario, args):
         elif isinstance(target, Mac):
             target.pull(path, out / f"shot-{frame:05d}.bmp")
     with open(out / "frametimes.csv", "w") as csv:
-        csv.write("frame,frame_ms,present_ms,work_ms\n")
-        for frame, ms, present, work in frames:
-            csv.write(f"{frame},{ms},{present},{'' if work is None else work}\n")
-    summary["meta"] = {"scenario": scenario["name"], "label": label, "started_utc": started.isoformat(),
+        csv.write("frame,frame_ms,present_ms,work_ms,draws\n")
+        for frame, ms, present, work, draws in frames:
+            csv.write(f"{frame},{ms},{present},{'' if work is None else work},{'' if draws is None else draws}\n")
+    if paging:
+        summary["meta"]["paging_mb"] = paging
+    summary["meta"] = {**summary["meta"], "scenario": scenario["name"], "label": label, "started_utc": started.isoformat(),
                        "exited_cleanly": exited, "notes": notes[-40:], "log": logs[-1]}
     (out / "summary.json").write_text(json.dumps(summary, indent=2))
     print_summary(summary)
     print(f"bench: results in {out}")
     if not exited:
         print("bench: WARNING the run didn't reach its exit frame; don't compare it", file=sys.stderr)
+    if paging and paging["swapins"] + paging["swapouts"] > 1024:
+        print(f"bench: WARNING the Mac swapped {paging['swapins']} MB in and {paging['swapouts']} MB out during the "
+              "run; memory pressure slows everything, so check this run before comparing it", file=sys.stderr)
     if args.baseline:
         compare(Path(args.baseline), out)
     return out
@@ -386,7 +422,8 @@ def print_summary(summary):
             continue
         print(f"{name:<12}{s['frames']:>8}{s['fps']:>8.1f}{s['mean_ms']:>8.1f}{s['p95_ms']:>8.1f}{s['p99_ms']:>8.1f}"
               f"{s['max_ms']:>9.1f}{s['over_33ms']:>7}{s['over_250ms']:>6}"
-              + (f"   work {s['work_mean_ms']:.2f} / p95 {s['work_p95_ms']:.1f}" if "work_mean_ms" in s else ""))
+              + (f"   work {s['work_mean_ms']:.2f} / p95 {s['work_p95_ms']:.1f}" if "work_mean_ms" in s else "")
+              + (f"   draws {s['draws_mean']:.0f}" if "draws_mean" in s else ""))
 
 
 def compare(baseline, candidate, threshold=0.05):
@@ -398,13 +435,13 @@ def compare(baseline, candidate, threshold=0.05):
         if phase == "meta" or phase not in a or not a[phase].get("frames") or not b[phase].get("frames"):
             continue
         cells = []
-        for key in ("mean_ms", "p95_ms", "p99_ms", "work_mean_ms", "work_p95_ms"):
+        for key in ("mean_ms", "p95_ms", "p99_ms", "work_mean_ms", "work_p95_ms", "draws_mean"):
             if key not in a[phase] or key not in b[phase]:
                 continue
             old, new = a[phase][key], b[phase][key]
             change = (new - old) / old if old else 0
             worse |= key == "mean_ms" and change > threshold
-            cells.append(f"{key[:-3]} {old:.1f}->{new:.1f} ({change:+.1%})")
+            cells.append(f"{key.removesuffix('_ms')} {old:.1f}->{new:.1f} ({change:+.1%})")
         print(f"  {phase:<10} " + "  ".join(cells))
     for run in (a, b):
         if not run.get("meta", {}).get("exited_cleanly"):

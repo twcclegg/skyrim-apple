@@ -272,7 +272,9 @@ static void head_steer(void) {
 #if defined(LB_IOS_DEVICE) || defined(LB_MAC_MAIN_PUMP)
 #define LB_PACE_LOG 1
 static double g_present_began, g_present_sum, g_present_max, g_present_last, g_slept_last;
+static int g_draws_last;
 void platform_present_slept(double ms) { g_slept_last = ms; }
+void platform_present_draws(int draws) { g_draws_last = draws; }
 static double pace_now_ms(void) { return (double)SDL_GetPerformanceCounter() * 1000.0 / (double)SDL_GetPerformanceFrequency(); }
 void platform_present_begin(void) { g_present_began = pace_now_ms(); }
 void platform_present_end(void) {
@@ -281,8 +283,9 @@ void platform_present_end(void) {
     g_present_sum += took;
     if (took > g_present_max) g_present_max = took;
 }
-/* Benchmark runs (tools/bench): LB_FRAMETIMES=1 logs every frame as "ft <frame> <frame ms> <Present ms> <work ms>",
- * where work is the frame time without the 60 fps pacing sleep and without Present (the game's own CPU time);
+/* Benchmark runs (tools/bench): LB_FRAMETIMES=1 logs every frame as
+ * "ft <frame> <frame ms> <Present ms> <work ms> <draw calls>", where work is the frame time without the 60 fps
+ * pacing sleep and without Present (the game's own CPU time);
  * LB_EXIT_FRAME=N ends the game cleanly once frame N is presented. */
 #ifdef LB_IOS_DEVICE
 void platform_native_request_quit(void);
@@ -301,7 +304,7 @@ static void bench_frame(double took) {
     }
     if (frametimes) {
         double work = took - g_present_last - g_slept_last;
-        LOG("ft %d %.2f %.2f %.2f", g_frames, took, g_present_last, work > 0 ? work : 0);
+        LOG("ft %d %.2f %.2f %.2f %d", g_frames, took, g_present_last, work > 0 ? work : 0, g_draws_last);
     }
     g_slept_last = 0;
     if (exit_frame > 0 && g_frames == exit_frame) {
@@ -336,6 +339,7 @@ static void pace_frame(void) {
 void platform_present_begin(void) {}
 void platform_present_end(void) {}
 void platform_present_slept(double ms) { (void)ms; }
+void platform_present_draws(int draws) { (void)draws; }
 #endif
 
 #ifdef LB_IOS_DEVICE

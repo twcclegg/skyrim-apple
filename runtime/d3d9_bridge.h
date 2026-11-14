@@ -24,7 +24,7 @@ static inline R bridge_call(T *self, R (STDMETHODCALLTYPE T::*m)(P...), A... a) 
     return (self->*m)(((P)(a))...);
 }
 
-extern int g_d3d_trace, g_bisect;
+extern int g_d3d_trace, g_bisect, g_d3d_draws;  /* g_d3d_draws: draw calls since the last Present */
 bool d3d_skip_draw(void);
 void d3d_trace(CPU *c, const char *name, int nargs);
 
@@ -35,4 +35,6 @@ void platform_present_begin(void);
 void platform_present_end(void);
 /* time the 60 fps pacing slept after this Present, for the benchmark's per-frame work time */
 void platform_present_slept(double ms);
+/* draw calls the game made for the frame being presented, for the benchmark's per-frame log */
+void platform_present_draws(int draws);
 }
