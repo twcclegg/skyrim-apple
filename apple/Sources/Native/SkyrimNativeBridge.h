@@ -62,6 +62,27 @@ void skyrim_camera_jitter(int phases);
 /* Added to the mip level the game's textures are sampled at: log2(render size / shown size), so -1 when the
  * picture is shown at twice the size it was rendered at. 0 = as the game sets it. */
 void skyrim_texture_bias(float levels);
+/* ipad/metalfx_temporal.mm: MetalFX's temporal scaler, looked up by name because the visionOS SDK marks its types
+ * unavailable. Objects are passed as Unmanaged.passUnretained(...).toOpaque(). */
+typedef struct skyrim_temporal_scaler_setup {
+    uint32_t input_width, input_height, output_width, output_height;
+    uint32_t color_format, depth_format, motion_format, output_format;   /* MTLPixelFormat */
+    int auto_exposure;
+    /* Filled in by skyrim_temporal_scaler_make: the MTLTextureUsage the scaler needs of each texture. */
+    uint32_t color_usage, depth_usage, motion_usage, output_usage;
+} skyrim_temporal_scaler_setup;
+typedef struct skyrim_temporal_scaler_frame {
+    void *color, *depth, *motion, *output;   /* id<MTLTexture> */
+    float jitter_x, jitter_y, motion_scale_x, motion_scale_y;
+    int reset;                               /* 1 = forget the frames before */
+    int depth_reversed;
+} skyrim_temporal_scaler_frame;
+/* A scaler to give back with skyrim_temporal_scaler_free, or NULL with the reason in `why` (the system has no such
+ * class, it does not support the device, it made none, it threw). `device` is an id<MTLDevice>. */
+void *skyrim_temporal_scaler_make(void *device, skyrim_temporal_scaler_setup *setup, char *why, size_t why_size);
+/* Encodes one upscale into command_buffer (id<MTLCommandBuffer>). 0 when MetalFX threw; stop using the scaler. */
+int skyrim_temporal_scaler_encode(void *scaler, const skyrim_temporal_scaler_frame *frame, void *command_buffer);
+void skyrim_temporal_scaler_free(void *scaler);
 #endif
 
 #endif

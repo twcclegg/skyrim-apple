@@ -421,9 +421,16 @@ final class ImmersiveCompositor: @unchecked Sendable {
     // temporal scaler adds the frames up into a picture factor times the size, following the camera's movement
     // through the motion and depth temporal_fragment writes. Frames without a camera (menus, loading) go through
     // the spatial scaler instead, and the next frame with one starts afresh.
-    #if canImport(MetalFX)
-    private var temporalScaler: (any MTLFXTemporalScaler)?
-    #endif
+    //
+    // The visionOS SDK marks MetalFX's temporal scaler unavailable, so its types can't be mentioned here.
+    // ipad/metalfx_temporal.mm looks the class up by name when asked; if the system doesn't have it, that is
+    // logged once and the spatial scaler is used.
+    private final class TemporalScaler {
+        let pointer: UnsafeMutableRawPointer
+        init(_ pointer: UnsafeMutableRawPointer) { self.pointer = pointer }
+        deinit { skyrim_temporal_scaler_free(pointer) }
+    }
+    private var temporalScaler: TemporalScaler?
     private var temporalPipeline: (any MTLRenderPipelineState)?
     private var temporalDepthState: (any MTLDepthStencilState)?
     private var temporalInputs: (color: any MTLTexture, motion: any MTLTexture, depth: any MTLTexture)?
@@ -464,15 +471,12 @@ final class ImmersiveCompositor: @unchecked Sendable {
         temporalBefore = nil
         temporalInputs = nil
         temporalOutput = nil
-        #if canImport(MetalFX)
         temporalScaler = nil
-        #endif
         skyrim_camera_jitter(0)
         skyrim_texture_bias(0)
         log("temporal: \(why); using the spatial upscale")
     }
 
-    #if canImport(MetalFX)
     /// The scaler, its textures and the pass that feeds it, for game frames of this size. The game is only asked
     /// to shift its camera once all of them exist, so a scaler that can't be made never leaves a shifted picture.
     private func makeTemporal(width: Int, height: Int, factor: Float) -> Bool {
@@ -480,37 +484,37 @@ final class ImmersiveCompositor: @unchecked Sendable {
         temporalInputs = nil
         temporalOutput = nil
         temporalBefore = nil
-        guard MTLFXTemporalScalerDescriptor.supportsDevice(device) else {
-            temporalGiveUp("MetalFX temporal scaling is not supported on this device")
-            return false
-        }
         let conventions = readTemporalConventions()
-        let description = MTLFXTemporalScalerDescriptor()
-        description.inputWidth = width
-        description.inputHeight = height
-        description.outputWidth = Int((Float(width) * factor).rounded())
-        description.outputHeight = Int((Float(height) * factor).rounded())
-        description.colorTextureFormat = .rgba16Float
-        description.depthTextureFormat = .depth32Float
-        description.motionTextureFormat = .rg16Float
-        description.outputTextureFormat = .rgba16Float
-        description.isAutoExposureEnabled = conventions.autoExposure
-        guard let made = description.makeTemporalScaler(device: device) else {
-            temporalGiveUp("no MetalFX temporal scaler for \(width)x\(height) -> \(description.outputWidth)x\(description.outputHeight)")
+        var setup = skyrim_temporal_scaler_setup()
+        setup.input_width = UInt32(width)
+        setup.input_height = UInt32(height)
+        setup.output_width = UInt32((Float(width) * factor).rounded())
+        setup.output_height = UInt32((Float(height) * factor).rounded())
+        setup.color_format = UInt32(MTLPixelFormat.rgba16Float.rawValue)
+        setup.depth_format = UInt32(MTLPixelFormat.depth32Float.rawValue)
+        setup.motion_format = UInt32(MTLPixelFormat.rg16Float.rawValue)
+        setup.output_format = UInt32(MTLPixelFormat.rgba16Float.rawValue)
+        setup.auto_exposure = conventions.autoExposure ? 1 : 0
+        var why = [CChar](repeating: 0, count: 256)
+        let room = why.count
+        guard let pointer = skyrim_temporal_scaler_make(Unmanaged.passUnretained(device as AnyObject).toOpaque(),
+                                                        &setup, &why, room) else {
+            temporalGiveUp(String(cString: why))
             return false
         }
-        func target(_ format: MTLPixelFormat, _ width: Int, _ height: Int, _ usage: MTLTextureUsage) -> (any MTLTexture)? {
+        let made = TemporalScaler(pointer)
+        let outputWidth = Int(setup.output_width), outputHeight = Int(setup.output_height)
+        func target(_ format: MTLPixelFormat, _ width: Int, _ height: Int, _ needed: UInt32, _ also: MTLTextureUsage) -> (any MTLTexture)? {
             let wanted = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: format, width: width, height: height, mipmapped: false)
-            wanted.usage = usage
+            wanted.usage = MTLTextureUsage(rawValue: UInt(needed)).union(also)
             wanted.storageMode = .private
             return device.makeTexture(descriptor: wanted)
         }
-        guard let color = target(.rgba16Float, width, height, made.colorTextureUsage.union([.renderTarget, .shaderRead])),
-              let motion = target(.rg16Float, width, height, made.motionTextureUsage.union([.renderTarget, .shaderRead])),
-              let depth = target(.depth32Float, width, height, made.depthTextureUsage.union([.renderTarget, .shaderRead])),
-              let output = target(.rgba16Float, description.outputWidth, description.outputHeight,
-                                  made.outputTextureUsage.union(.shaderRead)) else {
-            temporalGiveUp("no textures for \(width)x\(height) -> \(description.outputWidth)x\(description.outputHeight)")
+        guard let color = target(.rgba16Float, width, height, setup.color_usage, [.renderTarget, .shaderRead]),
+              let motion = target(.rg16Float, width, height, setup.motion_usage, [.renderTarget, .shaderRead]),
+              let depth = target(.depth32Float, width, height, setup.depth_usage, [.renderTarget, .shaderRead]),
+              let output = target(.rgba16Float, outputWidth, outputHeight, setup.output_usage, .shaderRead) else {
+            temporalGiveUp("no textures for \(width)x\(height) -> \(outputWidth)x\(outputHeight)")
             return false
         }
         if temporalPipeline == nil || temporalDepthState == nil {
@@ -548,7 +552,6 @@ final class ImmersiveCompositor: @unchecked Sendable {
         log("temporal: MetalFX temporal \(width)x\(height) -> \(output.width)x\(output.height), \(phases) jitter positions, texture bias \(-log2(factor)), signs jitter \(conventions.jitter.x) \(conventions.jitter.y) motion \(conventions.motion.x) \(conventions.motion.y), auto exposure \(conventions.autoExposure ? "on" : "off")")
         return true
     }
-    #endif
 
     /// The game image after the MetalFX temporal upscale, in linear light (no sRGB decode left to do), encoded
     /// into `commands` when the frame is new. nil when it is off, can't be made (logged once), or this frame has
@@ -556,7 +559,6 @@ final class ImmersiveCompositor: @unchecked Sendable {
     private func temporalUpscale(_ texture: any MTLTexture, depth sceneDepth: (any MTLTexture)?, game: skyrim_immersive_frame,
                                  factor: Float, commands: any MTLCommandBuffer) -> (any MTLTexture)? {
         guard factor > 1, !temporalUnavailable else { return nil }
-        #if canImport(MetalFX)
         if game.is_new == 0 { return temporalShown ? temporalOutput : nil }
         temporalShown = false
         guard game.has_camera != 0 else {
@@ -618,31 +620,28 @@ final class ImmersiveCompositor: @unchecked Sendable {
         encoder.endEncoding()
 
         let conventions = readTemporalConventions()
-        scaler.colorTexture = inputs.color
-        scaler.depthTexture = inputs.depth
-        scaler.motionTexture = inputs.motion
-        scaler.outputTexture = output
-        scaler.inputContentWidth = texture.width
-        scaler.inputContentHeight = texture.height
-        scaler.jitterOffsetX = conventions.jitter.x * game.jitter.0
-        scaler.jitterOffsetY = conventions.jitter.y * game.jitter.1
-        scaler.motionVectorScaleX = conventions.motion.x
-        scaler.motionVectorScaleY = conventions.motion.y
-        scaler.isDepthReversed = false  // D3D depth: 0 near, 1 far
-        scaler.preExposure = 1
-        scaler.reset = restart
-        scaler.encode(commandBuffer: commands)
+        func unretained(_ object: AnyObject) -> UnsafeMutableRawPointer { Unmanaged.passUnretained(object).toOpaque() }
+        var frame = skyrim_temporal_scaler_frame()
+        frame.color = unretained(inputs.color)
+        frame.depth = unretained(inputs.depth)
+        frame.motion = unretained(inputs.motion)
+        frame.output = unretained(output)
+        frame.jitter_x = conventions.jitter.x * game.jitter.0
+        frame.jitter_y = conventions.jitter.y * game.jitter.1
+        frame.motion_scale_x = conventions.motion.x
+        frame.motion_scale_y = conventions.motion.y
+        frame.depth_reversed = 0  // D3D depth: 0 near, 1 far
+        frame.reset = restart ? 1 : 0
+        guard skyrim_temporal_scaler_encode(scaler.pointer, &frame, unretained(commands)) != 0 else {
+            temporalGiveUp("MetalFX's temporal scaler could not encode a frame")
+            return nil
+        }
 
         temporalBefore = view
         temporalShown = true
         temporalFrames += 1
         if restart { temporalRestarts += 1 }
         return output
-        #else
-        temporalUnavailable = true
-        log("temporal: MetalFX is not in this SDK (visionOS Simulator); using the image as it is")
-        return nil
-        #endif
     }
 
     init(layer: LayerRenderer) {

@@ -110,7 +110,7 @@ endif()
 add_library(skyrim_ipad_bridge OBJECT native_bridge.mm)
 if(SKYRIM_SDL_PLATFORM STREQUAL "visionos")
   # The immersive compositor's frame handoff needs DXVK's tap header and MoltenVK's Vulkan headers.
-  target_sources(skyrim_ipad_bridge PRIVATE immersive_bridge.mm)
+  target_sources(skyrim_ipad_bridge PRIVATE immersive_bridge.mm metalfx_temporal.mm)
   target_include_directories(skyrim_ipad_bridge PRIVATE "${SKYRIM_ROOT}/android/app/jni/dxvk/include/native"
     "${SKYRIM_MOLTENVK_ROOT}/include")
 endif()

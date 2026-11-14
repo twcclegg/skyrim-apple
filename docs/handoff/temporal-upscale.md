@@ -9,6 +9,33 @@ half (the motion vectors and the scaler) was written on Linux **without a Swift 
 visionOS and has never been compiled or run**. `tools/metalfx_temporal_probe.swift` is there so a Mac can
 settle what is open before anyone puts a headset on.
 
+## Status, 2026-11-13: the visionOS SDK has no temporal scaler
+
+The M1 type-checked f3dde77 (issue #21): the simulator SDK passes, the device SDK does not. Xcode's visionOS
+SDK 27.2 marks `MTLFXTemporalScaler`, `MTLFXTemporalDenoisedScaler`, `MTLFXFrameInterpolator` and their
+`MTL4FX` variants `API_UNAVAILABLE(visionos)`. Only the spatial scaler (PR #13) is available.
+
+Whether the headset's system has the class anyway is **not known**. A third-party port reports the temporal
+scaler working there when looked up by name, and branch `immersive/metalfx-probe` (c3c3206, logging only)
+prints what the device has when immersive play starts. Until a headset log says so, treat this branch as an
+experiment that may end at "the system does not have it".
+
+What changed here because of it:
+
+- The compositor no longer mentions MetalFX's temporal types. `ipad/metalfx_temporal.mm` looks the
+  descriptor class up by name, with the few properties it uses declared again so the calls are typed, and
+  hands Swift a plain C interface (`skyrim_temporal_scaler_make`, `_encode`, `_free`). If the class is
+  absent, does not support the device, makes no scaler or throws, the reason is logged once
+  (`immersive: temporal: ...; using the spatial upscale`) and the spatial scaler is used. So one headset
+  session answers both "is it there" and "what does it look like".
+- That file was checked on Linux with clang against stand-in Metal headers (syntax, ARC, the casts) and
+  `ImmersiveScreen.swift` with `swiftc -parse`. **Neither has met the real SDK.** "For the Mac" below has a
+  self-test that runs the by-name path on macOS.
+- Calling an API the SDK marks unavailable is fine for a build installed from Xcode. It would not pass App
+  Store review.
+- A hand-written temporal resolve was sized as the alternative and is not worth porting; see "A hand-written
+  resolve instead".
+
 ## What was built
 
 Game side (`runtime/`):
@@ -45,12 +72,14 @@ Compositor (`apple/Sources/App/ImmersiveScreen.swift`), with `LB_IMMERSIVE_TEMPO
 - Frames with no camera (menus) and anything that fails go through the spatial scaler of PR #13 instead. If
   the scaler, its textures or the pass can't be made, one `immersive: temporal: ...; using the spatial upscale`
   line says why, and jitter and bias are turned off again.
-- In the simulator (no MetalFX in that SDK) it logs once and draws the image as it is.
+- In the simulator (no MetalFX there) the lookup by name finds nothing: it logs once and the image is drawn
+  as it is.
 
 Tools:
 
 - `tools/taa_sim.py`: the measurements below, from frames the desktop build dumps.
-- `tools/metalfx_temporal_probe.swift`: the real scaler on a Mac; see "For the Mac".
+- `tools/taa_resolve.py`: a hand-written temporal upscale in numpy, scored against full-size frames.
+- `tools/metalfx_temporal_probe.swift`: the real scaler on a Mac (macOS has it); see "For the Mac".
 
 ## Settings
 
@@ -88,15 +117,53 @@ Dumps are game imagery and are not in the repository.
   the last shift and stands still. For menus that don't pause, the bridge applies no shift.
 - The desktop build still builds and runs with all of this off (the default).
 
+## A hand-written resolve instead (Linux, measured)
+
+If the headset has no temporal scaler, the alternative is the compositor's own shader. `tools/taa_resolve.py`
+tries the usual one on real frames before anyone writes it in Metal. 200 frames at 1280x720 are the truth;
+each gives a 640x360 frame by keeping one pixel of every 2x2 block, a different one each frame, which is what
+a half-size render with a quarter-pixel jitter and texture bias -1 samples. The resolve sees those, their
+depth and the cameras. Riverwood, low preset, weather pinned: 25 frames standing, 71 walking forward through
+tall grass, 45 strafing into a pine at close range.
+
+World PSNR in dB (compass and crosshair left out) / compass PSNR / fine detail as a share of the truth's:
+
+| Variant | Standing | Walking | Strafing |
+| --- | --- | --- | --- |
+| one frame upscaled bilinearly, no history | 24.95 / 20.09 / 70% | 24.61 / 21.51 / 72% | 26.28 / 22.52 / 77% |
+| history from the same pixel (no motion vectors) | 30.98 / 24.12 / 76% | 19.98 / 18.78 / 79% | 20.20 / 18.34 / 88% |
+| motion vectors, bicubic history, neighbourhood clamp | 30.98 / 24.12 / 76% | 22.34 / 18.47 / 70% | 21.87 / 18.23 / 78% |
+| ... without the clamp | 33.18 / 26.50 / 83% | 20.22 / 17.58 / 89% | 17.86 / 15.02 / 119% |
+| ... with depth rejection | 27.41 / 21.87 / 76% | 24.17 / 19.94 / 75% | 25.65 / 20.64 / 81% |
+| ... depth rejection, faster blend when moving | 27.41 / 21.87 / 76% | 24.50 / 20.32 / 71% | 26.11 / 21.96 / 77% |
+| ... tolerant depth rejection | 30.75 / 23.91 / 76% | 22.79 / 18.73 / 72% | 24.18 / 19.71 / 83% |
+| ... tolerant depth rejection, faster blend when moving | 30.75 / 23.91 / 76% | 23.54 / 19.11 / 68% | 25.32 / 21.21 / 77% |
+
+- **Standing still it works:** about 6 dB over a single upscaled frame, and more detail.
+- **Moving through foliage it does not:** every variant is at or below a single frame. The reprojection is
+  right on solid surfaces (checked by warping full-size frames); the loss is in thin alpha-tested grass and
+  needles that uncover each other and sway. Rejecting history there gets back to par, no further, and the
+  strict rejection that does it costs 3.5 dB of the standing gain because it also fires at foliage edges
+  when nothing moves.
+- **The compass is worse in every moving case**, as the known limits below say it would be.
+- This route is a worst case on purpose; an open road was not measured. The prototype had only a
+  little tuning and is not the best such a shader can do. It is enough to say a hand-written resolve is not a quick win.
+
+Run it (dumps are game imagery; keep them out of the repository):
+
+    tools/taa_resolve.py <dump dir> --frames 1560-1759 --span standing=1575-1599 --span walking=1620-1690 \
+        --span strafing=1715-1759
+
 ## What was not tested
 
 Everything on the Apple side:
 
-- `ImmersiveScreen.swift` and the probe passed only `swiftc -parse` on Linux (syntax). They have not been
-  type-checked against Metal, MetalFX or CompositorServices, and the Metal shader source has not been
-  compiled.
-- Whether MetalFX's temporal scaler is in the visionOS device SDK at all, and whether it takes
-  RGBA16Float colour, Depth32Float depth and RG16Float motion.
+- `ImmersiveScreen.swift` and the probe passed only `swiftc -parse` on Linux (syntax). f3dde77 was
+  type-checked by the M1 (simulator SDK clean; device SDK failed on the temporal types). The by-name version
+  after it has not been type-checked, and the Metal shader source has not been compiled.
+- Whether the headset's system has MetalFX's temporal scaler (the SDK says no), and whether it takes
+  RGBA16Float colour, Depth32Float depth and RG16Float motion there. On a Mac the M1's probe made one with
+  those formats.
 - **The sign conventions.** Which way MetalFX wants `jitterOffset` and the motion vectors is a reading of
   the documentation. A wrong jitter sign gives a picture softer than the spatial scaler; a wrong motion sign
   smears everything when the camera moves. The probe measures both.
@@ -119,8 +186,17 @@ Known limits, none of them looked at on a headset:
 ## For the Mac (Skyrim - M1)
 
 1. Type-check `apple/Sources` for the visionOS device SDK and the simulator SDK, as for PR #13
-   (`swiftc -typecheck`, `-D SKYRIM_NATIVE_RUNTIME`). Fix what the blind writing got wrong.
-2. Build and run the probe (macOS has MetalFX, so this needs no headset):
+   (`swiftc -typecheck`, `-D SKYRIM_NATIVE_RUNTIME`). Fix what the blind writing got wrong. The device SDK
+   should now pass: nothing names the temporal types any more.
+2. Run the by-name path on macOS. This is the code the headset will run, less the compositor around it:
+
+       xcrun clang++ -std=c++17 -fobjc-arc -DSKYRIM_TEMPORAL_SCALER_SELFTEST ipad/metalfx_temporal.mm \
+           -framework Metal -framework Foundation -framework MetalFX -o /tmp/temporal_scaler && /tmp/temporal_scaler
+
+   It should print the scaler's class and `two frames encoded and completed`, exit 0. Also compile the file
+   with the visionOS engine's own flags, as `immersive_bridge.mm` is (`ipad/CMakeLists.txt` now lists it).
+3. Build and run the probe (macOS has MetalFX, so this needs no headset). It uses the typed API, which is
+   fine on macOS:
 
        xcrun swiftc -O tools/metalfx_temporal_probe.swift -o /tmp/temporal_probe
        /tmp/temporal_probe apple/Sources/App/ImmersiveScreen.swift
@@ -132,7 +208,7 @@ Known limits, none of them looked at on a headset:
    scaler accepts. If the best signs are not `-1 -1` / `+1 +1`, change the defaults in
    `readTemporalConventions`. "NOT CLEAR" means the test did not separate the choices; say so rather than
    picking one.
-3. With game data on the Mac, the real picture: dump frames from the desktop build at half size, standing
+4. With game data on the Mac, the real picture: dump frames from the desktop build at half size, standing
    still and then walking,
 
        LB_WINDOW=640x360 LB_JITTER=32 LB_TEXTURE_BIAS=-1 LB_CAMLOG=1 LB_SHOT=600-680 ...
@@ -142,19 +218,25 @@ Known limits, none of them looked at on a headset:
        /tmp/temporal_probe apple/Sources/App/ImmersiveScreen.swift frames <dump dir> 600 680 <out dir> 2 <signs>
 
    and compare `temporal-00680.bmp` with `spatial-00680.bmp` and with a 1280x720 render of the same place.
-   Look at the compass while walking, at grass and water, and at the hands with a weapon drawn.
-4. Report the probe's output and what step 3 looked like on issue #21.
+   Look at the compass while walking, at grass and water, and at the hands with a weapon drawn. Walking
+   through tall grass is where the hand-written resolve above gained nothing, so that is the case that says
+   whether MetalFX is worth a headset session.
+5. Report the outputs and what step 4 looked like on issue #21.
 
 ## Headset test (Thomas)
 
 Only after the Mac steps. One change at a time in `launch-env.json`:
 
+0. With `immersive/metalfx-probe` merged into the build, the log's `metalfx probe:` lines say whether the
+   headset has the temporal scaler at all. If `MTLFXTemporalScalerDescriptor` is `absent`, stop here: step 2
+   will fall back to the spatial scaler and there is nothing to look at.
 1. Baseline: `LB_WINDOW=1280x720`, `LB_IMMERSIVE_UPSCALE=2` (PR #13's spatial scaler). Note `compositor gpu`
    and the game's fps lines.
 2. Add `LB_IMMERSIVE_TEMPORAL=1`. The log should say `immersive: image: upscale x2.0 temporal` and
    `immersive: temporal: MetalFX temporal 1280x720 -> 2560x1440, 32 jitter positions, texture bias -1.0, ...`,
    then every few seconds `temporal: N frames upscaled, M fresh starts`. A line ending
-   `using the spatial upscale` means it fell back.
+   `using the spatial upscale` means it fell back, and says why (for one,
+   `this system has no MetalFX temporal scaler`).
 3. Standing still: distant detail, thin edges (branches, railings), texture detail on the ground. It should
    be clearly sharper than step 1 and should not shimmer.
 4. Walking and turning: smearing behind edges, the compass and crosshair, people walking past, grass, water.
@@ -164,6 +246,11 @@ Only after the Mac steps. One change at a time in `launch-env.json`:
 ## Merging
 
 - On top of PR #13; that goes first.
+- Not before a headset log shows the temporal scaler exists there. If it does not, the game side (jitter,
+  frame jitter, texture bias, the dump tools) is still what any other temporal method would need; the
+  compositor's temporal path and `ipad/metalfx_temporal.mm` would come out.
+- `immersive/metalfx-probe` adds a block to `ipad/immersive_bridge.mm`; this branch does not touch that
+  place.
 - `immersive/locomotion-extrapolation` and `immersive/foveated-render` change `ImmersiveScreen.swift` too
   and will conflict in `draw()` and the uniforms. With foveation the motion pass needs the foveated frustum
   mapping (it assumes pixels are evenly spaced in tangent); until that is written, don't turn both on.
