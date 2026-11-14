@@ -1,0 +1,2 @@
+# Group 4 native replacements (runtime/skyrim_native_g4.c)
+0xAE4CB0  # quicksort of uint16 indices by float key, largest first
