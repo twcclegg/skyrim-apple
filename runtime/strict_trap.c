@@ -15,6 +15,35 @@
 static struct sigaction g_prev;
 unsigned long long rt_strict_traps;     /* crossing accesses handled, for the exit report */
 
+/* LB_STRICT_TRAP_PROFILE: count traps per lifted function, to choose which functions keep the inline test */
+#ifdef LB_STRICT_TRAP_PROFILE
+#include <dlfcn.h>
+#include <stdio.h>
+#include <stdlib.h>
+#define NPC 16384
+static struct { uintptr_t pc; unsigned long long n; } g_pcs[NPC];
+static void note_pc(uintptr_t pc) {
+    for (unsigned h = (unsigned)(pc >> 2) * 2654435761u % NPC, k = 0; k < NPC; k++, h = (h + 1) % NPC) {
+        uintptr_t cur = __atomic_load_n(&g_pcs[h].pc, __ATOMIC_RELAXED);
+        if (!cur && __atomic_compare_exchange_n(&g_pcs[h].pc, &cur, pc, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) cur = pc;
+        if (cur == pc) { __atomic_fetch_add(&g_pcs[h].n, 1, __ATOMIC_RELAXED); return; }
+    }
+}
+void rt_strict_trap_report(void) {
+    const char *path = getenv("LB_STRICT_TRAP_OUT");
+    FILE *f = path ? fopen(path, "w") : NULL;
+    if (!f) return;
+    for (unsigned h = 0; h < NPC; h++) if (g_pcs[h].pc) {
+        Dl_info di; const char *name = dladdr((void *)g_pcs[h].pc, &di) && di.dli_sname ? di.dli_sname : "?";
+        fprintf(f, "%llu %s\n", g_pcs[h].n, name);
+    }
+    fclose(f);
+}
+#else
+#define note_pc(pc) ((void)0)
+void rt_strict_trap_report(void) {}
+#endif
+
 static int fixup(siginfo_t *si, ucontext_t *uc) {
     struct __darwin_arm_thread_state64 *ss = &uc->uc_mcontext->__ss;
     const uint32_t *pc = (const uint32_t *)__darwin_arm_thread_state64_get_pc(*ss);
@@ -38,6 +67,7 @@ static int fixup(siginfo_t *si, ucontext_t *uc) {
     }
     __darwin_arm_thread_state64_set_pc_fptr(*ss, (void *)(pc + 1));
     __atomic_fetch_add(&rt_strict_traps, 1, __ATOMIC_RELAXED);
+    note_pc((uintptr_t)pc);
     return 1;
 }
 

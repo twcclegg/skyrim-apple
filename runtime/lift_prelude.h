@@ -83,20 +83,27 @@ static inline void rt_movsd(uint32_t n, uint32_t dst, uint32_t src) {
 #elif defined(__aarch64__)
 static inline uint8_t TL8(uint32_t a) { return __atomic_load_n(MEM + a, __ATOMIC_ACQUIRE); }
 static inline void TS8(uint32_t a, uint8_t v) { __atomic_store_n(MEM + a, v, __ATOMIC_RELEASE); }
+/* The inline alignment test: aligned accesses are ldar/stlr, others a plain access with a barrier. */
+#define TSO_CHECKED(n, T, mask) \
+static inline T TLC##n(uint32_t a) { \
+    if (__builtin_expect(!(a & mask), 1)) return __atomic_load_n((T *)(MEM + a), __ATOMIC_ACQUIRE); \
+    T v; memcpy(&v, MEM + a, sizeof v); __atomic_thread_fence(__ATOMIC_ACQUIRE); return v; } \
+static inline void TSC##n(uint32_t a, T v) { \
+    if (__builtin_expect(!(a & mask), 1)) { __atomic_store_n((T *)(MEM + a), v, __ATOMIC_RELEASE); return; } \
+    __atomic_thread_fence(__ATOMIC_RELEASE); memcpy(MEM + a, &v, sizeof v); }
+TSO_CHECKED(16, uint16_t, 1)
+TSO_CHECKED(32, uint32_t, 3)
 #if defined(LB_STRICT_TRAP)
 /* No alignment test: ldar/stlr take unaligned addresses inside a 16-byte block (FEAT_LSE2), and the rare
- * access that crosses one is done by the SIGBUS handler in runtime/strict_trap.c. */
+ * access that crosses one is done by the SIGBUS handler in runtime/strict_trap.c. The functions the lifter
+ * lists as UNALIGNED keep the test (it redefines TL16.. to TLC16.. around them). */
 #define TSO_PAIR(n, T, mask) \
 static inline T TL##n(uint32_t a) { return __atomic_load_n((T *)(MEM + a), __ATOMIC_ACQUIRE); } \
 static inline void TS##n(uint32_t a, T v) { __atomic_store_n((T *)(MEM + a), v, __ATOMIC_RELEASE); }
 #else
 #define TSO_PAIR(n, T, mask) \
-static inline T TL##n(uint32_t a) { \
-    if (__builtin_expect(!(a & mask), 1)) return __atomic_load_n((T *)(MEM + a), __ATOMIC_ACQUIRE); \
-    T v; memcpy(&v, MEM + a, sizeof v); __atomic_thread_fence(__ATOMIC_ACQUIRE); return v; } \
-static inline void TS##n(uint32_t a, T v) { \
-    if (__builtin_expect(!(a & mask), 1)) { __atomic_store_n((T *)(MEM + a), v, __ATOMIC_RELEASE); return; } \
-    __atomic_thread_fence(__ATOMIC_RELEASE); memcpy(MEM + a, &v, sizeof v); }
+static inline T TL##n(uint32_t a) { return TLC##n(a); } \
+static inline void TS##n(uint32_t a, T v) { TSC##n(a, v); }
 #endif
 TSO_PAIR(16, uint16_t, 1)
 TSO_PAIR(32, uint32_t, 3)

@@ -251,6 +251,18 @@ HOST_OVERRIDES_SKYRIM = {
     "exe": {0x472580},  # plane/sphere side test, hot in culling -> runtime/skyrim_native.c
 }
 # LIFT_GAME=marvel|skyrim selects the overrides (runtime built with -DGAME_MARVEL / -DGAME_SKYRIM).
+# Functions that make unaligned 16- and 32-bit accesses crossing a 16-byte block often (copy and string
+# routines, decompression): with -DLB_STRICT_TRAP they keep the inline alignment test, because a trap per
+# access would cost more than the test saves. From a per-function trap count over the Whiterun and
+# boss-fight benchmark scenarios (LB_STRICT_TRAP_PROFILE); every function with 100 or more. Correctness
+# does not depend on this list: an access in any other function that crosses a block is done by the trap.
+UNALIGNED_SKYRIM = {
+    0x445690, 0x4552E0, 0x569050, 0x94C050, 0xA3C4E0, 0xB53ED0, 0xBA6C10, 0xBEE1A0, 0xD57660, 0xDCA6E0,
+    0xF52E30, 0xF537F0, 0xF53AE4, 0xF5F243, 0xF65D2E, 0xF770AE, 0xF789C6, 0x901A530,
+}
+UNALIGNED = UNALIGNED_SKYRIM if os.environ.get("LIFT_GAME") == "skyrim" else set()
+CHECKED_ON = "#ifdef LB_STRICT_TRAP\n#define TL16 TLC16\n#define TL32 TLC32\n#define TS16 TSC16\n#define TS32 TSC32\n#endif"
+CHECKED_OFF = "#ifdef LB_STRICT_TRAP\n#undef TL16\n#undef TL32\n#undef TS16\n#undef TS32\n#endif"
 HOST_OVERRIDES = {"marvel": HOST_OVERRIDES_MARVEL, "skyrim": HOST_OVERRIDES_SKYRIM}.get(
     os.environ.get("LIFT_GAME"), HOST_OVERRIDES_BATMAN)
 
@@ -1215,6 +1227,8 @@ class Lifter:
     def emit(self):
         o = self.out
         # A function replaced by host code keeps its guest body as f_X_guest.
+        if self.f in UNALIGNED:
+            o.append(CHECKED_ON)
         o.append("void f_%X%s(CPU *c) {" % (self.f, "_guest" if self.f in HOST_OVERRIDES.get(MOD, ()) else ""))
         o.append("    uint32_t eax = c->r[0], ecx = c->r[1], edx = c->r[2], ebx = c->r[3], "
                  "esp = c->r[4], ebp = c->r[5], esi = c->r[6], edi = c->r[7];")
@@ -1277,6 +1291,8 @@ class Lifter:
             o.append("L_dispatch:")
             o.append("    switch (jt_) { %s default: %s rt_call(c, jt_); return; }" % (cases, SPILL))
         o.append("}")
+        if self.f in UNALIGNED:
+            o.append(CHECKED_OFF)
         if xc and xc.used:
             o[:] = [l.replace(SPILL, "SPILLF();").replace(RELOAD, "RELOADF();") for l in o]
             o.insert(5, X87_LOCALS)
