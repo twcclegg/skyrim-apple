@@ -1,0 +1,4 @@
+# Group 3 native replacements -> runtime/skyrim_native_g3.c
+0xC8EB60  # shader world matrix from rotation, translation, scale (instruction-exact test)
+0x40A4B0  # float vector length, CRT sqrt inlined (calling-convention test, g3_abi.py)
+0xABED70  # NiPlane from three points: unit cross product and length inlined (calling-convention test, g3_abi.py)
