@@ -25,6 +25,19 @@ come from private game files).
    system swapped during the run (`meta.paging_mb`) and warns past 1 GB: with little memory, swapping can make
    a run several times slower for no reason in the build under test.
 
+## Draws per pass (`LB_PASSES`)
+
+`--env LB_PASSES=1` adds one line per frame next to the `ft` line, with the frame's draw calls and primitives by
+the kind of pass they belong to (the classes add up to the `ft` draw count; `rt` counts render-target changes):
+
+    pass <frame> shadow=<draws>/<prims> refl=… main=… depth=… fp=… mask=… fx=… post=… ui=… other=… rt=<n>
+
+The classes are guessed from the bound targets (size and format relative to the back buffer, whether a
+depth-stencil is bound, depth-only clears, quads); the rules and which of them are unverified are in
+`runtime/d3d9_bridge.cpp` (`pass_class`). `LB_PASSES=2` also logs, for the frames in `LB_D3DTRACE=<from>:<to>` (the
+first frame without it), one `passdbg <frame> <class> <w>x<h> fmt=<n> ds=<0|1> draws=<n> prims=<n>` line per run
+of draws of one class into one target, to check the rules against a real frame.
+
 ## Scenarios
 
 JSON in `scenarios/`. From the main menu they open the console, type commands (`tgm`, then `coc <cell>`, which

@@ -399,6 +399,7 @@ environment of `macos/run.sh`; in the Simulator, pass them with
 | `LB_MOUSE_CAPTURE=0` | macOS: leave the pointer free, for automated and CUA runs |
 | `LB_ANY_PAD=1` | Development: admit controllers other than a DualSense as XInput pads |
 | `LB_MAX_FPS=N` | Apple present pacing: at most `N` fps, default 60; `0` disables it |
+| `LB_PASSES=1` | Log `pass <frame> shadow=<draws>/<prims> … other=… rt=<n>` at each Present: draws per kind of pass (`tools/bench/README.md`); `2` also logs a `passdbg` line per run of draws into one target in the `LB_D3DTRACE` frames |
 | `DXVK_FORCE_BASE_VERTEX_FOLD=1` | macOS: force the Simulator's base-vertex fold, so tests can compare it with native drawing |
 
 ## Apple-specific fixes
