@@ -1,0 +1,5 @@
+447ED0  # 3x3 matrix product
+474CD0  # 3x3 matrix times vector
+420560  # normalized cross product
+AFC100  # box vs frustum planes (centre/extent)
+AFBF80  # box vs frustum planes (corners)
