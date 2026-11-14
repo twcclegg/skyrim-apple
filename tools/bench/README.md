@@ -25,6 +25,23 @@ come from private game files).
    system swapped during the run (`meta.paging_mb`) and warns past 1 GB: with little memory, swapping can make
    a run several times slower for no reason in the build under test.
 
+## GPU busy time and per-pass-class counts
+
+Both are optional; a log without them parses as before.
+
+- GPU busy: runs set `LB_POWER_LOG_S=2` (unless the scenario or `--env` sets it), so the game prints
+  `dxvk: gpu busy <N>%, <X> ms per frame over <F> frames` every 2 s on stderr. `summary.json` gets a top-level
+  `gpu` object: `{"windows", "frames", "gpu_busy_ms", "gpu_busy_pct"}`, both means weighted by each window's frame
+  count. These lines carry no frame numbers, so they can't be tied to phases: the figure covers the whole run
+  (loading and menus included). `compare` prints it as one line.
+- Pass classes: with `LB_PASSES=1` (add `--env LB_PASSES=1`) the game prints one line per frame,
+  `pass <frame> shadow=<draws>/<prims> refl=... main=620/41233/3.21 ... rt=<n>`. Every `key=a/b[/c]` is parsed
+  generically, so new classes or the third number (GPU ms) need no parser change. Each phase (and `overall`)
+  gets `passes`: `{class: {"frames", "draws_mean", "prims_mean", "gpu_ms_mean"}}`; `gpu_ms_mean` appears only when
+  the lines carry it, and a single-number key such as `rt` gives `{"frames", "value_mean"}`. Screenshot frames are
+  excluded, as for frame times. `compare` prints a per-class table (draws, prims, GPU ms; baseline->candidate and
+  the ratio) per phase when both runs have `passes`. Pass lines are read from the game log and the console.
+
 ## Scenarios
 
 JSON in `scenarios/`. From the main menu they open the console, type commands (`tgm`, then `coc <cell>`, which
