@@ -106,6 +106,7 @@ def main(argv=None):
     ap.add_argument("--eye-units", type=float, help="half the eye separation in game units (default: the config's)")
     ap.add_argument("--saves", default=str(REPO / "bench-results/stereo-saves"), help="the game's save folder")
     ap.add_argument("--env", action="append", default=[], metavar="KEY=VALUE", help="extra launch environment")
+    ap.add_argument("--timeout", type=float, help="seconds before a launch is stopped (default: exit_frame / 20 + 240)")
     args = ap.parse_args(argv)
 
     config = json.loads(Path(args.config).read_text())
@@ -156,7 +157,7 @@ def main(argv=None):
             key, _, value = item.partition("=")
             env[key] = value
         logs_before = set(target.list_files(""))
-        timeout = location["exit_frame"] / 20 + 240
+        timeout = args.timeout or location["exit_frame"] / 20 + 240
         print(f"stereo_capture: {name}: running to frame {location['exit_frame']} (timeout {timeout:.0f} s), "
               f"triplets {triplets}, d = {eye_units:g} units")
         console = target.launch(env, timeout)
