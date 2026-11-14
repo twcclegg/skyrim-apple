@@ -122,6 +122,14 @@ file(GLOB GAME_C CONFIGURE_DEPENDS "${SKYRIM_GEN_DIR}/*.c")
 add_library(skyrim_ipad_generated OBJECT ${GAME_C})
 target_include_directories(skyrim_ipad_generated PRIVATE "${SKYRIM_ROOT}/runtime" "${SKYRIM_GEN_DIR}")
 target_compile_definitions(skyrim_ipad_generated PRIVATE GAME_SKYRIM LB_STRICT_ORDER)
+# -DLB_STRICT_TRAP=ON: no inline alignment test in strict loads and stores; the rare access that crosses a
+# 16-byte block is completed by the SIGBUS handler in runtime/strict_trap.c. A debugger sees each of those
+# faults before the handler does, so leave it off for debugging sessions.
+option(LB_STRICT_TRAP "Strict ordering without the inline alignment test (SIGBUS fix-up)" OFF)
+if(LB_STRICT_TRAP)
+  target_compile_definitions(skyrim_ipad_runtime PUBLIC LB_STRICT_TRAP)
+  target_compile_definitions(skyrim_ipad_generated PRIVATE LB_STRICT_TRAP)
+endif()
 # The guest base pointer never changes after startup; telling the generated code so removes its reloads
 # (docs/perf/LOG.md). -DLB_CONST_MEM=OFF builds the old way for an A/B.
 option(LB_CONST_MEM "Generated code treats the guest base pointer as a constant" ON)
