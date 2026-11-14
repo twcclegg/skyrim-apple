@@ -9,6 +9,8 @@
  * compositor stops showing is given back after the last command buffer that read it. */
 #define VK_USE_PLATFORM_METAL_EXT 1
 #import <Metal/Metal.h>
+#import <objc/message.h>
+#include <dlfcn.h>
 #include <vulkan/vulkan.h>
 #include <mutex>
 #include <stdio.h>
@@ -147,11 +149,55 @@ id<MTLTexture> depth_texture(const Entry &entry) {
 
 }  // namespace
 
+namespace {
+/* MetalFX on this device, logged once when immersive play starts. The visionOS SDK marks the temporal scaler, the
+ * temporal denoiser and the frame interpolator unavailable, so they are looked up by name: this says whether the
+ * system has them anyway, whether they report support for this GPU, and whether a temporal scaler can be made. */
+void metalfx_probe(void) {
+    static bool done;
+    if (done) return;
+    done = true;
+    dlopen("/System/Library/Frameworks/MetalFX.framework/MetalFX", RTLD_LAZY);
+    id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+    SEL supports = NSSelectorFromString(@"supportsDevice:");
+    for (NSString *name in @[@"MTLFXSpatialScalerDescriptor", @"MTLFXTemporalScalerDescriptor",
+                             @"MTLFXTemporalDenoisedScalerDescriptor", @"MTLFXFrameInterpolatorDescriptor"]) {
+        Class cls = NSClassFromString(name);
+        int supported = -1;
+        if (cls && device && [cls respondsToSelector:supports])
+            supported = ((BOOL (*)(id, SEL, id))objc_msgSend)(cls, supports, device) ? 1 : 0;
+        fprintf(stderr, "metalfx probe: %s %s, supportsDevice %d\n", name.UTF8String, cls ? "present" : "absent",
+                supported);
+    }
+    Class temporal = NSClassFromString(@"MTLFXTemporalScalerDescriptor");
+    if (!temporal || !device) return;
+    @try {
+        id descriptor = [[temporal alloc] init];
+        [descriptor setValue:@(MTLPixelFormatRGBA16Float) forKey:@"colorTextureFormat"];
+        [descriptor setValue:@(MTLPixelFormatDepth32Float) forKey:@"depthTextureFormat"];
+        [descriptor setValue:@(MTLPixelFormatRG16Float) forKey:@"motionTextureFormat"];
+        [descriptor setValue:@(MTLPixelFormatRGBA16Float) forKey:@"outputTextureFormat"];
+        [descriptor setValue:@960 forKey:@"inputWidth"];
+        [descriptor setValue:@540 forKey:@"inputHeight"];
+        [descriptor setValue:@1920 forKey:@"outputWidth"];
+        [descriptor setValue:@1080 forKey:@"outputHeight"];
+        SEL make = NSSelectorFromString(@"newTemporalScalerWithDevice:");
+        typedef id __attribute__((ns_returns_retained)) (*MakeFn)(id, SEL, id);
+        id scaler = [descriptor respondsToSelector:make] ? ((MakeFn)objc_msgSend)(descriptor, make, device) : nil;
+        fprintf(stderr, "metalfx probe: temporal scaler 960x540 -> 1920x1080 %s%s\n", scaler ? "created, " : "not created",
+                scaler ? object_getClassName(scaler) : "");
+    } @catch (NSException *e) {
+        fprintf(stderr, "metalfx probe: temporal scaler threw %s\n", e.reason.UTF8String);
+    }
+}
+}  // namespace
+
 extern "C" void skyrim_immersive_start(void) {
     {
         std::lock_guard<std::mutex> hold(g_lock);
         g_active = true;
     }
+    metalfx_probe();
     skyrim_present_tap_set(on_frame, nullptr);
     skyrim_present_tap_set_exclusive(1);
     fprintf(stderr, "immersive: tap registered, tap-only presents on\n");
