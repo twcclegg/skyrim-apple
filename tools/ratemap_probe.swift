@@ -55,8 +55,8 @@ guard device.supportsRasterizationRateMap(layerCount: 1) else { exit(1) }
 
 // The map, made the way runtime/foveation_provider.mm makes it.
 let layer = MTLRasterizationRateLayerDescriptor(sampleCount: MTLSizeMake(horizontal.count, vertical.count, 1))
-for (i, rate) in horizontal.enumerated() { layer.horizontalSampleStorage[i] = rate }
-for (i, rate) in vertical.enumerated() { layer.verticalSampleStorage[i] = rate }
+for (i, rate) in horizontal.enumerated() { layer.horizontal[i] = rate }
+for (i, rate) in vertical.enumerated() { layer.vertical[i] = rate }
 let mapDescriptor = MTLRasterizationRateMapDescriptor()
 mapDescriptor.label = "probe"
 mapDescriptor.screenSize = MTLSizeMake(screen[0], screen[1], 0)
