@@ -306,6 +306,9 @@ static void bench_frame(double took) {
     g_slept_last = 0;
     if (exit_frame > 0 && g_frames == exit_frame) {
         LOG("bench: exit frame %d reached", g_frames);
+#if defined(LB_STRICT_TRAP)
+        { extern unsigned long long rt_strict_traps; LOG("bench: %llu unaligned crossing accesses handled by trap", rt_strict_traps); }
+#endif
         platform_native_request_quit();
     }
 }
