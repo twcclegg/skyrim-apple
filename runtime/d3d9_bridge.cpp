@@ -502,7 +502,8 @@ static bool menu_open(void) {
 extern "C" int skyrim_menu_open(void) { return menu_open() ? 1 : 0; }
 #endif
 
-static void shot_depth(IDirect3DDevice9 *d) {
+// tag: the file name after "depth-" / "shot-" (the frame number, plus the eye for stereo captures).
+static void shot_depth(IDirect3DDevice9 *d, const char *tag) {
     IDirect3DSurface9 *depth = d3d_scene_depth_target(), *copy = nullptr;
     D3DSURFACE_DESC desc;
     D3DLOCKED_RECT locked;
@@ -513,7 +514,7 @@ static void shot_depth(IDirect3DDevice9 *d) {
     if (SUCCEEDED(hr)) hr = copy->LockRect(&locked, nullptr, D3DLOCK_READONLY);
     if (SUCCEEDED(hr)) {
         char path[1100];
-        snprintf(path, sizeof path, "%s/depth-%05d.f32", g_save_dir, g_frame);
+        snprintf(path, sizeof path, "%s/depth-%s.f32", g_save_dir, tag);
         FILE *out = fopen(path, "wb");
         if (out) {
             uint32_t size[2] = {desc.Width, desc.Height};
@@ -529,6 +530,8 @@ static void shot_depth(IDirect3DDevice9 *d) {
     if (copy) copy->Release();
 }
 
+static void shot_write(IDirect3DDevice9 *d, const char *tag, bool depth);
+
 static void shot_before_present(IDirect3DDevice9 *d) {
     static int frames[16], count = -1;
     if (count < 0) {
@@ -543,7 +546,15 @@ static void shot_before_present(IDirect3DDevice9 *d) {
     int wanted = 0;
     for (int i = 0; i < count; i++) wanted |= frames[i] == g_frame;
     if (!wanted) return;
-    shot_depth(d);
+    char tag[32];
+    snprintf(tag, sizeof tag, "%05d", g_frame);
+    shot_write(d, tag, true);
+}
+
+// The back buffer about to be presented to <save>/shot-<tag>.bmp, and with depth the scene's depth target to
+// <save>/depth-<tag>.f32.
+static void shot_write(IDirect3DDevice9 *d, const char *tag, bool depth) {
+    if (depth) shot_depth(d, tag);
     IDirect3DSurface9 *back = nullptr, *copy = nullptr;
     D3DSURFACE_DESC desc;
     D3DLOCKED_RECT locked;
@@ -555,7 +566,7 @@ static void shot_before_present(IDirect3DDevice9 *d) {
     if (SUCCEEDED(hr)) hr = copy->LockRect(&locked, nullptr, D3DLOCK_READONLY);
     if (SUCCEEDED(hr)) {
         char path[1100];
-        snprintf(path, sizeof path, "%s/shot-%05d.bmp", g_save_dir, g_frame);
+        snprintf(path, sizeof path, "%s/shot-%s.bmp", g_save_dir, tag);
         FILE *out = fopen(path, "wb");
         uint32_t w = desc.Width, h = desc.Height, row = (w * 3 + 3) & ~3u, size = 54 + row * h;
         uint8_t header[54] = {'B', 'M'};
@@ -734,6 +745,137 @@ static void camera_log(void) {
             f[0], f[1], f[2], f[3], f[4], f[5], fov, fov1);
 }
 
+#if defined(__APPLE__)
+/* True two-eye stereo captures (experiment, Mac): render chosen frames from a camera moved sideways, to compare
+ * with the compositor's depth reprojection (tools/stereo_capture.py, tools/stereo_compare.py).
+ *
+ *   LB_STEREO_EYE_UNITS=d   half the eye separation in game units (2.24 = 32 mm at 70 units per metre). Also
+ *                           what turns the shader code on inside DXVK (dxvk_stereo.h), so it must be set at launch.
+ *   LB_STEREO_FRAMES=list   comma-separated items F, A-B or A-B:S (triplets starting at A, A+S, ... up to B; S
+ *                           defaults to 3). Each triplet base F renders frame F from the left eye, F+1 from the
+ *                           right eye and F+2 from the centre, and writes <save>/shot-F-L.bmp, shot-F-R.bmp,
+ *                           shot-F-C.bmp, depth-F-C.f32 and stereo-F-<eye>.txt (the eye shift and camera used).
+ *
+ * The left eye sits at view-space x = -d. Seen from there a point at view x is at x + d, so its clip x grows by
+ * P00*d: it moves right on screen. DXVK applies pos.x -= k, so k = P00 * e with e = -d for the left eye (k < 0,
+ * clip x grows) and e = +d for the right eye. P00 = 2 / (tan_right - tan_left) from the world camera's frustum
+ * tangents (equal to 1 / tan_right for the game's symmetric frustum).
+ *
+ * The shift for frame N+1 is set right after frame N's Present returns, so the whole of frame N+1, from its
+ * first draw, renders from one eye. Without LB_STEREO_EYE_UNITS nothing changes, in DXVK either; with it but no
+ * LB_STEREO_FRAMES, the shaders carry the shift with k = 0. */
+extern "C" void dxvk_stereo_set_clip_shift(float k);  // DXVK (dxvk_stereo.h)
+extern "C" int dxvk_stereo_enabled(void);
+
+struct StereoState {
+    bool init = false, on = false;
+    float d = 0;
+    std::vector<int> bases;
+    float k_applied = 0;        // the shift the frame being presented was drawn with
+    GameCamera cam_applied{};   // the camera k_applied was computed from
+    bool cam_applied_valid = false;
+};
+static StereoState g_stereo;
+
+static void stereo_init(void) {
+    StereoState &st = g_stereo;
+    st.init = true;
+    const char *d = getenv("LB_STEREO_EYE_UNITS"), *f = getenv("LB_STEREO_FRAMES");
+    if (!d || !f || !*f || atof(d) == 0) return;
+    st.d = (float)fabs(atof(d));
+    for (const char *e = f; e && *e;) {
+        int a = 0, b = 0, step = 3, n = 0;
+        if (sscanf(e, "%d-%d:%d%n", &a, &b, &step, &n) == 3 || sscanf(e, "%d-%d%n", &a, &b, &n) == 2) {
+            if (step < 3) step = 3;  // triplets must not overlap
+            for (int x = a; x <= b && st.bases.size() < 256; x += step) st.bases.push_back(x);
+        } else if (sscanf(e, "%d", &a) == 1) {
+            st.bases.push_back(a);
+        }
+        e = strchr(e, ',');
+        if (e) e++;
+    }
+    st.on = !st.bases.empty();
+    LOG("stereo capture: d %.3f units, %zu triplets, DXVK shader shift %s", st.d, st.bases.size(),
+        dxvk_stereo_enabled() ? "on" : "OFF (LB_STEREO_EYE_UNITS must be set at launch)");
+}
+
+// The eye ('L', 'R', 'C') frame renders from in a stereo triplet, with the triplet's base frame; 0 if none.
+static char stereo_eye(int frame, int *base) {
+    for (int b : g_stereo.bases) {
+        if (frame == b) { *base = b; return 'L'; }
+        if (frame == b + 1) { *base = b; return 'R'; }
+        if (frame == b + 2) { *base = b; return 'C'; }
+    }
+    return 0;
+}
+
+static void stereo_write_info(const char *tag, char eye, int base) {
+    char path[1100];
+    snprintf(path, sizeof path, "%s/stereo-%s.txt", g_save_dir, tag);
+    FILE *out = fopen(path, "w");
+    if (!out) return;
+    const StereoState &st = g_stereo;
+    const float *f = st.cam_applied.frustum;
+    const float p00 = st.cam_applied_valid && f[1] != f[0] ? 2.0f / (f[1] - f[0]) : 0.0f;
+    fprintf(out, "frame %d\nbase %d\neye %c\neye_units %.6f\neye_x %.6f\nclip_shift_k %.9g\np00 %.9g\n", g_frame,
+            base, eye, st.d, eye == 'L' ? -st.d : eye == 'R' ? st.d : 0.0f, st.k_applied, p00);
+    fprintf(out, "passes %s\nmenu_open %d\n", getenv("LB_STEREO_PASSES") ? getenv("LB_STEREO_PASSES") : "screen",
+            menu_open() ? 1 : 0);
+    // The camera the shift came from (read at the previous Present) and the camera at this Present.
+    auto put_cam = [&](const char *name, const GameCamera &c, bool valid) {
+        if (!valid) { fprintf(out, "%s none\n", name); return; }
+        fprintf(out, "%s_frustum_lrtb_near_far %.9g %.9g %.9g %.9g %.9g %.9g\n", name, c.frustum[0], c.frustum[1],
+                c.frustum[2], c.frustum[3], c.frustum[4], c.frustum[5]);
+        fprintf(out, "%s_rot", name);
+        for (float v : c.rot) fprintf(out, " %.9g", v);
+        fprintf(out, "\n%s_pos %.9g %.9g %.9g\n", name, c.pos[0], c.pos[1], c.pos[2]);
+    };
+    put_cam("cam_used", st.cam_applied, st.cam_applied_valid);
+    GameCamera now;
+    const bool now_valid = game_camera_read(&now);
+    put_cam("cam_present", now, now_valid);
+    fclose(out);
+}
+
+// Before Present: capture the frame if it belongs to a triplet.
+static void stereo_before_present(IDirect3DDevice9 *d) {
+    if (!g_stereo.init) stereo_init();
+    if (!g_stereo.on) return;
+    int base = 0;
+    const char eye = stereo_eye(g_frame, &base);
+    if (!eye) return;
+    char tag[32];
+    snprintf(tag, sizeof tag, "%05d-%c", base, eye);
+    shot_write(d, tag, eye == 'C');
+    stereo_write_info(tag, eye, base);
+    LOG("stereo capture: frame %d eye %c k %.6g -> shot-%s.bmp", g_frame, eye, g_stereo.k_applied, tag);
+}
+
+// After Present: set the eye for the next frame.
+static void stereo_after_present(void) {
+    StereoState &st = g_stereo;
+    if (!st.on) return;
+    int base = 0;
+    const char eye = stereo_eye(g_frame + 1, &base);
+    float k = 0;
+    GameCamera cam;
+    const bool valid = (eye == 'L' || eye == 'R') && game_camera_read(&cam);
+    if (valid) {
+        const float l = cam.frustum[0], r = cam.frustum[1];
+        if (r > l) k = 2.0f / (r - l) * (eye == 'L' ? -st.d : st.d);
+        st.cam_applied = cam;
+    } else if (eye == 'L' || eye == 'R') {
+        LOG("stereo capture: frame %d eye %c: no world camera, rendering the centre eye", g_frame + 1, eye);
+    }
+    if (eye) st.cam_applied_valid = valid || (eye == 'C' && game_camera_read(&st.cam_applied));
+    dxvk_stereo_set_clip_shift(k);
+    st.k_applied = k;
+}
+#else
+static void stereo_before_present(IDirect3DDevice9 *) {}
+static void stereo_after_present(void) {}
+#endif
+
 void B_IDirect3DDevice9_Present(CPU *c) {
     auto *d = (IDirect3DDevice9 *)com_host(ARG(0));
     if (g_trace_from < 0) {
@@ -749,6 +891,7 @@ void B_IDirect3DDevice9_Present(CPU *c) {
     touch_draw(d);
     { extern void hud_screen_present(IDirect3DDevice9 *); hud_screen_present(d); }
     shot_before_present(d);
+    stereo_before_present(d);
     RECT vr = view_rect();
     const RECT *dst = ARG(2) ? (const RECT *)GPTR(ARG(2)) : (vr.left || vr.top) ? &vr : nullptr;
 #if defined(__APPLE__)
@@ -767,6 +910,7 @@ void B_IDirect3DDevice9_Present(CPU *c) {
     dxvk_present_tap_set_depth(nullptr);
     d3d_scene_depth_reset();
 #endif
+    stereo_after_present();
     pace_present();
     platform_present_hook();
     bisect_present();

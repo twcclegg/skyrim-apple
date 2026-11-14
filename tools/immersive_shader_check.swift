@@ -7,8 +7,10 @@
 // Build and run from the repository root:
 //   swiftc -O tools/immersive_shader_check.swift -o /tmp/immersive_shader_check
 //   /tmp/immersive_shader_check shot-N.bmp depth-N.f32 out_prefix [--head] [--refine 2] [--ipd-scale 1] [--viewer-x 0]
-//       [--scale 0.15] [--head-scale 1] [--tear 0.08] [--time-size 1888x1792]
+//       [--scale 0.15] [--head-scale 1] [--tear 0.08] [--time-size 1888x1792] [--tangent 0.849]
 // Writes out_prefix-sbs.png (left | right, 1280x720 each) and prints the share of pixels the mesh left undrawn.
+// --tangent: the game camera's right frustum tangent (tan of the horizontal half-angle), as camera[] carries it;
+// 0.849 is the default 65-degree 4:3 field of view at 16:9.
 import AppKit
 import Foundation
 import Metal
@@ -103,7 +105,8 @@ let stencil = device.makeDepthStencilState(descriptor: stencilDescription)!
 // The same geometry as the renderer: a 2.8 m screen 3 m away, or (--head) the frame at its own angular size on a
 // plane 2 m from the rays' origin. The camera looks straight at it from each eye.
 let aspect = Float(width) / Float(height)
-let frustum = SIMD2<Float>(0.849, 0.849 / aspect)
+let tangent = number("tangent", 0.849)
+let frustum = SIMD2<Float>(tangent, tangent / aspect)
 let eyeBack: Float = head ? 2.0 : 3.0
 let halfSize = head ? eyeBack * frustum : SIMD2<Float>(1.4, 1.4 / aspect)
 let cameraTangents = head ? frustum : tan(35 * Float.pi / 180) * SIMD2<Float>(1, 1 / aspect)
