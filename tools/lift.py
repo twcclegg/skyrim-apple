@@ -279,6 +279,13 @@ HOST_OVERRIDES_MARVEL = {
 HOST_OVERRIDES_SKYRIM = {
     "exe": {0x472580},  # plane/sphere side test, hot in culling -> runtime/skyrim_native.c
 }
+# More native replacements, one file per group: tools/native_overrides/<group>.txt lists hex addresses (one per line,
+# '#' comments) whose natives live in runtime/skyrim_native_<group>.c.
+_NATIVE_LISTS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "native_overrides")
+for _name in sorted(os.listdir(_NATIVE_LISTS)) if os.path.isdir(_NATIVE_LISTS) else ():
+    if _name.endswith(".txt"):
+        with open(os.path.join(_NATIVE_LISTS, _name)) as _f:
+            HOST_OVERRIDES_SKYRIM["exe"] |= {int(_l.split("#")[0], 16) for _l in _f if _l.split("#")[0].strip()}
 # LIFT_GAME=marvel|skyrim selects the overrides (runtime built with -DGAME_MARVEL / -DGAME_SKYRIM).
 HOST_OVERRIDES = {"marvel": HOST_OVERRIDES_MARVEL, "skyrim": HOST_OVERRIDES_SKYRIM}.get(
     os.environ.get("LIFT_GAME"), HOST_OVERRIDES_BATMAN)
