@@ -1,0 +1,3 @@
+4EC9C0  # NiTransform composition out = A * B -> runtime/skyrim_native_g1.c
+CDA170  # camera/shader transform setup (4x4 matrix and two M^T * v) -> runtime/skyrim_native_g1.c
+CDA260  # skinning palette (per-bone transform composition) -> runtime/skyrim_native_g1.c
