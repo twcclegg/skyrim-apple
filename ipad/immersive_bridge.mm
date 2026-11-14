@@ -34,6 +34,7 @@ typedef struct skyrim_immersive_frame {
     int has_camera;
 } skyrim_immersive_frame;
 int skyrim_frame_camera(float out[18]);  /* runtime/d3d9_bridge.cpp */
+int skyrim_frame_eye(float *k_out);  /* runtime/d3d9_bridge.cpp: -1 left, 0 none/centre, +1 right; k_out: clip shift */
 }
 
 namespace {
