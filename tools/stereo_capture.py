@@ -8,7 +8,13 @@ For each location in the config (one game launch each, from the main menu with t
 runtime gets LB_STEREO_EYE_UNITS and LB_STEREO_FRAMES (runtime/d3d9_bridge.cpp): every triplet base F renders
 frame F from the left eye, F+1 from the right eye and F+2 from the centre, and writes shot-F-L.bmp,
 shot-F-R.bmp, shot-F-C.bmp, depth-F-C.f32 and stereo-F-<eye>.txt into the save folder. The eye shift itself is
-done inside DXVK's vertex shaders (third_party/dxvk include/native/dxvk_stereo.h). The scripted input (LB_KEYS)
+done inside DXVK's vertex shaders (third_party/dxvk include/native/dxvk_stereo.h).
+
+--hybrid (or "hybrid": true in a location or the config) sets LB_STEREO_HYBRID=1: each base F is a group of six
+frames of one held game moment, L R C (full true stereo), FL FR (the eye offset on first-person draws only) and W
+(the centre without first-person draws), with depth for C, FL, FR and W, for tools/stereo_compare.py --hybrid.
+Bases must then be at least 6 frames apart. --first-person sets LB_STEREO_PASSES=firstperson (plain triplets whose
+L and R shift only the first-person draws). The scripted input (LB_KEYS)
 comes from each location's timeline: console commands typed as tools/bench/bench.py types them, and held keys.
 
 Results: OUT_DIR/<location>/ holds the captures, game.log and env.json, and OUT_DIR/manifest.json lists the
@@ -59,15 +65,24 @@ def key_script(location):
     return ",".join(entries)
 
 
-def check_timeline(location):
-    """Steps must not overlap the triplets or each other's console typing, and must end before the exit."""
-    last = max(location["triplets"]) + 2
+TRIPLET = ["L", "R", "C"]
+HYBRID = ["L", "R", "C", "FL", "FR", "W"]  # runtime/d3d9_bridge.cpp k_hybrid
+DEPTH = {"C", "FL", "FR", "W"}
+
+
+def slots_for(env):
+    return HYBRID if env.get("LB_STEREO_HYBRID", "0") not in ("", "0") else TRIPLET
+
+
+def check_timeline(location, group):
+    """Steps must not overlap the groups or each other's console typing, and must end before the exit."""
+    last = max(location["triplets"]) + group - 1
     if last >= location["exit_frame"]:
         fail(f"{location['name']}: exit_frame {location['exit_frame']} comes before the last capture ({last})")
     bases = sorted(location["triplets"])
     for a, b in zip(bases, bases[1:]):
-        if b - a < 3:
-            fail(f"{location['name']}: triplets {a} and {b} overlap (each takes 3 frames)")
+        if b - a < group:
+            fail(f"{location['name']}: groups {a} and {b} overlap (each takes {group} frames)")
 
 
 def seed_saves(saves):
@@ -82,11 +97,11 @@ def seed_saves(saves):
             print(f"stereo_capture: seeded {target / name} from the bench's save folder")
 
 
-def collect(saves, out, triplets):
+def collect(saves, out, triplets, slots):
     """Moves this run's stereo files from the save folder into out."""
     moved = []
     for base in triplets:
-        for eye in "LRC":
+        for eye in slots:
             tag = f"{base:05d}-{eye}"
             for name in (f"shot-{tag}.bmp", f"stereo-{tag}.txt", f"depth-{tag}.f32"):
                 path = saves / name
@@ -106,6 +121,8 @@ def main(argv=None):
     ap.add_argument("--eye-units", type=float, help="half the eye separation in game units (default: the config's)")
     ap.add_argument("--saves", default=str(REPO / "bench-results/stereo-saves"), help="the game's save folder")
     ap.add_argument("--env", action="append", default=[], metavar="KEY=VALUE", help="extra launch environment")
+    ap.add_argument("--hybrid", action="store_true", help="six-frame hybrid groups (LB_STEREO_HYBRID=1)")
+    ap.add_argument("--first-person", action="store_true", help="LB_STEREO_PASSES=firstperson triplets")
     ap.add_argument("--timeout", type=float, help="seconds before a launch is stopped (default: exit_frame / 20 + 240)")
     args = ap.parse_args(argv)
 
@@ -117,8 +134,19 @@ def main(argv=None):
     locations = [l for l in config["locations"] if not args.only or l["name"] in args.only]
     if not locations:
         fail("no locations selected")
+    def location_env(location):
+        env = dict(config.get("env", {}), **location.get("env", {}))
+        if args.hybrid or location.get("hybrid", config.get("hybrid", False)):
+            env["LB_STEREO_HYBRID"] = "1"
+        if args.first_person:
+            env["LB_STEREO_PASSES"] = "firstperson"
+        for item in args.env:
+            key, _, value = item.partition("=")
+            env[key] = value
+        return env
+
     for location in locations:
-        check_timeline(location)
+        check_timeline(location, len(slots_for(location_env(location))))
 
     target = bench.Mac(args.mac, args.game)
     target.preflight()
@@ -144,18 +172,15 @@ def main(argv=None):
         out = out_root / name
         out.mkdir(parents=True, exist_ok=True)
         triplets = sorted(location["triplets"])
+        slots = slots_for(location_env(location))
         for base in triplets:  # leftovers of an earlier run with the same frames would be mistaken for this one
-            for eye in "LRC":
+            for eye in slots:
                 for stem in ("shot", "stereo", "depth"):
                     for path in saves.glob(f"{stem}-{base:05d}-{eye}.*"):
                         path.unlink()
         env = {"LB_LOG": "1", "LB_EXIT_FRAME": str(location["exit_frame"]), "LB_KEYS": key_script(location),
                "LB_STEREO_EYE_UNITS": f"{eye_units:g}", "LB_STEREO_FRAMES": ",".join(str(b) for b in triplets)}
-        env.update(config.get("env", {}))
-        env.update(location.get("env", {}))
-        for item in args.env:
-            key, _, value = item.partition("=")
-            env[key] = value
+        env.update(location_env(location))
         logs_before = set(target.list_files(""))
         timeout = args.timeout or location["exit_frame"] / 20 + 240
         print(f"stereo_capture: {name}: running to frame {location['exit_frame']} (timeout {timeout:.0f} s), "
@@ -165,15 +190,16 @@ def main(argv=None):
         if logs:
             target.pull(logs[-1], out / "game.log")
         (out / "env.json").write_text(json.dumps(env, indent=2, sort_keys=True))
-        moved = collect(saves, out, triplets)
+        moved = collect(saves, out, triplets, slots)
         complete = [b for b in triplets
-                    if all((out / f"shot-{b:05d}-{e}.bmp").exists() for e in "LRC") and (out / f"depth-{b:05d}-C.f32").exists()]
+                    if all((out / f"shot-{b:05d}-{e}.bmp").exists() for e in slots)
+                    and all((out / f"depth-{b:05d}-{e}.f32").exists() for e in slots if e in DEPTH)]
         print(f"stereo_capture: {name}: {len(moved)} files, complete triplets {complete} -> {out}")
         if len(complete) < len(triplets):
             print(f"stereo_capture: WARNING {name}: missing captures; see {out / 'game.log'} ({console.strip()})",
                   file=sys.stderr)
         manifest["locations"][name] = {"dir": name, "triplets": complete, "crops": location.get("crops", {}),
-                                       "description": location.get("description", "")}
+                                       "description": location.get("description", ""), "slots": slots}
         manifest_path.write_text(json.dumps(manifest, indent=2))
     print(f"stereo_capture: manifest {manifest_path}")
 

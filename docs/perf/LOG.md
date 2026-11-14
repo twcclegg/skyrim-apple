@@ -335,3 +335,55 @@ ranges) in three states: empty hands (`riverwood-walk-mac`), and an iron sword w
   `LB_STEREO_EYE_UNITS=2.24` alone; the 203 runs have an overcast, cloudy sky in their screenshots, the 146 runs
   (including the alternate-eye one) a clear one. Which draws they are is not pinned down: the cloudy run's 180-draw
   effects run is mostly one alpha-blended shader without depth writes (142 draws); no clear-sky trace was taken.
+
+## 2026-11-14 — first-person-only stereo and the offline hybrid (M5, 1280×720; twcclegg/skyrim-apple#23 chunk 1.2)
+
+What a hybrid would look like (true per-eye hands, weapon and spell effect over the reprojected world), built
+offline before any compositor work.
+
+- **`LB_STEREO_PASSES=firstperson`:** in stereo triplets the eye offset is on only while the first-person flag
+  is (every kind: mask, prepass, late colour, the fire's target, depth), zero for the rest of the frame. The
+  bridge switches it as the flag changes; DXVK reads the value per draw. DXVK sees the same variable but treats
+  anything other than `size` or `all` with its default rule, so there is no clash. The mask is shifted too: it is
+  sampled at the hands' screen position when the late pass lights them. Riverwood: L and C differ in 10 pixels
+  of a 250-pixel-wide strip with no first person in it, against about 179,000 overall.
+- **`LB_STEREO_HYBRID=1`** (`tools/stereo_capture.py --hybrid`): six frames per base, all at one game moment
+  (the clock is held at 1 µs per frame, as `LB_VR180` does): full-stereo L, R and C, first-person-only FL and FR,
+  and W (the centre with every first-person draw skipped), with depth for C, FL, FR and W. The hold works:
+  |W − C| outside the hands is 0.11 (Riverwood) and 0.04 (Whiterun) on a 0–255 scale. |FL − L| inside the hands
+  is 0.05–0.19, so the first-person-only shift draws the same hands as full stereo.
+- **The layer** (`tools/stereo_hybrid.swift`): opaque wherever FL's R32F depth differs from W's (the late
+  pass's depth draws), otherwise max(0, FL − W) as additive (the flame and its heat haze). The hybrid is the layer
+  over the immersive shaders' reprojection of W; (c2) puts it over the reprojection of C, with the centre's hands
+  left in.
+- **Numbers** (`tools/stereo_compare.py --hybrid`, mean |x − true| per eye, 0–255; disparity x_L − x_R in pixels;
+  3 groups each, which agree to within a few tenths):
+
+  | | reprojection (b) | hybrid (c) | hybrid over C (c2) |
+  |---|---|---|---|
+  | Riverwood, spell hand and flame crop, L / R | 17.4–17.7 / 15.7–16.3 | 4.6–4.8 / 3.2–3.3 | 7.4–7.5 / 7.4–7.9 |
+  | Riverwood, sword crop | 7.5–7.7 / 8.5–8.6 | 0.53 / 1.9 | 2.6 / 4.3 |
+  | Whiterun, sword crop | 5.7 / 6.2 | 0.94 / 1.9 | 2.3 / 3.7 |
+
+  | disparity, px | true (a) | reprojection (b) | hybrid (c) |
+  |---|---|---|---|
+  | flame, centroid of the additive layer | 84–86 | 11–12 | = (a) |
+  | flame, block matching on the pictures | 89–95 | 9.4 | 89–94 |
+  | spell hand (Riverwood) | 98 | 32 | = (a) |
+  | sword (Riverwood / Whiterun) | 101 / 97 | 33 / 32 | = (a) |
+
+- **Reprojection places the first-person meshes 3× too far.** The R32F target stores 1 − near / z, and the
+  compositor decodes it with the world's near plane (15), but the hands' depth was written through the
+  first-person projection (near 5), so z comes out 3× too large: 98 px becomes 32 (hand at about 0.5 m shown at
+  about 1.5 m). The flame writes no depth at all and gets the disparity of the ground behind it (about 10 px).
+- **What it looks like.** (b): the flame and hand sit almost flat on the ground behind them, the sword's
+  texture is stretched sideways along its edges, and the hand's edge drags the ground with it. (c): hands,
+  sword and flame are indistinguishable from (a). What is left is the reprojected world's own error (foliage
+  edges, disocclusions at the frame edge) plus a faint seam around the flame where the heat haze moves world
+  pixels. Additive differencing under-adds glow over bright pixels. (c2): a second, ghost copy of the sword and
+  hand beside the true one, so the mono hands must be kept out of the world image.
+- **What the offline hybrid gets for free that a compositor would not:** the layer is cut from tone-mapped
+  frames of one exposure, so tone mapping, eye adaptation and bloom match. Shadows on the hands come from the
+  game's own sun-shadow mask. The flame's light on the world is in W (it is a light, not a first-person draw).
+  The real layer (chunk 1.3) is drawn before tone mapping into its own target and has none of this unless the post
+  chain runs for it. Its alpha also has to come from the pass itself, not from a depth difference.

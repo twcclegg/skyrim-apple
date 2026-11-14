@@ -13,6 +13,14 @@ For each triplet (shot-F-L.bmp, shot-F-R.bmp, shot-F-C.bmp + depth-F-C.f32 and s
        true stereo L | R | centre,  reprojected L | R,  anaglyphs (true | reprojected),  |true - reprojected| x4
      and one crop-<name>.png per crop (hands and sword, water, fire, foliage...: the crops in the capture's
      manifest or --crop), at full resolution with sharp pixels.
+With --hybrid (captures made with tools/stereo_capture.py --hybrid: six frames of one held game moment per base F,
+L R C full true stereo, FL FR the eye offset on first-person draws only, W the centre without first-person draws):
+  3. the reprojection runs on C and on W, and tools/stereo_hybrid.swift composites the first-person layer of each
+     eye (from FL against W) over the reprojected W, and also over the reprojected C;
+  4. OUT_DIR/<location>/<F>/hybrid.png and hybrid-crop-<name>.png show, per eye, (a) full true stereo, (b) the
+     depth reprojection of C, (c) the hybrid, (c2) the hybrid over the reprojection of C (centre hands left in),
+     the layer itself and |(b) - (a)|, |(c) - (a)|; metrics.json holds per-crop mean differences against (a) and the
+     flame's and hand's disparity in each method (tools/stereo_hybrid.swift says how they are measured).
 Swift tools are built into OUT_DIR/bin once (swiftc -O). Nothing is written inside the repository. The left and
 right frames are rendered one and two frames before the centre frame, so anything still moving at sgtm 0.02
 (water, flames, foliage in the wind) may differ slightly between them for that reason alone.
@@ -73,6 +81,133 @@ def sheet(compose, out_png, title, rows, cell, nearest, work):
     spec_path = work / (out_png.stem + ".json")
     spec_path.write_text(json.dumps(spec, indent=1))
     subprocess.run([str(compose), str(spec_path)], check=True)
+
+
+def camera_params(shots, tag, units_per_metre):
+    info_l, info_c = read_info(shots / f"stereo-{tag}-L.txt"), read_info(shots / f"stereo-{tag}-C.txt")
+    try:
+        eye_units = float(info_l["eye_units"][0])
+    except (KeyError, IndexError, ValueError):
+        fail(f"{shots / f'stereo-{tag}-L.txt'} gives no eye_units")
+    frustum = info_l.get("cam_used_frustum_lrtb_near_far") or info_c.get("cam_used_frustum_lrtb_near_far")
+    tangent = float(frustum[1]) if frustum else 0.849
+    near = float(frustum[4]) if frustum else None
+    return eye_units, tangent, near, eye_units / (REPROJ_EYE_M * units_per_metre)
+
+
+def reproject(check, centre, depth, prefix, ipd_scale, tangent, units_per_metre, args):
+    """immersive_shader_check on one centre frame; returns its side-by-side PNG and its report line."""
+    command = [str(check), str(centre), str(depth), str(prefix), "--head", "--refine", f"{args.refine:g}",
+               "--ipd-scale", f"{ipd_scale:.6f}", "--tangent", f"{tangent:.6f}", "--time-size", "64x64",
+               "--units", f"{units_per_metre:g}", "--source", str(REPO / "apple/Sources/App/ImmersiveScreen.swift")]
+    if args.near is not None:
+        command += ["--near", f"{args.near:g}"]
+    print("stereo_compare: " + " ".join(command))
+    done = subprocess.run(command, cwd=REPO, capture_output=True, text=True)
+    if done.returncode:
+        fail(f"immersive_shader_check failed:\n{done.stdout}{done.stderr}")
+    return Path(str(prefix) + "-sbs.png"), done.stdout.strip()
+
+
+def crop_cell(crop, width, height, cell_w=640):
+    aspect = (crop[3] * height) / max(1e-6, crop[2] * width)
+    return [cell_w, max(64, int(round(cell_w * aspect)))]
+
+
+def compare_hybrid(shots, base, crops, out, args, units_per_metre, bin_dir):
+    """(a) full true stereo, (b) reprojection of C, (c) reprojected W + the true first-person layer."""
+    tag = f"{base:05d}"
+    names = {s: shots / f"shot-{tag}-{s}.bmp" for s in ("L", "R", "C", "FL", "FR", "W")}
+    depths = {s: shots / f"depth-{tag}-{s}.f32" for s in ("C", "FL", "FR", "W")}
+    for path in list(names.values()) + list(depths.values()):
+        if not path.exists():
+            print(f"stereo_compare: skipping {tag}: no {path}", file=sys.stderr)
+            return
+    for slot in ("L", "FL", "W"):
+        info = read_info(shots / f"stereo-{tag}-{slot}.txt")
+        if info.get("clock_held", ["0"])[0] != "1":
+            print(f"stereo_compare: WARNING {tag}: {slot} was not drawn with the game clock held", file=sys.stderr)
+        if info.get("menu_open", ["0"])[0] != "0":
+            print(f"stereo_compare: WARNING {tag}: a menu was open at {slot}", file=sys.stderr)
+    eye_units, tangent, near, ipd_scale = camera_params(shots, tag, units_per_metre)
+    out.mkdir(parents=True, exist_ok=True)
+    work = out / "work"
+    work.mkdir(exist_ok=True)
+    check, compose = tool("immersive_shader_check", bin_dir), tool("stereo_compose", bin_dir)
+    hybrid = tool("stereo_hybrid", bin_dir)
+    sbs_c, report_c = reproject(check, names["C"], depths["C"], out / "reproj", ipd_scale, tangent, units_per_metre,
+                                args)
+    sbs_w, report_w = reproject(check, names["W"], depths["W"], out / "reproj-world", ipd_scale, tangent,
+                                units_per_metre, args)
+    spec = {k: str(v) for k, v in names.items()}
+    spec.update({f"depth_{k}": str(v) for k, v in depths.items()})
+    spec.update({"reproj_C": str(sbs_c), "reproj_W": str(sbs_w), "out": str(out), "crops": crops,
+                 "noise": args.noise})
+    spec_path = work / "hybrid.json"
+
+    def run_hybrid():
+        spec_path.write_text(json.dumps(spec, indent=1))
+        done = subprocess.run([str(hybrid), str(spec_path)], capture_output=True, text=True)
+        if done.returncode:
+            fail(f"stereo_hybrid failed:\n{done.stdout}{done.stderr}")
+
+    run_hybrid()  # phase 1: the centre's layer as a key picture, reprojected like C to find (b)'s hands and flame
+    sbs_key, _ = reproject(check, out / "layer-key-C.png", depths["C"], out / "reproj-layer-key", ipd_scale, tangent,
+                           units_per_metre, args)
+    spec["reproj_layer_C"] = str(sbs_key)
+    run_hybrid()
+    metrics = json.loads((out / "metrics.json").read_text())
+    halves = {"L": [0.0, 0.0, 0.5, 1.0], "R": [0.5, 0.0, 0.5, 1.0]}
+    one = [0, 0, 1, 1]
+
+    def rows_for(crop):
+        a = {e: full(names[e], within(one, crop)) for e in "LR"}
+        b = {e: full(sbs_c, within(halves[e], crop)) for e in "LR"}
+        c = {e: full(out / f"hybrid-{e}.png", within(one, crop)) for e in "LR"}
+        c2 = {e: full(out / f"hybridc-{e}.png", within(one, crop)) for e in "LR"}
+        lay = {e: full(out / f"layer-{e}.png", within(one, crop)) for e in "LR"}
+        return [
+            {"label": f"(a) full true stereo: the whole frame rendered from each eye (d = {eye_units:g} units)",
+             "cells": [{"label": "(a) true L", "source": a["L"]}, {"label": "(a) true R", "source": a["R"]}]},
+            {"label": "(b) depth reprojection of the centre frame (immersive shaders; magenta = holes)",
+             "cells": [{"label": "(b) reprojected L", "source": b["L"]},
+                       {"label": "(b) reprojected R", "source": b["R"]}]},
+            {"label": "(c) hybrid: reprojected world without first person + first-person layer rendered per eye",
+             "cells": [{"label": "(c) hybrid L", "source": c["L"]}, {"label": "(c) hybrid R", "source": c["R"]}]},
+            {"label": "(c2) the same layer over the reprojection of C (centre hands and flame not removed)",
+             "cells": [{"label": "(c2) L", "source": c2["L"]}, {"label": "(c2) R", "source": c2["R"]}]},
+            {"label": "first-person layer per eye (opaque from FL, additive = FL - W, x2)",
+             "cells": [{"label": "layer L", "source": lay["L"]}, {"label": "layer R", "source": lay["R"]}]},
+            {"label": "|(b) - (a)| x4",
+             "cells": [{"label": "L", "source": {"diff": [b["L"], a["L"]], "gain": 4}},
+                       {"label": "R", "source": {"diff": [b["R"], a["R"]], "gain": 4}}]},
+            {"label": "|(c) - (a)| x4",
+             "cells": [{"label": "L", "source": {"diff": [c["L"], a["L"]], "gain": 4}},
+                       {"label": "R", "source": {"diff": [c["R"], a["R"]], "gain": 4}}]},
+        ]
+
+    def numbers(name):
+        m = metrics["crops"].get(name)
+        if not m:
+            return ""
+        mad, disp = m["mad_vs_true"], m["disparity_px"]
+        text = (f" |x-a| L/R: b {mad['L']['reprojection']:.1f}/{mad['R']['reprojection']:.1f}, "
+                f"c {mad['L']['hybrid']:.1f}/{mad['R']['hybrid']:.1f}. disparity px a/b/c:")
+        for key in ("opaque", "flame"):
+            if key in disp:
+                d = disp[key]
+                text += f" {key} {d['true']:.0f}/{d['reprojection']:.0f}/{d['hybrid']:.0f}"
+        return text
+
+    title = f"{shots.name} group {base}: tangent {tangent:.3f}, ipd-scale {ipd_scale:.3f}"
+    sheet(compose, out / "hybrid.png", title, rows_for(None), [960, 540], False, work)
+    width, height = bmp_size(names["C"])
+    for name, crop in crops.items():
+        sheet(compose, out / f"hybrid-crop-{name}.png", f"{shots.name} {base} {name}.{numbers(name)}",
+              rows_for(crop), crop_cell(crop, width, height), True, work)
+    print(json.dumps(metrics, indent=1))
+    print(f"stereo_compare: reprojection of C: {report_c}\nstereo_compare: reprojection of W: {report_w}")
+    print(f"stereo_compare: {out}")
 
 
 def compare_triplet(shots, base, crops, out, args, units_per_metre, bin_dir):
@@ -174,6 +309,8 @@ def main(argv=None):
     ap.add_argument("--units-per-metre", type=float, help="game units per metre (default: manifest's, else 70)")
     ap.add_argument("--refine", type=float, default=2, help="immersive_shader_check --refine")
     ap.add_argument("--near", type=float, help="immersive_shader_check --near (default: the compositor's)")
+    ap.add_argument("--hybrid", action="store_true", help="hybrid groups (stereo_capture.py --hybrid captures)")
+    ap.add_argument("--noise", type=float, default=6, help="--hybrid: colour difference counted as no layer")
     args = ap.parse_args(argv)
 
     out_root = Path(args.out).resolve()
@@ -188,7 +325,7 @@ def main(argv=None):
         shots = Path(args.shots).resolve()
         units = args.units_per_metre or 70
         for base in args.base:
-            compare_triplet(shots, base, extra, out_root / shots.name / f"{base:05d}", args, units, bin_dir)
+            (compare_hybrid if args.hybrid else compare_triplet)(shots, base, extra, out_root / shots.name / f"{base:05d}", args, units, bin_dir)
         return
     if not args.captures:
         fail("give a capture folder or --shots")
@@ -201,8 +338,9 @@ def main(argv=None):
         crops = dict(location.get("crops", {}), **extra)
         if not location["triplets"]:
             print(f"stereo_compare: {name}: no complete triplets", file=sys.stderr)
+        hybrid = args.hybrid or "FL" in location.get("slots", [])
         for base in location["triplets"]:
-            compare_triplet(captures / location["dir"], base, crops, out_root / name / f"{base:05d}", args, units,
+            (compare_hybrid if hybrid else compare_triplet)(captures / location["dir"], base, crops, out_root / name / f"{base:05d}", args, units,
                             bin_dir)
 
 
