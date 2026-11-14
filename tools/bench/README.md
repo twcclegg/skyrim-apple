@@ -38,6 +38,17 @@ depth-stencil is bound, depth-only clears, quads); the rules and which of them a
 first frame without it), one `passdbg <frame> <class> <w>x<h> fmt=<n> ds=<0|1> draws=<n> prims=<n>` line per run
 of draws of one class into one target, to check the rules against a real frame.
 
+`--env LB_PASSES_GPU=1` (with `LB_PASSES`) adds GPU milliseconds per class, from Direct3D 9 timestamp queries
+issued by the bridge at every change of target or class and at Present, read back without flushing a few frames
+later. Each frame gets one more line once its timestamps are in:
+
+    passgpu <frame> shadow=<ms> refl=… … other=<ms> total=<ms> marks=<timestamps> zero=<spans that read 0>
+
+`bench.py` merges it into the frame's `pass` line as the third number (`gpu_ms_mean`) and keeps `total`, `marks`
+and `zero` as `gpu.total`, `gpu.marks` and `gpu.zero`. GPU idle inside a frame counts towards the span it falls
+in; the Present blit after the last timestamp does not count. `LB_PASSES_GPU=2` also logs every span of one frame
+in 300 (`passgpudbg <frame> <span> <class> <ms>`).
+
 ## GPU busy time and per-pass-class counts
 
 Both are optional; a log without them parses as before.
