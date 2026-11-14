@@ -1,6 +1,8 @@
 // Guest<->host Direct3D 9 bridge: COM object registry and the methods
 // that need hand-written marshalling (structures with pointers, locks,
 // presentation). Everything else is generated into d3d9_bridge_gen.cpp.
+#include <unistd.h>
+#include <dirent.h>
 #include <SDL2/SDL.h>
 #ifdef __APPLE__
 #include <TargetConditionals.h>
@@ -871,9 +873,155 @@ static void stereo_after_present(void) {
     dxvk_stereo_set_clip_shift(k);
     st.k_applied = k;
 }
+/* LB_VR180=start:count[:tan] (offline capture, Mac): a stereo 180-degree video, rendered by the game itself.
+ *
+ * From frame `start`, every block of 16 frames is one video frame (count blocks). Frame 0 of a block advances the
+ * game clock by 1/24 s; frames 1..15 render the same moment from rig L, R, C (eyes at x = -e, +e, 0 along the
+ * camera's right axis, e = LB_VR180_EYE units, default 2.24 = 32 mm) and faces 0..4 (front, left, right, up, down;
+ * square frustum +-tan, default 1.1). Each face frame writes <save>/shot-B-RK.bmp, stereo-B-RK.txt and, for rig C,
+ * depth-B-CK.f32 (B = the block's first frame). tools: scratchpad vr180/stitch, vr180/reproject.
+ *
+ * How: the game recomputes the world camera's rotation and position during its update every frame, then culls and
+ * renders. The override is written at BeginScene, after the update and before culling, so the game culls and
+ * renders the turned view natively (shadows, LOD, effects), and the first-person arms stay where they are in the
+ * world. The game clock (rt_game_ns, kernel32.c) is scripted from `start` on: it moves 1 us per frame within a
+ * block, so animation, effects and eye adaptation hold still across the 15 renders.
+ *
+ * LB_VR180_PENDING=n (default 30): before a block starts, wait while more than n shot-*.bmp files are in the save
+ * folder, so a stitcher deleting its inputs keeps disk use bounded. */
+extern "C" volatile int g_fake_clock_on;
+extern "C" volatile uint64_t g_fake_clock_ns;
+extern "C" uint64_t rt_game_ns(void);
+struct Vr180 {
+    bool init = false, on = false;
+    int start = 0, count = 0, pending = 30;
+    float tan = 1.1f, e = 2.24f;
+    uint64_t t0 = 0;
+    float frustum0[6];
+    bool have_frustum0 = false;
+    int rig_frame = -1;
+    GameCamera rig{};
+    bool rig_valid = false;
+};
+static Vr180 g_vr;
+static void vr180_init(void) {
+    g_vr.init = true;
+    const char *e = getenv("LB_VR180");
+    if (!e || sscanf(e, "%d:%d:%f", &g_vr.start, &g_vr.count, &g_vr.tan) < 2 || g_vr.count <= 0) return;
+    if (const char *x = getenv("LB_VR180_EYE")) g_vr.e = (float)atof(x);
+    if (const char *x = getenv("LB_VR180_PENDING")) g_vr.pending = atoi(x);
+    g_vr.on = true;
+    LOG("vr180: %d blocks from frame %d, tan %.3f, eye %.3f units", g_vr.count, g_vr.start, g_vr.tan, g_vr.e);
+}
+// Frame f's place: -1 outside, else block index; *slot = 0 (clock frame) or 1..15 (rig*5 + face + 1).
+static int vr180_slot(int f, int *slot) {
+    if (!g_vr.on || f < g_vr.start || f >= g_vr.start + 16 * g_vr.count) return -1;
+    *slot = (f - g_vr.start) % 16;
+    return (f - g_vr.start) / 16;
+}
+static const char kRig[3] = {'L', 'R', 'C'};
+// The face basis in rig coordinates (x right, y up, z forward): forward, up, right.
+static const float kFace[5][3][3] = {
+    {{0, 0, 1}, {0, 1, 0}, {1, 0, 0}},    // front
+    {{-1, 0, 0}, {0, 1, 0}, {0, 0, 1}},   // left
+    {{1, 0, 0}, {0, 1, 0}, {0, 0, -1}},   // right
+    {{0, 1, 0}, {0, 0, -1}, {1, 0, 0}},   // up
+    {{0, -1, 0}, {0, 0, 1}, {1, 0, 0}},   // down
+};
+// At BeginScene of the frame being rendered (g_frame + 1): turn the camera for a face frame.
+extern "C++" void vr180_scene_hook(void) {
+    if (!g_vr.init) vr180_init();
+    if (!g_vr.on) return;
+    const int f = g_frame + 1;
+    int slot = 0;
+    const int block = vr180_slot(f, &slot);
+    uint32_t root = M32(0x1B2E8BC), w = root >= 0x10000 ? M32(root + 0xB8) : 0;
+    if (w < 0x10000) return;
+    if (!g_vr.have_frustum0) { memcpy(g_vr.frustum0, MEM + w + 0xE8, sizeof g_vr.frustum0); g_vr.have_frustum0 = true; }
+    if (block < 0 || slot == 0) {
+        memcpy(MEM + w + 0xE8, g_vr.frustum0, 4 * 4);  // l r t b back to the game's
+        return;
+    }
+    if (g_vr.rig_frame != f) {  // the game's own camera of this frame, before any override (BeginScene may repeat)
+        g_vr.rig_valid = game_camera_read(&g_vr.rig);
+        g_vr.rig_frame = f;
+    }
+    if (!g_vr.rig_valid) return;
+    const int rig = (slot - 1) / 5, face = (slot - 1) % 5;
+    // Gamebryo camera: world rotation columns are forward, up, right (world coordinates).
+    const float *R = g_vr.rig.rot;
+    const float F[3] = {R[0], R[3], R[6]}, U[3] = {R[1], R[4], R[7]}, X[3] = {R[2], R[5], R[8]};
+    auto world = [&](const float v[3], float out[3]) {
+        for (int i = 0; i < 3; i++) out[i] = v[0] * X[i] + v[1] * U[i] + v[2] * F[i];
+    };
+    float fw[3], up[3], rt[3];
+    world(kFace[face][0], fw); world(kFace[face][1], up); world(kFace[face][2], rt);
+    const float rot[9] = {fw[0], up[0], rt[0], fw[1], up[1], rt[1], fw[2], up[2], rt[2]};
+    const float ex = rig == 0 ? -g_vr.e : rig == 1 ? g_vr.e : 0.0f;
+    const float pos[3] = {g_vr.rig.pos[0] + ex * X[0], g_vr.rig.pos[1] + ex * X[1], g_vr.rig.pos[2] + ex * X[2]};
+    const float fr[4] = {-g_vr.tan, g_vr.tan, g_vr.tan, -g_vr.tan};
+    memcpy(MEM + w + 0x54, rot, sizeof rot);
+    memcpy(MEM + w + 0x78, pos, sizeof pos);
+    memcpy(MEM + w + 0xE8, fr, sizeof fr);
+    (void)block;
+}
+// Before Present: write the face frame's files.
+static void vr180_before_present(IDirect3DDevice9 *d) {
+    int slot = 0;
+    const int block = vr180_slot(g_frame, &slot);
+    if (block < 0 || slot == 0) return;
+    const int rig = (slot - 1) / 5, face = (slot - 1) % 5, base = g_vr.start + 16 * block;
+    char tag[32];
+    snprintf(tag, sizeof tag, "%05d-%c%d", base, kRig[rig], face);
+    shot_write(d, tag, rig == 2);
+    char path[1100];
+    snprintf(path, sizeof path, "%s/stereo-%s.txt", g_save_dir, tag);
+    if (FILE *out = fopen(path, "w")) {
+        IDirect3DSurface9 *back = nullptr;
+        D3DSURFACE_DESC desc{};
+        if (SUCCEEDED(d->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &back))) { back->GetDesc(&desc); back->Release(); }
+        const float *R = g_vr.rig.rot, *P = g_vr.rig.pos;
+        fprintf(out, "frame %d\nblock %d\nbase %d\nrig %c\nface %d\ntan %.9g\nnear %.9g\nfar %.9g\neye_x %.9g\n"
+                "width %u\nheight %u\nunits_per_metre 70\n", g_frame, block, base, kRig[rig], face, g_vr.tan,
+                g_vr.rig.frustum[4], g_vr.rig.frustum[5], rig == 0 ? -g_vr.e : rig == 1 ? g_vr.e : 0.0f,
+                desc.Width, desc.Height);
+        fprintf(out, "rig_rot %.9g %.9g %.9g %.9g %.9g %.9g %.9g %.9g %.9g\nrig_pos %.9g %.9g %.9g\n", R[0], R[1],
+                R[2], R[3], R[4], R[5], R[6], R[7], R[8], P[0], P[1], P[2]);
+        fclose(out);
+    }
+}
+static int vr180_pending_shots(void) {
+    int n = 0;
+    if (DIR *dir = opendir(g_save_dir)) {
+        while (struct dirent *ent = readdir(dir))
+            if (!strncmp(ent->d_name, "shot-", 5) && strstr(ent->d_name, ".bmp")) n++;
+        closedir(dir);
+    }
+    return n;
+}
+// After Present: the clock for the next frame, and backpressure before a block starts.
+static void vr180_after_present(void) {
+    if (!g_vr.init) vr180_init();
+    if (!g_vr.on) return;
+    const int f = g_frame + 1;
+    if (f < g_vr.start) return;
+    if (!g_fake_clock_on) { g_vr.t0 = rt_game_ns(); g_fake_clock_ns = g_vr.t0; g_fake_clock_on = 1; }
+    const int k = f - g_vr.start;
+    if (k % 16 == 0 && k / 16 < g_vr.count && g_vr.pending > 0) {
+        for (int waited = 0; vr180_pending_shots() > g_vr.pending; waited++) {
+            if (waited % 60 == 0) LOG("vr180: block %d waits for the stitcher (%d shots pending)", k / 16, vr180_pending_shots());
+            usleep(500000);
+        }
+    }
+    g_fake_clock_ns = g_vr.t0 + (uint64_t)(k / 16) * 41666667ull + (uint64_t)k * 1000ull;
+    if (k % 16 == 0 && k / 16 < g_vr.count && (k / 16) % 10 == 0) LOG("vr180: block %d of %d", k / 16, g_vr.count);
+}
 #else
 static void stereo_before_present(IDirect3DDevice9 *) {}
 static void stereo_after_present(void) {}
+static void vr180_before_present(IDirect3DDevice9 *) {}
+static void vr180_after_present(void) {}
+void vr180_scene_hook(void) {}
 #endif
 
 void B_IDirect3DDevice9_Present(CPU *c) {
@@ -892,6 +1040,7 @@ void B_IDirect3DDevice9_Present(CPU *c) {
     { extern void hud_screen_present(IDirect3DDevice9 *); hud_screen_present(d); }
     shot_before_present(d);
     stereo_before_present(d);
+    vr180_before_present(d);
     RECT vr = view_rect();
     const RECT *dst = ARG(2) ? (const RECT *)GPTR(ARG(2)) : (vr.left || vr.top) ? &vr : nullptr;
 #if defined(__APPLE__)
@@ -911,6 +1060,7 @@ void B_IDirect3DDevice9_Present(CPU *c) {
     d3d_scene_depth_reset();
 #endif
     stereo_after_present();
+    vr180_after_present();
     pace_present();
     platform_present_hook();
     bisect_present();

@@ -1342,9 +1342,14 @@ static uint64_t now_ns(void) {
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 }
-SHIM(GetTickCount) { RET((uint32_t)(now_ns() / 1000000), 0); }
+/* The clock the game sees. Offline captures (LB_VR180, d3d9_bridge.cpp) replace it with a scripted one so every
+ * frame of a capture block shows the same moment and blocks are exactly 1/24 s apart. */
+volatile int g_fake_clock_on;
+volatile uint64_t g_fake_clock_ns;
+uint64_t rt_game_ns(void) { return g_fake_clock_on ? g_fake_clock_ns : now_ns(); }
+SHIM(GetTickCount) { RET((uint32_t)(rt_game_ns() / 1000000), 0); }
 SHIM(QueryPerformanceCounter) {
-    uint64_t t = now_ns() / 100;
+    uint64_t t = rt_game_ns() / 100;
     M32(ARG(0)) = (uint32_t)t;
     M32(ARG(0) + 4) = (uint32_t)(t >> 32);
     RET(1, 1);

@@ -275,6 +275,7 @@ static void B_IDirect3DDevice9_GetDepthStencilSurface(CPU *c) {
 }
 
 static void B_IDirect3DDevice9_BeginScene(CPU *c) {
+    { extern void vr180_scene_hook(void); vr180_scene_hook(); }
     IDirect3DDevice9 *self = (IDirect3DDevice9 *)com_host(ARG(0));
     if (g_d3d_trace) d3d_trace(c, "IDirect3DDevice9::BeginScene", 0);
     auto r = bridge_call(self, &IDirect3DDevice9::BeginScene);

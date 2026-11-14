@@ -149,6 +149,9 @@ def gen():
             spec = spec[1:] if void_ret else spec
             args = spec.split() if spec else []
             o.append("static void %s(CPU *c) {" % fn)
+            if iface == "IDirect3DDevice9" and name == "BeginScene":
+                # Offline VR180 captures turn the world camera here: after the game's update, before it culls.
+                o.append("    { extern void vr180_scene_hook(void); vr180_scene_hook(); }")
             o.append("    %s *self = (%s *)com_host(ARG(0));" % (iface, iface))
             o.append("    if (g_d3d_trace) d3d_trace(c, \"%s::%s\", %d);" % (iface, name, len(args)))
             if name.startswith("Draw") and not name.endswith("Patch"):
