@@ -16,6 +16,7 @@
 #include <mutex>
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 #include <unordered_map>
 #include "dxvk_present_tap.h"
 
@@ -48,6 +49,8 @@ struct Entry {
     float camera[18] = {};
     bool has_camera = false;
     bool valid = false;
+    uint64_t submitted_ns = 0;  /* monotonic, stamped in on_frame; see gpu_observe */
+    uint64_t ready_ns = 0;      /* monotonic, when acquire first saw the frame ready; 0 until then */
 };
 
 struct Cached {
@@ -67,8 +70,11 @@ std::unordered_map<uint64_t, Cached> g_cache;
 std::unordered_map<uint64_t, id<MTLTexture>> g_depth_cache;  /* R32Float, sampled as it is */
 PFN_vkExportMetalObjectsEXT g_export;
 
+uint64_t now_ns() { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW); }
+
 Entry entry_of(const dxvk_present_tap_frame *frame) {
     Entry entry;
+    entry.submitted_ns = now_ns();
     entry.state = frame->state;
     entry.device = frame->vk_device;
     entry.image = frame->vk_image;
@@ -232,8 +238,26 @@ namespace {
 /* Display cadence: for each game frame, how many compositor refreshes it stayed on screen, and how many frames
  * were replaced before being shown. Logged every 900 refreshes (10 s at 90 Hz); an even 45 fps at 90 Hz shows as
  * nearly every frame held for 2. */
-struct Cadence { uint32_t refreshes, held, hist[5], skipped; };
+struct Cadence { uint32_t refreshes, held, hist[5], skipped; uint32_t gpu_count; uint64_t gpu_total_ns, gpu_max_ns; };
 Cadence g_cadence;
+
+/* Game GPU latency: from on_frame handing a frame over (submitted_ns) to the first refresh whose poll of
+ * dxvk_present_tap_ready finds it finished (ready_ns). Both stamps live in the frame's Entry, which moves
+ * between the mailbox and g_shown by value, so they always belong to the same frame; submitted_ns is written
+ * before the Entry is published under g_lock and ready_ns is written under g_lock on the compositor thread.
+ * This is an UPPER BOUND on the game frame's GPU time, not the time itself: it includes the GPU working through
+ * whatever the compositor queued ahead of it, and is rounded up to the next compositor poll (about 11 ms at
+ * 90 Hz). Frames that on_frame pushes out of a full mailbox before any poll are not measured. Called with
+ * g_lock held, on the compositor thread, which is the only one that touches g_cadence. */
+void gpu_observe(Entry &entry) {
+    if (!entry.valid || entry.ready_ns || !dxvk_present_tap_ready(entry.state, entry.frame)) return;
+    entry.ready_ns = now_ns();
+    uint64_t latency = entry.ready_ns > entry.submitted_ns ? entry.ready_ns - entry.submitted_ns : 0;
+    Cadence &c = g_cadence;
+    c.gpu_count++;
+    c.gpu_total_ns += latency;
+    if (latency > c.gpu_max_ns) c.gpu_max_ns = latency;
+}
 
 void cadence_refresh(bool fresh, int skipped) {
     Cadence &c = g_cadence;
@@ -245,9 +269,15 @@ void cadence_refresh(bool fresh, int skipped) {
     c.skipped += (uint32_t)skipped + g_mailbox_drops.exchange(0, std::memory_order_relaxed);
     if (++c.refreshes < 900) return;
     uint32_t frames = c.hist[1] + c.hist[2] + c.hist[3] + c.hist[4];
-    if (frames)
+    if (frames) {
+        char gpu[96] = "";
+        if (c.gpu_count)
+            snprintf(gpu, sizeof gpu, "; game gpu latency mean %.2f ms, max %.2f ms",
+                     (double)c.gpu_total_ns / c.gpu_count / 1e6, (double)c.gpu_max_ns / 1e6);
         fprintf(stderr, "immersive cadence: %u game frames over %u refreshes; held 1: %u, 2: %u, 3: %u, 4+: %u; "
-                "replaced unseen: %u\n", frames, c.refreshes, c.hist[1], c.hist[2], c.hist[3], c.hist[4], c.skipped);
+                "replaced unseen: %u%s\n", frames, c.refreshes, c.hist[1], c.hist[2], c.hist[3], c.hist[4], c.skipped,
+                gpu);
+    }
     uint32_t held = c.held;
     c = Cadence();
     c.held = held;
@@ -259,10 +289,12 @@ extern "C" int skyrim_immersive_acquire(skyrim_immersive_frame *out) {
     Entry taken, skipped;
     {
         std::lock_guard<std::mutex> hold(g_lock);
-        if (g_mailbox[1].valid && dxvk_present_tap_ready(g_mailbox[1].state, g_mailbox[1].frame)) {
+        gpu_observe(g_mailbox[0]);  /* stamps readiness of both queued frames, for the latency log only */
+        gpu_observe(g_mailbox[1]);
+        if (g_mailbox[1].valid && g_mailbox[1].ready_ns) {
             std::swap(skipped, g_mailbox[0]);
             std::swap(taken, g_mailbox[1]);
-        } else if (g_mailbox[0].valid && dxvk_present_tap_ready(g_mailbox[0].state, g_mailbox[0].frame)) {
+        } else if (g_mailbox[0].valid && g_mailbox[0].ready_ns) {
             std::swap(taken, g_mailbox[0]);
             std::swap(g_mailbox[0], g_mailbox[1]);
         }
