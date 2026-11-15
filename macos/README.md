@@ -400,8 +400,8 @@ environment of `macos/run.sh`; in the Simulator, pass them with
 | `LB_ANY_PAD=1` | Development: admit controllers other than a DualSense as XInput pads |
 | `LB_MAX_FPS=N` | Apple present pacing: at most `N` fps, default 60; `0` disables it |
 | `LB_FP_DEPTH_SCALE=0` | On by default: the first-person arms, weapon and spell hand write the scene depth target (the immersive screen's depth, `depth-<frame>.f32`) in the world's encoding (near 15) instead of their own camera's (near 5), so they are not placed three times too far. `0` turns it off; `off@F[,F...]` only on those frames (as `LB_SHOT` numbers them). See `runtime/d3d9_bridge.cpp` |
-
 | `LB_PASSES=1` | Log `pass <frame> shadow=<draws>/<prims> … other=… rt=<n>` at each Present: draws per kind of pass (`tools/bench/README.md`); `2` also logs a `passdbg` line per run of draws into one target in the `LB_D3DTRACE` frames |
+| `LB_INI=Section:key=value;...` | Values the game reads instead of those in its INI files, for this run only (the files are not changed); each is logged as `ini: LB_INI sets ...` when the game first reads it |
 | `DXVK_FORCE_BASE_VERTEX_FOLD=1` | macOS: force the Simulator's base-vertex fold, so tests can compare it with native drawing |
 
 ## Apple-specific fixes
