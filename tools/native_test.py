@@ -24,8 +24,8 @@ bugs. Away from an arm64 machine, cross-compile and run under an emulator, for e
 
 Options:
   --order default|strict|both   Memory-ordering build to test (default: both). "strict" builds guest and native
-                    with -DLB_STRICT_ORDER (as the iPad / visionOS build does), so the natives' load-acquire /
-                    store-release paths are the ones compared. "both" runs the two passes one after the other;
+                    with -DLB_STRICT_ORDER (as the macOS, iPad, simulator and visionOS builds do), so the natives'
+                    load-acquire / store-release paths are the ones compared. "both" runs the two passes one after the other;
                     when the target is not arm64 it says so and leaves the strict pass out.
   --only A[,A...]   Run only these functions (everything is still built).
   --jobs N          Processes at a time (default: one per CPU).
