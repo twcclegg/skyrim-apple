@@ -364,6 +364,7 @@ void B_IDirect3D9_GetAdapterDisplayMode(CPU *c) {
 }
 
 static void passes_init(IDirect3DDevice9 *d);  // LB_PASSES, below
+static void d3d_passes_reset(IDirect3DDevice9 *d);
 
 void B_IDirect3D9_CreateDevice(CPU *c) {
     auto *d3d = (IDirect3D9 *)com_host(ARG(0));
@@ -420,7 +421,7 @@ void B_IDirect3DDevice9_Reset(CPU *c) {
     rt_host_affinity_end();
     pp_to_guest(&pp, ARG(1));
     if (SUCCEEDED(hr)) { g_bb_w = pp.BackBufferWidth; g_bb_h = pp.BackBufferHeight; }
-    if (SUCCEEDED(hr) && g_d3d_passes) d3d_passes_target(d);  // Reset binds the back buffer again
+    if (SUCCEEDED(hr) && g_d3d_passes) d3d_passes_reset(d);  // Reset binds the back buffer and drops the transforms
     LOG("Reset %ux%u -> %08x", pp.BackBufferWidth, pp.BackBufferHeight, (uint32_t)hr);
     RET(hr, 2);
 }
@@ -449,6 +450,7 @@ void d3d_trace(CPU *c, const char *name, int nargs) {
 // a screenshot after presenting it (finds which draw produces an artefact).
 int g_bisect, g_d3d_draws;
 static int g_bisect_from = -1, g_draw_no;
+static bool g_bisect_window;  // inside LB_BISECT's 160 frames (g_bisect is also set for LB_SKIP_DRAWS / LB_FP_SKIP)
 
 // LB_SKIP_DRAWS=F:A-B[,F:A-B...]: on frame F (the frame being drawn, as in LB_SHOT and LB_D3DTRACE: the number its
 // Present will have) skip draws A to B, counted from 0 at the frame's first draw (the #n of LB_D3DTRACE's lines).
@@ -479,6 +481,7 @@ static bool fp_skip_now(void);  // LB_FP_SKIP, below
 bool d3d_skip_draw(void) {
     if (!g_skip_ranges.empty() && skip_ranges_hit()) return true;
     if (fp_skip_now()) return true;
+    if (!g_bisect_window) return false;
     int k = g_frame - g_bisect_from;
     return k >= 0 && !(k & 1) && g_draw_no++ == k / 2;
 }
@@ -489,7 +492,7 @@ static void bisect_present(void) {
         g_bisect_from = e ? atoi(e) : 1 << 30;
     }
     int k = g_frame - 1 - g_bisect_from;
-    if (k >= 0 && !(k & 1) && g_bisect) {
+    if (k >= 0 && !(k & 1) && g_bisect_window) {
         char cmd[256];
         snprintf(cmd, sizeof cmd, "import -window root %s/skip_%03d.png",
                  getenv("LB_BISECT_DIR") ? getenv("LB_BISECT_DIR") : ".", k / 2);
@@ -506,7 +509,8 @@ static void bisect_present(void) {
     g_draw_no = 0;
     if (!g_skip_ranges_read) skip_ranges_read();
     static const bool fp_skip = getenv("LB_FP_SKIP") != nullptr;
-    g_bisect = (g_frame >= g_bisect_from && g_frame < g_bisect_from + 160) || !g_skip_ranges.empty() || fp_skip;
+    g_bisect_window = g_frame >= g_bisect_from && g_frame < g_bisect_from + 160;
+    g_bisect = g_bisect_window || !g_skip_ranges.empty() || fp_skip;
 }
 
 // LB_PASSES=1 logs, at each Present, the frame's draw calls and primitives by the kind of pass they belong to, so
@@ -587,13 +591,18 @@ static int fp_kind(void) {
     if (t.fmt != D3DFMT_A16B16G16R16F) return FP_OTHER;
     return f.fp_late ? FP_COLOUR : FP_PREPASS;
 }
+// Called after anything fp_kind() reads has changed (the target, the late-pass flag, the projection). The kind last
+// reported is kept here rather than recomputed before the change, since the caller may already have updated the
+// target or fp_late, and a change of kind with fp on throughout (colour to depth in the late pass) would be missed.
+static int g_fp_kind_reported = FP_NONE;
 static void fp_update(void) {
     PassFrame &f = g_pass_frame;
     const PassTarget &t = g_pass_target;
-    const int before = fp_kind();
     f.fp = (f.fp_late || f.fp_proj) && t.rt && !t.bb && !hud_screen_in_pass();
     const int now = fp_kind();
-    if (now != before && g_fp_listener) g_fp_listener(now);
+    if (now == g_fp_kind_reported) return;
+    g_fp_kind_reported = now;
+    if (g_fp_listener) g_fp_listener(now);
 }
 bool d3d_first_person(void) { return g_pass_frame.fp; }
 extern "C" int skyrim_first_person_pass(void) { return fp_kind(); }
@@ -697,6 +706,13 @@ void d3d_passes_target(IDirect3DDevice9 *d) {
     if (rt) rt->Release();
     if (ds) ds->Release();
     if (bb) bb->Release();
+}
+
+// After a successful Reset: the device is back to the back buffer and an identity projection, so no first-person pass
+// is in progress whatever the frame did before it.
+static void d3d_passes_reset(IDirect3DDevice9 *d) {
+    g_pass_frame.fp_late = g_pass_frame.fp_proj = false;
+    d3d_passes_target(d);
 }
 
 // A Clear of depth without colour into a back-buffer-sized target, once the main pass has drawn: the late
