@@ -92,6 +92,12 @@ TSO = os.environ.get("LIFT_TSO", "1") == "1"
 # anything else can see the CPU state: the end of the block, a call, a return, or a helper that takes `c`.
 # c->st[] and c->top therefore hold exactly what the plain model would hold at each of those points.
 X87CACHE = os.environ.get("LIFT_X87CACHE", "1") == "1"
+# LIFT_X87FN=1 keeps the cached registers across block edges too. Each block gets one agreed entry state (the top's
+# offset from `ft`, and which registers are in locals), found by a fixpoint over the function's blocks, so an edge
+# only writes back what the successor does not take over. Blocks whose predecessors disagree on the offset start
+# from the written-back state as before, as do all blocks of a function with a computed jump or setjmp. Calls,
+# returns and helpers that take `c` still see c->st[] and c->top exactly as the plain model has them.
+X87FN = os.environ.get("LIFT_X87FN", "0") == "1"
 
 # The busiest Windows imports, emitted inline at call sites that name them directly (`call [iat]`, or a call to a
 # `jmp [iat]` stub) instead of going through the import dispatcher: a return-address push, a register spill and
@@ -125,6 +131,8 @@ X87_LINE = re.compile(r"\bST\(|\bfpush\(|\bfpop\(|\bfstatus\(c\)|\bfxam\(c\)|\bf
 X87_SYNC = re.compile(r"\bfxam\(c\)|\bfprem\(c|\bfpu_env\(c|c->top\b")
 X87_TOK = re.compile(r"fpush\(c, |fpop\(c\);|ST\((\d)\)( = (?!=))?|fcompare\(c, |fstatus\(c\)|c->c[0-3] = |;")
 PASSES_CPU = re.compile(r"\(c[,)]|\bgoto\b|\breturn\b")
+EDGE_LINE = re.compile(r"^(if \(.*\) )?goto L_([0-9A-F]+);$")
+GOTO_BLOCK = re.compile(r"\bgoto L_([0-9A-F]+);")
 X87_LOCALS = "    double fr0, fr1, fr2, fr3, fr4, fr5, fr6, fr7; uint32_t ft = c->top, fsw = 0; (void)fsw;"
 
 
@@ -148,6 +156,14 @@ class X87Cache:
             out.append("ft = (ft + %d) & 7;" % (self.d & 7))
         self.reset()
         return out
+
+    def enter(self, state):
+        """Start a block from its agreed entry state (d, cached, dirty)."""
+        self.d, self.cached, self.dirty, self.sw = state[0], set(state[1]), set(state[2]), False
+
+    def edge(self, accept):
+        """Lines for leaving the block towards successors that take over the registers in `accept`."""
+        return ["c->st[(ft + %d) & 7] = fr%d;" % (k, k) for k in sorted(self.dirty - accept)]
 
     def rewrite(self, line):
         self.used = True
@@ -1263,15 +1279,15 @@ class Lifter:
         head = img[self.f - BASE:self.f - BASE + 5]
         frame = head[:3] == b"\x55\x8b\xec" or head == b"\x8b\xff\x55\x8b\xec"  # optional hot-patch mov edi, edi
         self.frame = frame
-        xc = X87Cache() if X87CACHE else None
+        # Pass 1: lift every block to lines, one list per instruction.
+        lifted = []
         for bi, (a, b) in enumerate(order):
-            o.append("L_%X:" % a)
             insns = decode_block(a, b)
             if not insns or insns[-1].address + insns[-1].size != b:
                 raise Unsupported("decode %X" % a)
             ld_pending = False
+            items = []
             for i in insns:
-                last = i is insns[-1]
                 nxt = i.address + i.size
                 lines = self.lift_terminator(i, nxt) if self.is_term(i) else None
                 if lines is not None:
@@ -1286,28 +1302,19 @@ class Lifter:
                     if shared_load(i, frame):
                         ld_pending = True
                     lines = mem_order(i, lines, frame)
-                if xc:
-                    cached = []
-                    for line in lines:
-                        if X87_LINE.search(line):
-                            cached += xc.rewrite(line)
-                        else:
-                            # the block ends here, or `c` goes to code that may read the x87 state
-                            if self.is_term(i) or PASSES_CPU.search(line):
-                                cached += xc.flush()
-                            cached.append(line)
-                    lines = cached
-                for line in lines:
-                    o.append("    " + line)
-                if last and xc:
-                    for line in xc.flush():
-                        o.append("    " + line)
-                if last and not self.is_term(i):
-                    # fall through into the next block
-                    if bi + 1 < len(order) and order[bi + 1][0] == nxt:
-                        pass
-                    else:
-                        o.append("    " + self.goto(nxt))
+                items.append((self.is_term(i), lines))
+            tail = None
+            if not items[-1][0] and not (bi + 1 < len(order) and order[bi + 1][0] == b):
+                tail = self.goto(b)  # no fall through into the next block
+            lifted.append((a, b, items, tail))
+        xc = X87Cache() if X87CACHE else None
+        plan = self.x87_plan(order, lifted) if xc and X87FN else None
+        for bi, (a, b, items, tail) in enumerate(lifted):
+            o.append("L_%X:" % a)
+            if plan:
+                xc.enter(plan[0][a])
+            for line in self.x87_block(xc, bi, order, items, tail, plan and self.x87_leave(xc, plan)):
+                o.append("    " + line)
         if self.need_dispatch:
             cases = " ".join("case 0x%Xu: goto L_%X;" % (b, b) for b in sorted(self.block_starts))
             o.append("L_dispatch:")
@@ -1317,6 +1324,108 @@ class Lifter:
             o[:] = [l.replace(SPILL, "SPILLF();").replace(RELOAD, "RELOADF();") for l in o]
             o.insert(5, X87_LOCALS)
         return o
+
+    def x87_succs(self, bi, order, items, tail):
+        """Blocks control can reach from the end of block `bi`, and whether it leaves through plain gotos only."""
+        lines = (items[-1][1] if items[-1][0] else []) + ([tail] if tail else [])
+        succs = {int(t, 16) for l in lines for t in GOTO_BLOCK.findall(l)}
+        last = lines[-1] if lines else ""
+        if not (last.startswith("goto ") or (not last.startswith("if (") and last.rstrip(" }").endswith("return;"))):
+            if bi + 1 < len(order):
+                succs.add(order[bi + 1][0])
+        plain = all(EDGE_LINE.match(l) or not PASSES_CPU.search(l) for l in lines)
+        return succs, plain
+
+    def x87_block(self, xc, bi, order, items, tail, leave):
+        """The lines of one block with the x87 cache applied. `leave(succs)` gives the lines that hand the cached
+        state to the successors (function-wide mode); without it everything is written back at the block's end."""
+        out = []
+        if not xc:
+            for _, lines in items:
+                out += lines
+            return out + ([tail] if tail else [])
+        succs, plain = self.x87_succs(bi, order, items, tail)
+        handed = False
+        for n, (term, lines) in enumerate(items):
+            if leave and term and plain and n == len(items) - 1:
+                out += leave(succs)  # the block leaves through plain gotos: hand over before them
+                handed = True
+            for line in lines:
+                if X87_LINE.search(line):
+                    out += xc.rewrite(line)
+                else:
+                    # the block ends here, or `c` goes to code that may read the x87 state
+                    if not handed and (term or PASSES_CPU.search(line)):
+                        out += xc.flush()
+                    out.append(line)
+        if not handed:
+            out += leave(succs) if leave and (tail is None or EDGE_LINE.match(tail)) else xc.flush()
+        if tail:
+            out.append(tail)
+        return out
+
+    def x87_leave(self, xc, plan):
+        states, bases = plan
+
+        def leave(succs):
+            if not succs or succs & bases:
+                return xc.flush()
+            accept = set(range(8))
+            for t in succs:
+                accept &= states[t][1]
+            return xc.edge(accept)
+        return leave
+
+    def x87_plan(self, order, lifted):
+        """Entry state (top offset from `ft`, cached registers, dirty registers) for every block, or None when the
+        function keeps the per-block cache."""
+        if self.need_dispatch or any("setjmp" in l for _, _, items, _ in lifted for _, ls in items for l in ls):
+            return None
+        empty = (0, frozenset(), frozenset())
+        states, bases = {order[0][0] if order[0][0] == self.f else self.f: empty}, set()
+        exits = {}
+
+        def record(a):
+            def leave(succs):
+                exits[a] = (succs, (probe.d, frozenset(probe.cached), frozenset(probe.dirty)))
+                return []
+            return leave
+        changed = True
+        while changed:
+            changed = False
+            for bi, (a, b, items, tail) in enumerate(lifted):
+                if a not in states and a not in bases:
+                    continue
+                probe = X87Cache()
+                probe.enter(empty if a in bases else states[a])
+                exits.pop(a, None)
+                self.x87_block(probe, bi, order, items, tail, record(a))
+                if a not in exits:  # left through a full write-back
+                    succs = self.x87_succs(bi, order, items, tail)[0]
+                    exits[a] = (succs, (probe.d, frozenset(probe.cached), frozenset(probe.dirty)))
+                succs, (d, cached, dirty) = exits[a]
+                if succs & bases and not succs <= bases:
+                    bases |= succs
+                    changed = True
+                for t in succs - bases:
+                    old = states.get(t)
+                    if old is None:
+                        new = (d, cached, dirty)
+                    elif (old[0] - d) & 7:
+                        bases.add(t)
+                        changed = True
+                        continue
+                    else:
+                        keep = old[1] & cached
+                        new = (old[0], keep, (old[2] | dirty) & keep)
+                    if new != old:
+                        states[t] = new
+                        changed = True
+        for a, _ in order:
+            if a in bases or a not in states:
+                bases.add(a)
+                states[a] = empty
+        return states, bases
 
     def is_term(self, i):
         g = set(i.groups)

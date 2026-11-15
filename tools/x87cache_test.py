@@ -136,8 +136,8 @@ int main(int argc, char **argv) {
 '''
 
 
-def lift_one(fa, blocks, all_funcs, cache):
-    lift.X87CACHE = cache
+def lift_one(fa, blocks, all_funcs, cache, fn=False):
+    lift.X87CACHE, lift.X87FN = cache, fn
     lines = lift.Lifter(fa, blocks, all_funcs).emit()
     head, body = lines[0], lines[1:]
     head = re.sub(r"^void f_[0-9A-F]+(_guest)?\(", "static void t_%X(" % fa, head)
@@ -165,7 +165,7 @@ def main():
     rng = random.Random(87)
     order = sorted(funcs)
     rng.shuffle(order)
-    ref, new, with_calls = {}, {}, 0
+    ref, new, wide, with_calls = {}, {}, {}, 0
     for fa in order:
         if len(ref) >= NFUNCS:
             break
@@ -184,6 +184,7 @@ def main():
         with_calls += calls
         ref[fa] = lift_one(fa, blocks, all_funcs, False)
         new[fa] = cached
+        wide[fa] = lift_one(fa, blocks, all_funcs, True, True)
     picked = sorted(ref)
     print("functions", len(picked), "with calls", with_calls)
     rt = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "runtime")
@@ -191,7 +192,8 @@ def main():
     with open(image, "wb") as f:
         f.write(lift.BASE.to_bytes(4, "little") + bytes(lift.img))
     out = {}
-    for name, variants in (("plain", ref), ("cached", new)):
+    print("function-wide cache changes", sum(wide[fa] != new[fa] for fa in picked), "of them")
+    for name, variants in (("plain", ref), ("cached", new), ("wide", wide)):
         exe = build(name, picked, variants, rt)
         res = subprocess.run([exe, image, str(RUNS)], capture_output=True, text=True)
         if res.returncode:
@@ -200,20 +202,21 @@ def main():
         open(os.path.join(WORK, name + ".txt"), "w").write(res.stdout)
     res = {name: {l[:11]: l for l in lines if len(l) > 11} for name, lines in out.items()}
     bad, traps, timeouts, compared = [], 0, 0, 0
-    for key in sorted(set(res["plain"]) | set(res["cached"])):
-        a, b = res["plain"].get(key, key + "(no result)"), res["cached"].get(key, key + "(no result)")
-        if "timeout" in a or "timeout" in b:
-            timeouts += 1  # where a 200 ms limit lands isn't repeatable
-            continue
-        traps += "TRAP" in a
-        compared += 1
-        if a != b:
-            bad.append((a, b))
+    for mode in ("cached", "wide"):
+        for key in sorted(set(res["plain"]) | set(res[mode])):
+            a, b = res["plain"].get(key, key + "(no result)"), res[mode].get(key, key + "(no result)")
+            if "timeout" in a or "timeout" in b:
+                timeouts += 1  # where a 200 ms limit lands isn't repeatable
+                continue
+            traps += "TRAP" in a
+            compared += 1
+            if a != b:
+                bad.append((mode, a, b))
     print("runs compared", compared, "faulted in the reference", traps, "timed out", timeouts, "different", len(bad))
     print("results sha256", hashlib.sha256("\n".join(out["plain"]).encode()).hexdigest()[:16])
-    for a, b in bad[:20]:
+    for mode, a, b in bad[:20]:
         print("  plain  ", a)
-        print("  cached ", b)
+        print("  %-7s" % mode, b)
     sys.exit(1 if bad else 0)
 
 
