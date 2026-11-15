@@ -5,8 +5,8 @@ multiview (`VK_KHR_multiview`, core in Vulkan 1.1) through D3D9 -> DXVK 1.9.2 ->
 It runs headless on a Mac against the MoltenVK package the game links. It draws into offscreen images, reads
 them back, and checks them on the CPU.
 
-**Status: written without being compiled or run.** A benchmark was running on the machine at the time, so
-nothing was built. Read "Where to look first" below before you trust a FAIL.
+**Status: every check passes on an M1 and an M5 Mac (MoltenVK 1.4.2), with the layered Metal path
+(check 7).** Not yet run on the headset's GPU or against the visionOS MoltenVK slice.
 
 ## Build (macOS)
 
@@ -16,18 +16,15 @@ From the repository root:
 tools/multiview_probe/build.sh
 ```
 
-This produces `build/multiview_probe`, which is gitignored. The script finds the MoltenVK package in this
-order:
-
-1. `$SKYRIM_MOLTENVK_ROOT`.
-2. `macos/deps/MoltenVK/MoltenVK` in this checkout.
-3. `../skyrim-apple-m5/macos/deps/MoltenVK/MoltenVK`, for a worktree next to the main checkout. This
-   worktree has no `macos/deps`, so this is the one it uses.
+This produces `build/multiview_probe`, which is gitignored. The script uses the MoltenVK package at
+`$SKYRIM_MOLTENVK_ROOT` if set (the directory holding `include/` and `dynamic/`), else
+`macos/deps/MoltenVK/MoltenVK` in this checkout. In a worktree without `macos/deps`, point
+`SKYRIM_MOLTENVK_ROOT` at another checkout's package.
 
 Here is the exact command it runs, for building by hand:
 
 ```sh
-MVK=/Users/mac-ci/repos/skyrim-apple-m5/macos/deps/MoltenVK/MoltenVK
+MVK=macos/deps/MoltenVK/MoltenVK
 xcrun clang++ -std=c++17 -O2 -g -Wall -Wextra -Wno-missing-field-initializers \
     -I"$MVK/include" \
     tools/multiview_probe/multiview_probe.mm \
@@ -80,8 +77,11 @@ MoltenVK has two ways to run a multiview subpass:
 
 - **Layered.** One Metal render pass with `renderTargetArrayLength = 2` and the instance count doubled. The
   vertex shader writes `[[render_target_array_index]]`.
-- **Fallback.** One Metal render pass per view, replaying the subpass. The view index comes from a buffer
-  named `spvViewMask`.
+- **Fallback.** One Metal render pass per view, replaying the subpass, with no
+  `[[render_target_array_index]]` output.
+
+Both paths read the view base and count from a buffer named `spvViewMask`, so only
+`render_target_array_index` tells them apart.
 
 MoltenVK picks layered when the GPU supports layered rendering. The probe reports two hints:
 
@@ -137,23 +137,21 @@ The checks are platform-neutral, but this file is a macOS command-line tool. To 
 
 Nothing can compile GLSL at build time or run time here:
 
-- There is no glslang or spirv-tools in the repository.
-- The `third_party/dxvk` submodule is not checked out in this worktree. DXVK 1.9.2 generates its SPIR-V in
-  C++ and does not vendor glslang anyway.
-- No glslang tools are installed on this machine.
+- There is no glslang or spirv-tools in the repository, and the build does not assume any are installed.
+- DXVK 1.9.2 generates its SPIR-V in C++ and does not vendor glslang.
 - The MoltenVK package ships only headers and `libMoltenVK.dylib`, with no `MoltenVKShaderConverter`
   library. MoltenVK's private MSL-source shader-module path would bypass SPIRV-Cross, and SPIRV-Cross is
   exactly what derives `gl_ViewIndex` from the instance index, so it would defeat the test.
 
 So the probe has a ~150-line SPIR-V builder (`SpvModule`) and three tiny modules, each with its GLSL in a
-comment. For an author who cannot run anything, this is the most checkable option: every opcode and enum
-value is listed once in `namespace sp` and was compared against `spirv.hpp` (SPIR-V 1.4 headers, in the
-main checkout's `android/app/jni/dxvk/include/spirv/`). They are copied out so the build needs no submodule.
+comment. Every opcode and enum value is listed once in `namespace sp` and was compared against `spirv.hpp`
+(SPIR-V 1.4 headers, `third_party/dxvk/include/spirv/`). They are copied out so the build needs no
+submodule.
 
 The modules are SPIR-V 1.0 with `OpExtension "SPV_KHR_multiview"` and `OpCapability MultiView`, which is
 the form DXVK 1.9.2 would emit.
 
-## Where to look first (least sure → more sure)
+## If a check fails (least sure → more sure)
 
 1. **The hand-built SPIR-V.** If `vkCreateShaderModule` or `vkCreateGraphicsPipelines` fails, or MoltenVK
    logs a SPIRV-Cross error, this is the first suspect. Ways to check it:
@@ -171,8 +169,8 @@ the form DXVK 1.9.2 would emit.
    the file is `.mm`. If this fails to compile, delete check 7(a) (the `getMetalFeatures` block) and the
    include. Everything else needs only `<vulkan/vulkan.h>`.
 3. **Check 7's MSL dump.** The exact layout of `MVK_CONFIG_SHADER_DUMP_DIR` (file names, whether MSL is
-   written at pipeline creation) is assumed, not verified. If it reports 0 files, set the variable in the
-   shell before launching. If it still reports 0 files, use the capture method above. In either case this
+   written at pipeline creation) is not documented by MoltenVK; 1.4.2 writes `shader-*.metal` files at
+   pipeline creation. If it reports 0 files, set the variable in the shell before launching. If it still reports 0 files, use the capture method above. In either case this
    does not affect the exit status.
 4. **3b's verdict.** Metal's behaviour for an out-of-range array index in `sample()` is exactly what is being
    measured. "NOT CLAMPED (something other than layer 0)" probably means undefined reads. Look at
@@ -187,4 +185,4 @@ the form DXVK 1.9.2 would emit.
    - The 2000 tiny triangles are CPU-bound by design. They say little about the GPU cost of layered
      rendering at full scene load. Use the game's own bench for that.
 7. **Vulkan usage itself** (render pass dependencies, layouts, framebuffer `layers = 1` with 2-layer views
-   for multiview). These follow the spec as far as I checked. MoltenVK is lenient here in any case.
+   for multiview). These follow the spec. MoltenVK is lenient here in any case.
