@@ -296,3 +296,31 @@ tear handling, and flat menus).
 - **CPU:** the process used 43–70% of one core, the main thread 21–28%. Thermal state stayed nominal.
 - **Thomas's verdict:** "Much better." His screenshots show clean edges on a rock and the sword at the
   reduced depth, and a flat main menu.
+
+## 2026-11-15 — first-person depth in the world's encoding (M5, Riverwood, 1280×720 low; twcclegg/skyrim-apple#23)
+
+The R32F scene-depth target that the immersive screen reprojects holds d = P33 (1 − near/z) through whichever
+projection drew the pixel. The world uses near 15; the late first-person pass (arms, weapon, spell hand) writes its
+depth through its own camera with near 5, so hands and weapons were reprojected about three times too far away.
+`runtime/d3d9_bridge.cpp` now detects those draws (a Clear of depth only on a back-buffer-sized target after the
+main pass, confirmed by a projection whose near plane is not the world's) and, for the draws into the R32F target
+only, binds a bytecode copy of the game's pixel shader whose output is `A d + B` (here 3.00008 d − 2.00009, from
+the projections the game sets). Vertex shader, z-buffer, depth test and compositor unchanged. On by default;
+`LB_FP_DEPTH_SCALE=0` turns it off, `=off@F,...` off on frames F only.
+
+Measured with a scripted scene (`coc riverwood`, `bat fpflame`: iron sword and Flames readied; `bat stereofreeze`:
+`sgtm 0.02`, HUD off), two runs with the fix on, one with `LB_FP_DEPTH_SCALE=0`, one with `off@2900`:
+
+- **Depth on the first-person pixels** (101,140 px: (1 − d) on/off ratio 2.5–3.5 between frames 2901 and 2900 of the
+  `off@2900` run, eroded by 2 px): decoded with near 15, median distance 99.1–99.6 units without the fix and
+  33.0–33.9 with it. The ratio is 2.998 within one run (frames 2901/2900) and 3.0006 / 2.9996 between the second
+  fix-on run and the fix-off run (frames 2900 / 3000). Disparity for a 64 mm eye separation (`stereo_proto.py`'s
+  formula, 80.7° across): 34.0 px → 101.4–102.2 px.
+- **World depth** (pixels 4 px clear of the hands): within one run, frames 2900 (off) and 2901 (on) are
+  bit-identical on 87.0%, frames 2899 and 2901 (both on) on 86.9%. Across runs, fix-on against fix-on 71.8–73.4%,
+  fix-on against fix-off 71.6–85.1%: the same as run-to-run noise.
+- **Picture:** within one run, off-frame 2900 against its fix-on neighbours differs by 1.20 and 1.31 /255 mean per
+  channel, the two fix-on neighbours by 2.05. Across runs, the two fix-on runs differ by 11.2–11.8 (they caught
+  different moments), fix-on against fix-off by 2.5–12.2.
+- **Cost:** `work` per frame in the held phase (1,900 frames, 3 runs each, alternating): 6.11 / 6.30 / 6.17 ms with
+  the fix, 6.18 / 6.22 / 6.17 ms without it. No difference measured.
