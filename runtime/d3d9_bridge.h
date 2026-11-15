@@ -31,7 +31,9 @@ void d3d_trace_camera(const char *why);  // LB_D3DTRACE: the game's world camera
 
 /* LB_PASSES (d3d9_bridge.cpp): draws and primitives per kind of pass, logged at each Present. 0 off, 1 the
  * per-frame "pass" line, 2 also "passdbg" and "fpdbg" lines. The hooks are called only while g_d3d_passes is set:
- * with LB_PASSES, or without logs when the first-person flag is wanted (LB_FP=1, LB_FP_SKIP, LB_STEREO_EYE_UNITS). */
+ * with LB_PASSES, or without logs when the first-person flag is wanted (LB_FP=1, LB_FP_SKIP, LB_STEREO_EYE_UNITS),
+ * which by default it is: the first-person depth draws are rewritten into the world's depth encoding
+ * (LB_FP_DEPTH_SCALE in d3d9_bridge.cpp; =0 turns that off, and the hooks with it). */
 extern int g_d3d_passes;
 void d3d_passes_draw(uint32_t prims);          // every Draw*Primitive*, with its primitive count
 void d3d_passes_target(IDirect3DDevice9 *d);   // after the render target 0 or the depth-stencil surface changed
