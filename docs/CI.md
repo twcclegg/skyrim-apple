@@ -22,11 +22,16 @@ forks and repositories without a runner never queue it.
 
 Rules that keep it private and safe on a public repository:
 
-- **No `pull_request` trigger.** Only pushes to the repository (including your own PR branches) and manual runs
-  reach the runner, so code from someone else's fork never runs there.
+- **No `pull_request` trigger here, and approval for fork pull requests.** This workflow runs only for pushes to
+  the repository (including your own PR branches) and manual runs. That alone does not keep forks off the runner:
+  a pull request runs the workflow files from its own branch, so one from a fork could change `ci.yml` to run on
+  `[self-hosted, skyrim-private]`. Requiring approval for fork pull request workflows (below) closes that, as long
+  as each approval follows a look at the pull request's `.github/` changes. Keeping the runner stopped while you
+  are not using it narrows it further.
 - **Nothing leaves the Mac.** No artifacts are uploaded: the engine and app contain compiled game code. Only the
   generated-code key and output hashes go into the job summary. Logs are public, so build steps must not print
-  game file contents.
+  game file contents or generated code: the steps that compile `gen/` write their output to `$SKYRIM_CI_HOME/logs`
+  on the runner and print only whether they passed.
 - **A non-admin account.** Run the runner as a dedicated standard user that holds nothing else.
 - **No stored GitHub credentials.** Registration uses a one-time token; the runner then holds only its own
   runner credential.
@@ -39,9 +44,12 @@ A runner that isn't always on works: jobs wait in the queue until it connects, G
 On an Apple Silicon Mac, as a dedicated standard (non-admin) user:
 
 1. **Prerequisites:** full Xcode with the visionOS SDK, Python 3.10+, `cmake` and `ninja` on `PATH` (for example
-   in a Python venv: `python3 -m venv ~/ci-tools && ~/ci-tools/bin/pip install cmake ninja`).
+   in a Python venv: `python3 -m venv ~/ci-tools && ~/ci-tools/bin/pip install cmake ninja`), and `cabextract`,
+   which `macos/bootstrap.sh` always uses (install it with Homebrew from an admin account; `/opt/homebrew/bin` is
+   readable by the runner user).
 2. **A game folder** that user can read, with `TESV_unpacked.exe`, `d3dx9_42.dll` and `X3DAudio1_7.dll` beside
-   `TESV.exe` (see [BUILDING.md](BUILDING.md)), so generation needs neither .NET nor cabextract.
+   `TESV.exe` (see [BUILDING.md](BUILDING.md)), so generation needs no .NET. The job also checks reused
+   generated code against this folder.
 3. **Install the runner:** in the repository, **Settings → Actions → Runners → New self-hosted runner** (macOS,
    ARM64). Follow its download and checksum steps, then configure with the extra label:
    `./config.sh --url <repository URL> --labels skyrim-private --token <token>`.
@@ -58,4 +66,5 @@ On an Apple Silicon Mac, as a dedicated standard (non-admin) user:
 ### Repository settings to check once
 
 - **Settings → Actions → General → Fork pull request workflows:** "Require approval for all outside
-  collaborators". This only affects the hosted `CI` workflow, which never reaches the private runner.
+  collaborators". Required once a runner is registered: without it, a fork's pull request can edit `ci.yml` to
+  run on the private runner (see above).

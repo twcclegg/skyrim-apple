@@ -25,7 +25,8 @@ jobs:
 
       - name: Toolchain
         run: |
-          brew list ninja >/dev/null 2>&1 || brew install ninja
+          # cabextract: macos/directx/fetch.py takes two DLLs from Microsoft's DirectX redistributable with it.
+          for tool in ninja cabextract; do brew list $tool >/dev/null 2>&1 || brew install $tool; done
           xcodebuild -version
           cmake --version | head -1
 
