@@ -286,8 +286,9 @@ Cadence g_cadence;
  * dxvk_present_tap_ready finds it finished (ready_ns). Both stamps live in the frame's Entry, which moves
  * between the mailbox and g_shown by value, so they always belong to the same frame; submitted_ns is written
  * before the Entry is published under g_lock and ready_ns is written under g_lock on the compositor thread.
- * This is an UPPER BOUND on the game frame's GPU time, not the time itself: it includes the GPU working through
- * whatever the compositor queued ahead of it, and is rounded up to the next compositor poll (about 11 ms at
+ * This is an UPPER BOUND on the game frame's GPU time, not the time itself: on_frame runs on the game thread once
+ * the frame is queued to DXVK's command thread, so it includes that thread recording and submitting the frame,
+ * the GPU working through whatever the compositor queued ahead of it, and rounding up to the next poll (about 11 ms at
  * 90 Hz). Frames that on_frame pushes out of a full mailbox before any poll are not measured. Called with
  * g_lock held, on the compositor thread, which is the only one that touches g_cadence. */
 void gpu_observe(Entry &entry) {
