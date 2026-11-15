@@ -7,7 +7,8 @@
 # the records, wrap the records or the destination around the top of the 4 GiB guest space (that memory and
 # the bottom of it are copied into the scratch area afterwards, so they are compared too), or copy nothing.
 # The calling-convention test clears ecx and edx before comparing; the setup ends in a for header whose body is
-# the call, so both are saved into the scratch area right after it and compared all the same.
+# the call, so both are saved into the scratch area right after it and compared all the same (as the STRICT
+# flag now does for them and the XMM registers; see native_test.py).
 _PTR = "(0x10004000u + (rnd() % 0x8000 & ~3u))"
 ABI = {
     0xCC4AC0: (
@@ -27,5 +28,5 @@ ABI = {
         "M32(esp + 4) = dst; M32(esp + 8) = src; M32(esp + 0xC) = idx; M32(esp + 0x10) = n; "
         "for (int once_ = 1; once_; once_ = 0, M32(0x1001F100u) = c->r[1], M32(0x1001F104u) = c->r[2])"
         % (_PTR, _PTR, _PTR),
-        "memcpy(MEM + 0x1001F200u, MEM + 0xFFFFFF00u, 0x100); memcpy(MEM + 0x1001F300u, MEM, 0x40);"),
+        "memcpy(MEM + 0x1001F200u, MEM + 0xFFFFFF00u, 0x100); memcpy(MEM + 0x1001F300u, MEM, 0x40);", STRICT),
 }

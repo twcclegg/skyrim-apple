@@ -1,6 +1,7 @@
 # Calling-convention test setups for runtime/skyrim_native_g8.c (see ABI in tools/native_test.py).
 # The natives leave every register as the guest does, so nothing beyond the default is cleared: only the dead
-# stack below the return address may differ.
+# stack below the return address may differ, and ecx, edx, the XMM registers and the memory a stubbed callee
+# sees are compared too (STRICT, see native_test.py).
 ABI = {
     0xF531CC: (  # fabs: ordinary doubles of either sign, zeros, denormals, the largest and smallest normals,
                  # random bit patterns, infinities and NaNs (quiet and signalling, either sign); any control word
@@ -13,14 +14,14 @@ ABI = {
         "case 1: b_ = ((uint64_t)rnd() << 33) ^ ((uint64_t)rnd() << 2) ^ rnd(); break; "
         "case 2: b_ = (((uint64_t)rnd() << 33) ^ rnd()) & 0x800FFFFFFFFFFFFFull; break; } "
         "M64(esp + 4) = b_; c->fpu_cw = (rnd() % 4) ? cw_[rnd() % 7] : (uint16_t)rnd();",
-        ""),
+        "", STRICT),
     0x45C640: (  # bit n of the 64-bit mask at [ecx+0x20]: n below 32, 32 to 63, 64 and up, and with high bytes set
                  # (the shift count is the low byte); masks of single bits, all ones, zero and random
         "uint32_t o_ = 0x10004000u + (rnd() % 0x8000 & ~3u), r_ = rnd() % 6; "
         "M32(o_ + 0x20) = r_ == 0 ? 0 : r_ == 1 ? 0xFFFFFFFFu : r_ == 2 ? 1u << (rnd() % 32) : rnd(); "
         "r_ = rnd() % 6; M32(o_ + 0x24) = r_ == 0 ? 0 : r_ == 1 ? 0xFFFFFFFFu : r_ == 2 ? 1u << (rnd() % 32) : rnd(); "
         "r_ = rnd() % 4; c->r[1] = o_; M32(esp + 4) = r_ == 0 ? rnd() : r_ == 1 ? rnd() % 256 : rnd() % 72;",
-        ""),
+        "", STRICT),
 }
 
 # 0xACE100: a culler (six planes at +0x2C, plane mask at +0x8C, flag byte at +0x10D) and an object (bound at +0x88:
@@ -46,7 +47,7 @@ ABI[0xACE100] = (_F8 +
     "  MF32(obj + 0x88) = 0.0f; MF32(obj + 0x8C) = 0.0f; MF32(obj + 0x90) = 0.0f; "
     "  MF32(obj + 0x94) = (rnd() & 1) ? d_ : -d_; } "
     "c->r[1] = self; M32(esp + 4) = obj;",
-    "")
+    "", "ecx edx xmm callees=1")  # the virtual call takes one argument, the culler
 
 # 0xF6029C: the SSE2 block copy: 1 to 64 blocks plus a remainder it ignores (below one block the guest loops 2^32
 # times, never in the game: memcpy calls it from 256 bytes on), 16-byte aligned and unaligned addresses, and overlapping ranges either way round (the ranges stay clear of the stack).
@@ -56,4 +57,4 @@ ABI[0xF6029C] = (
     "switch (rnd() % 6) { case 0: src = dst + (rnd() % 0x400 & al_); break; case 1: dst = src + (rnd() % 0x400 & al_); break; "
     "case 2: src = dst; break; } "
     "M32(esp + 4) = dst; M32(esp + 8) = src; M32(esp + 12) = n_;",
-    "")
+    "", STRICT)

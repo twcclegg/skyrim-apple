@@ -3,6 +3,11 @@
 # length and the C runtime's sqrt and fabs, the box corner builder), so they are compared with the whole lifted
 # call tree. All of them leave the x87 stack as they found it and return in eax, so the x87 registers and
 # condition codes are not part of the result; the box tests return a bool in al, so the rest of eax isn't either.
+# Strict ABI fields (third element, see native_test.py): the XMM registers and callee-visible memory. Not ecx
+# and edx: the guest returns with what its helpers and its own moves last left in them (the x87 control words
+# the C runtime's sqrt handles, float bits, loop counters, stack addresses); the natives do the helpers inline
+# and return both as they were at entry. Both registers are the callee's to clobber (thiscall), the results
+# are in eax / al and memory.
 
 # (setup arithmetic is kept to one operation per expression: a fused multiply-add in one build and not the
 # other would hand the two sides different arguments)
@@ -35,7 +40,7 @@ ABI = {
         "if (r == 2) out = a; if (r == 3) out = b; "
         "if (rnd() % 16 == 0) c->fpu_cw = 0x7F; "
         "c->r[1] = a; M32(esp + 4) = out; M32(esp + 8) = b;",
-        _X87),
-    0xAFC100: (_BOX, "c->r[0] &= 0xFF; " + _X87),
-    0xAFBF80: (_BOX, "c->r[0] &= 0xFF; " + _X87),
+        _X87, "xmm callees"),
+    0xAFC100: (_BOX, "c->r[0] &= 0xFF; " + _X87, "xmm callees"),
+    0xAFBF80: (_BOX, "c->r[0] &= 0xFF; " + _X87, "xmm callees"),
 }

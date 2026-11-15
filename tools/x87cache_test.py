@@ -24,7 +24,7 @@ sys.argv = [sys.argv[0], EXE, FUNCS, WORK]
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import lift  # noqa: E402
 
-CALL = re.compile(r"\bf_[0-9A-F]+\(c\)")
+CALL = re.compile(r"\bf_([0-9A-F]+)\(c\)")
 
 HARNESS = r'''
 #include <stddef.h>
@@ -51,9 +51,43 @@ static void dump(const char *what, CPU *c) {
     printf(" st");
     for (int k = 0; k < 8; k++) printf(" %.17g", c->st[k]);
 }
+#define SCR 0x10000000u
+#define SCR_SIZE 0x20000u
+#ifdef NATIVE_TEST
+/* native_test.py only. A second callee hash, of the guest memory a callee can see: in an exact test the whole
+ * scratch area; in a calling-convention test (g_abi_esp = the tested function's stack pointer at entry) the
+ * scratch area outside the stack below that pointer (the tested function's own frames, which a replacement need
+ * not write), plus the callee's return address and its first g_abi_args argument dwords. Also what a
+ * calling-convention test clears before the comparison (ecx, edx, the XMM registers), as the call left it. */
+#define NT_STACK 0x10018000u  /* calling-convention tests keep their buffers out of [NT_STACK, entry esp) */
+static uint64_t g_seen2, g_xmm;
+static uint32_t g_abi_esp, g_abi_args, g_ecx, g_edx;
+static int nt_stubbed;  /* 1: a replacement's direct calls go to the stub, as the guest's do in an exact test */
+static uint64_t mixw(uint64_t h, uint32_t a, uint32_t end) {
+    for (; end - a >= 8; a += 8) { uint64_t v; memcpy(&v, MEM + a, 8); h = (h ^ v) * 0x100000001B3ull; h ^= h >> 29; }
+    for (; a != end; a += 4) { uint32_t v; memcpy(&v, MEM + a, 4); h = (h ^ v) * 0x100000001B3ull; h ^= h >> 29; }
+    return h;
+}
+static void nt_callee_memory(CPU *c) {
+    uint64_t h = (g_seen2 ^ g_seen) * 0x100000001B3ull;
+    if (!g_abi_esp) h = mixw(h, SCR, SCR + SCR_SIZE);
+    else {
+        h = mixw(mixw(h, SCR, NT_STACK), g_abi_esp, SCR + SCR_SIZE);
+        for (uint32_t k = 0; k <= g_abi_args; k++) {
+            uint32_t a = c->r[4] + 4 * k;
+            if (a <= 0xFFFFFFFCu) h = mixw(h, a, a + 4);
+        }
+    }
+    g_seen2 = h;
+}
+#define NT_KEEP(c) (g_ecx = (c)->r[1], g_edx = (c)->r[2], g_xmm = mix(0xCBF29CE484222325ull, (c)->xmm, sizeof (c)->xmm))
+#endif
 static void stub_call(CPU *c) {
     if (g_trace) dump("callee sees", c);
     g_seen = mix(g_seen, c, offsetof(CPU, thread));
+#ifdef NATIVE_TEST
+    nt_callee_memory(c);
+#endif
     c->r[4] += 4;                                   /* ret */
     c->r[0] = (uint32_t)(g_seen >> 7);              /* eax, and edx/ecx are the callee's to clobber */
     c->r[2] = (uint32_t)(g_seen >> 23);
@@ -70,8 +104,6 @@ jmp_buf *rt_setjmp_slot(CPU *c, uint32_t g) { static jmp_buf jb; (void)c; (void)
 void rt_setjmp3(CPU *c) { stub_call(c); }
 static void on_signal(int sig) { g_why = sig == SIGALRM ? "timeout" : "fault"; siglongjmp(g_jb, 1); }
 #include "body.c"
-#define SCR 0x10000000u
-#define SCR_SIZE 0x20000u
 static uint64_t g_rng;
 static uint32_t rnd(void) { g_rng = g_rng * 6364136223846793005ull + 1442695040888963407ull; return (uint32_t)(g_rng >> 33); }
 static double rnd_double(void) {
@@ -87,6 +119,7 @@ int main(int argc, char **argv) {
     int runs = atoi(argv[2]);
     uint32_t only = argc > 4 ? (uint32_t)strtoul(argv[3], NULL, 16) : 0;  /* trace one function's one run */
     int only_run = argc > 4 ? atoi(argv[4]) : -1;
+    uint32_t pick = argc == 4 ? (uint32_t)strtoul(argv[3], NULL, 16) : 0;  /* run one function only */
     MEM = mmap(NULL, 1ull << 32, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
     FILE *f = fopen(argv[1], "rb");                 /* the module's bytes, where the lifter read them */
     uint32_t base; fread(&base, 4, 1, f); size_t n = fread(MEM + base, 1, 64u << 20, f); (void)n; fclose(f);
@@ -94,6 +127,7 @@ int main(int argc, char **argv) {
     for (unsigned t = 0; t < sizeof g_tests / sizeof *g_tests; t++) {
         /* one process per function: guest memory outside the scratch area (the module's own data) starts the
          * same for every function, whatever earlier ones wrote or wherever a timeout stopped them */
+        if (pick && g_addrs[t] != pick) continue;
         fflush(stdout);
         pid_t child = fork();
         if (child) { int status; waitpid(child, &status, 0); continue; }
@@ -101,6 +135,9 @@ int main(int argc, char **argv) {
             if (only && (g_addrs[t] != only || r != only_run)) continue;
             g_trace = only != 0;
             g_rng = 0x9E3779B97F4A7C15ull * (t + 1) + (uint64_t)r * 7919; g_seen = 0xCBF29CE484222325ull; g_why = NULL;
+#ifdef NATIVE_TEST
+            g_seen2 = g_seen; g_abi_esp = g_abi_args = g_ecx = g_edx = 0; g_xmm = 0; nt_stubbed = 1;
+#endif
             for (uint32_t o = 0; o < SCR_SIZE; o += 4) {  /* floats and pointers back into the scratch area */
                 uint32_t v = rnd(), k = v % 4;
                 if (k == 0) { float x = (float)rnd_double(); memcpy(&v, &x, 4); if (rnd() % 24 == 0) v = 0x7FC00000u; }
@@ -124,9 +161,14 @@ int main(int argc, char **argv) {
             g_tests[t](&c);
             setitimer(ITIMER_REAL, &off, NULL);
             if (g_trace) { dump("returns", &c); printf("\n"); }
-            printf("cpu %016llx mem %016llx callees %016llx\n",
+            printf("cpu %016llx mem %016llx callees %016llx",
                    (unsigned long long)mix(0xCBF29CE484222325ull, &c, offsetof(CPU, thread)),
                    (unsigned long long)mix(0xCBF29CE484222325ull, MEM + SCR, SCR_SIZE), (unsigned long long)g_seen);
+#ifdef NATIVE_TEST
+            printf(" | ecx %08x edx %08x xmm %016llx callees %016llx", g_ecx, g_edx, (unsigned long long)g_xmm,
+                   (unsigned long long)g_seen2);
+#endif
+            printf("\n");
         }
         fflush(stdout);
         _exit(0);
@@ -136,24 +178,26 @@ int main(int argc, char **argv) {
 '''
 
 
-def lift_one(fa, blocks, all_funcs, cache):
+def lift_one(fa, blocks, all_funcs, cache, stub="stub_call(c)"):
+    """The lifted function as a test, static void t_<addr>; its direct calls become stub (a re.sub replacement)."""
     lift.X87CACHE = cache
     lines = lift.Lifter(fa, blocks, all_funcs).emit()
     head, body = lines[0], lines[1:]
     head = re.sub(r"^void f_[0-9A-F]+(_guest)?\(", "static void t_%X(" % fa, head)
-    return [head] + [CALL.sub("stub_call(c)", l) for l in body]
+    return [head] + [CALL.sub(stub, l) for l in body]
 
 
-def build(name, picked, variants, rt):
+def build(name, picked, variants, rt, cc=("cc",), flags=(), head="", tail=""):
+    """Builds WORK/<name>/harness from the tests in variants; head and tail go before and after them in body.c."""
     work = os.path.join(WORK, name)
     os.makedirs(work, exist_ok=True)
-    text = "".join("\n".join(variants[fa]) + "\n\n" for fa in picked)
+    text = head + "".join("\n".join(variants[fa]) + "\n\n" for fa in picked) + tail
     text += "typedef void (*TF)(CPU *);\nstatic TF g_tests[] = {%s};\n" % ", ".join("t_%X" % fa for fa in picked)
     text += "static uint32_t g_addrs[] = {%s};\n" % ", ".join("0x%Xu" % fa for fa in picked)
     open(os.path.join(work, "body.c"), "w").write(text)
     open(os.path.join(work, "harness.c"), "w").write(HARNESS)
     exe = os.path.join(work, "harness")
-    subprocess.check_call(["cc", "-O2", "-w", "-fno-strict-aliasing", "-fwrapv", "-fsigned-char", "-I", rt,
+    subprocess.check_call([*cc, "-O2", "-w", "-fno-strict-aliasing", "-fwrapv", "-fsigned-char", *flags, "-I", rt,
                            "-I", work, "-o", exe, os.path.join(work, "harness.c"), os.path.join(rt, "fpu.c"), "-lm"])
     return exe
 
