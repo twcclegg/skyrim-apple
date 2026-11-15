@@ -597,7 +597,15 @@ static void gpu_mark(int cls) {
     if (g.pending) return;  // the ring is full of unread frames: this one goes unmeasured
     if (g.marks >= GPU_MARKS) return;
     IDirect3DQuery9 *&q = g.q[g.marks];
-    if (!q && FAILED(g_pass_dev->CreateQuery(D3DQUERYTYPE_TIMESTAMP, &q))) { q = nullptr; return; }
+    if (!q) {
+        const HRESULT hr = g_pass_dev->CreateQuery(D3DQUERYTYPE_TIMESTAMP, &q);
+        if (FAILED(hr) || !q) {  // no timestamps after all: stop, rather than try again at every draw
+            LOG("LB_PASSES_GPU: CreateQuery(TIMESTAMP) failed (%08x); GPU time per class off", (uint32_t)hr);
+            q = nullptr;
+            g_passes_gpu = 0;
+            return;
+        }
+    }
     q->Issue(D3DISSUE_END);
     g.cls[g.marks++] = (int8_t)cls;
 }
