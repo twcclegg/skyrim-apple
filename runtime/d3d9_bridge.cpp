@@ -617,11 +617,13 @@ extern "C" void skyrim_display_tick(void) {
 }
 
 // Refreshes per game frame when pacing on display ticks, else 0 (no recent ticks, or no whole-number ratio).
+// N refreshes may be up to 15% longer than the interval asked for (a lower frame rate), but not shorter beyond
+// clock noise, so LB_MAX_FPS stays a maximum: 45 at 96 Hz stays on the timer instead of running at 48.
 static int ticks_per_frame(int64_t interval_ns, int64_t now) {
     if (!g_tick_period_ns || now - g_tick_ns > 100000000) return 0;
     const double ratio = (double)interval_ns / (double)g_tick_period_ns;
     const long n = std::lround(ratio);
-    return n >= 1 && std::fabs(ratio - (double)n) < 0.15 ? (int)n : 0;
+    return n >= 1 && ratio - (double)n < 0.02 * (double)n && (double)n - ratio < 0.15 ? (int)n : 0;
 }
 
 static void pace_present(void) {
