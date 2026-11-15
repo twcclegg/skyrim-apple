@@ -551,18 +551,21 @@ static bool shot_frame_wanted(int frame) {
 }
 
 // LB_STEREO_ALTERNATE with LB_STEREO_EYE_UNITS set (Apple only): the stereo section below then names LB_SHOT's
-// files by eye, so the plain shot is skipped.
+// files by eye, so the plain shot is skipped. Read once.
 static bool stereo_alternate_env(void) {
 #if defined(__APPLE__)
-    const char *a = getenv("LB_STEREO_ALTERNATE"), *d = getenv("LB_STEREO_EYE_UNITS");
-    return a && atoi(a) != 0 && d && atof(d) != 0;
+    static const bool on = [] {
+        const char *a = getenv("LB_STEREO_ALTERNATE"), *d = getenv("LB_STEREO_EYE_UNITS");
+        return a && atoi(a) != 0 && d && atof(d) != 0;
+    }();
+    return on;
 #else
     return false;
 #endif
 }
 
 static void shot_before_present(IDirect3DDevice9 *d) {
-    if (stereo_alternate_env() || !shot_frame_wanted(g_frame)) return;
+    if (!shot_frame_wanted(g_frame) || stereo_alternate_env()) return;
     char tag[32];
     snprintf(tag, sizeof tag, "%05d", g_frame);
     shot_write(d, tag, true);
