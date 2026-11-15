@@ -7,7 +7,6 @@
 # MoltenVK package root (the directory that holds include/ and dynamic/), first match wins:
 #   $SKYRIM_MOLTENVK_ROOT
 #   <repo>/macos/deps/MoltenVK/MoltenVK
-#   <repo>/../skyrim-apple-m5/macos/deps/MoltenVK/MoltenVK   (a worktree next to the main checkout)
 set -eu
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -17,8 +16,6 @@ if [ -n "${SKYRIM_MOLTENVK_ROOT:-}" ]; then
     MVK="$SKYRIM_MOLTENVK_ROOT"
 elif [ -f "$REPO/macos/deps/MoltenVK/MoltenVK/include/vulkan/vulkan.h" ]; then
     MVK="$REPO/macos/deps/MoltenVK/MoltenVK"
-elif [ -f "$REPO/../skyrim-apple-m5/macos/deps/MoltenVK/MoltenVK/include/vulkan/vulkan.h" ]; then
-    MVK="$(cd "$REPO/../skyrim-apple-m5/macos/deps/MoltenVK/MoltenVK" && pwd)"
 else
     echo "MoltenVK package not found; set SKYRIM_MOLTENVK_ROOT to the directory holding include/ and dynamic/" >&2
     exit 1
