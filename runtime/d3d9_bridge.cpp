@@ -1335,8 +1335,15 @@ static void stereo_after_present(void) {
     // The first-person flag is off between frames (passes_present), so a first-person-only frame starts unshifted.
     dxvk_stereo_set_clip_shift(st.fp_only && fp_kind() == FP_NONE ? 0.0f : k);
     if (st.hold) {
-        if (slot && !st.holding) {
-            st.hold_t0 = rt_game_ns();
+        if (slot && (index == 0 || !st.holding)) {
+            // Each group holds its own moment: real time at its start, read from the clock rt_game_ns gives when not
+            // held (kernel32.c now_ns), since rt_game_ns is the held clock between back-to-back groups (an A-B range
+            // steps by the group's length by default). Those jump forward to the next group's moment, as the clock
+            // does when let go between groups, rather than going back to the first group's.
+            struct timespec ts;
+            clock_gettime(CLOCK_MONOTONIC, &ts);
+            st.hold_t0 = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+            g_fake_clock_ns = st.hold_t0;  // before the switch, so no thread reads a stale held value (or 0)
             st.holding = true;
             g_fake_clock_on = 1;
         } else if (!slot && st.holding) {
