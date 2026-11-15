@@ -399,6 +399,7 @@ environment of `macos/run.sh`; in the Simulator, pass them with
 | `LB_MOUSE_CAPTURE=0` | macOS: leave the pointer free, for automated and CUA runs |
 | `LB_ANY_PAD=1` | Development: admit controllers other than a DualSense as XInput pads |
 | `LB_MAX_FPS=N` | Apple present pacing: at most `N` fps, default 60; `0` disables it |
+| `LB_INI=Section:key=value;...` | Values the game reads instead of those in its INI files, for this run only (the files are not changed); each is logged as `ini: LB_INI sets ...` when the game first reads it |
 | `DXVK_FORCE_BASE_VERTEX_FOLD=1` | macOS: force the Simulator's base-vertex fold, so tests can compare it with native drawing |
 
 ## Apple-specific fixes

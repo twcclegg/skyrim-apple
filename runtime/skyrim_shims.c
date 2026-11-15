@@ -123,6 +123,7 @@ static const char *ini_override(const char *sec, const char *key) {
         g_ini_nover = 0;
         const char *e = getenv("LB_INI");
         while (e && *e && g_ini_nover < INI_OVERRIDES) {
+            while (*e == ' ') e++;  /* "a:b=1; c:d=2" */
             const char *end = strchr(e, ';'), *colon = strchr(e, ':'), *eq = strchr(e, '=');
             if (!end) end = e + strlen(e);
             if (colon && eq && colon < eq && eq < end) {
