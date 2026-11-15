@@ -151,7 +151,11 @@ def gen():
             o.append("static void %s(CPU *c) {" % fn)
             o.append("    %s *self = (%s *)com_host(ARG(0));" % (iface, iface))
             o.append("    if (g_d3d_trace) d3d_trace(c, \"%s::%s\", %d);" % (iface, name, len(args)))
+            if iface == "IDirect3DDevice9" and name == "SetTransform":
+                # first-person depth: the projection's near plane (d3d_fp_projection)
+                o.append("    if (g_d3d_fp && ARG(1) == D3DTS_PROJECTION && ARG(2)) d3d_fp_projection((const float *)GPTR(ARG(2)));")
             if name.startswith("Draw") and not name.endswith("Patch"):
+                o.append("    if (g_d3d_fp) d3d_fp_draw();")
                 o.append("    if (g_bisect && d3d_skip_draw()) { RET(0, %d); return; }" % (len(args) + 1))
             call = []
             post = []

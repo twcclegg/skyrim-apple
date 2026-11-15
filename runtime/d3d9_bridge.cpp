@@ -23,6 +23,7 @@ bool bc_surface_target(void *surf, void **tex, uint32_t *sub);
 #include <unordered_map>
 #include <vector>
 #include <map>
+#include <algorithm>
 
 // ---------------------------------------------------------------- registry
 namespace {
@@ -358,6 +359,8 @@ void B_IDirect3D9_GetAdapterDisplayMode(CPU *c) {
     RET(0, 3);
 }
 
+static void fp_init(IDirect3DDevice9 *d);  // first-person depth, below
+
 void B_IDirect3D9_CreateDevice(CPU *c) {
     auto *d3d = (IDirect3D9 *)com_host(ARG(0));
     D3DPRESENT_PARAMETERS pp;
@@ -373,6 +376,7 @@ void B_IDirect3D9_CreateDevice(CPU *c) {
     pp_to_guest(&pp, ARG(5));
     if (SUCCEEDED(hr)) { g_bb_w = pp.BackBufferWidth; g_bb_h = pp.BackBufferHeight; }
     if (SUCCEEDED(hr)) { extern void hud_screen_device(IDirect3DDevice9 *); hud_screen_device(dev); }
+    if (SUCCEEDED(hr)) fp_init(dev);
     if (ARG(6)) M32(ARG(6)) = SUCCEEDED(hr) ? d3d9_wrap(dev, IFACE_IDirect3DDevice9) : 0;
     LOG("CreateDevice -> %08x", (uint32_t)hr);
     RET(hr, 7);
@@ -412,6 +416,7 @@ void B_IDirect3DDevice9_Reset(CPU *c) {
     rt_host_affinity_end();
     pp_to_guest(&pp, ARG(1));
     if (SUCCEEDED(hr)) { g_bb_w = pp.BackBufferWidth; g_bb_h = pp.BackBufferHeight; }
+    if (SUCCEEDED(hr) && g_d3d_fp) d3d_fp_target(d);  // Reset binds the back buffer again
     LOG("Reset %ux%u -> %08x", pp.BackBufferWidth, pp.BackBufferHeight, (uint32_t)hr);
     RET(hr, 2);
 }
@@ -465,6 +470,328 @@ static void bisect_present(void) {
     }
     g_draw_no = 0;
     g_bisect = g_frame >= g_bisect_from && g_frame < g_bisect_from + 160;
+}
+
+// ---------------------------------------------------------------- first-person depth
+/* First-person draws (twcclegg/skyrim-apple#23): the arms, the weapon and the spell hand are drawn with the game's
+ * first-person camera, whose projection has its own near plane (5; the world's is 15). Traced in Riverwood (TESV
+ * 1.9.32.0.8, low preset, 1280x720) with empty hands, a sword, and a sword plus Flames, a frame draws them three
+ * times, each after a SetTransform(D3DTS_PROJECTION) with that near plane: into the 960x540 pass (depth, then red
+ * only), as a depth-only prepass first in the main pass, and in a late pass after the world's effects, still before
+ * tone mapping:
+ *   Clear(ZBUFFER only, z 1)  on the scene target (A16B16G16R16F); its colour (the world) stays
+ *   the lit meshes, then the hand's effect (Flames: a few additive draws and one into an A8R8G8B8 target)
+ *   Clear(ZBUFFER only)       on the scene's R32F depth target, which keeps the world's depth (not cleared)
+ *   the opaque meshes again (five draws with a sword), writing their depth over the world's: the FP_DEPTH draws
+ * then the world's projection again and the post chain.
+ * Only the FP_DEPTH draws matter here. The detector is on during the late pass (from its Clear of depth only into
+ * a back-buffer-sized target, once the main pass has drawn, until a projection with another near plane or a target
+ * that is not back-buffer-sized) and whenever the projection set last has the near plane learnt from a late pass and
+ * not the world camera's. The late pass is confirmed, and the first-person near plane learnt, by the first projection
+ * after its Clear: a near plane other than the world's (the loading screen's model has a Clear of depth only but the
+ * world's near plane, and is left out). Third person has no such Clear and no such projection. The hooks run on the
+ * thread making the device calls, between draws; they are on unless LB_FP_DEPTH_SCALE=0. */
+int g_d3d_fp;
+struct FpTarget { void *rt; uint32_t w, h, fmt; bool ds, bb; };  // render target 0 now (rt: identity only)
+struct FpFrame {
+    bool seen_main, seen_depth;  // a draw into the main scene target / the R32F depth target happened this frame
+    bool late;                   // in the late pass: after its Clear of depth only, until its projection ends
+    bool late_confirmed;         // ... and its projection was seen to be the first-person one
+    bool proj;                   // the projection set last is the first-person one
+    bool fp;                     // late || proj, and a target that allows it
+};
+static FpTarget g_fp_target;
+static FpFrame g_fp_frame;
+static IDirect3DDevice9 *g_fp_device;  // the device the hooks last saw
+static float g_fp_near;                // the first-person near plane, learnt from a late pass (0: not yet)
+static float g_proj_p33;               // _33 of the projection set last (0: not perspective)
+static float g_world_p33;              // _33 of the last projection with the world camera's near plane (0: none yet)
+static bool g_fp_depth_scale;          // LB_FP_DEPTH_SCALE: on unless 0
+static std::vector<int> g_fp_depth_scale_off;  // LB_FP_DEPTH_SCALE=off@F,...: frames drawn without it
+static void fp_depth_scale_draw(void);
+static void fp_depth_scale_restore(void);
+
+// The draw being made is a first-person one into the scene's R32F depth target (FP_DEPTH).
+static bool fp_depth_draw_now(void) {
+    const FpTarget &t = g_fp_target;
+    return g_fp_frame.fp && t.w == g_bb_w && t.h == g_bb_h && t.fmt == D3DFMT_R32F;
+}
+static void fp_update(void) {
+    FpFrame &f = g_fp_frame;
+    const FpTarget &t = g_fp_target;
+    f.fp = (f.late || f.proj) && t.rt && !t.bb && !hud_screen_in_pass();
+    // FP_DEPTH draws over (whichever call ended them, the target already being the new one): the game's shader back
+    if (!fp_depth_draw_now()) fp_depth_scale_restore();
+}
+
+// Every Draw*Primitive*, before the draw.
+void d3d_fp_draw(void) {
+    const FpTarget &t = g_fp_target;
+    FpFrame &f = g_fp_frame;
+    if (hud_screen_in_pass() || t.bb) return;
+    const bool bb_size = g_bb_w && t.w == g_bb_w && t.h == g_bb_h;
+    if (bb_size && t.fmt == D3DFMT_R32F) f.seen_depth = true;
+    else if (bb_size && t.fmt == D3DFMT_A16B16G16R16F && t.ds && !f.seen_depth) f.seen_main = true;
+    if (g_fp_depth_scale && fp_depth_draw_now()) fp_depth_scale_draw();
+}
+
+// After render target 0 or the depth-stencil surface changed (also after CreateDevice, Reset, the HUD screen pass).
+void d3d_fp_target(IDirect3DDevice9 *d) {
+    g_fp_device = d;
+    IDirect3DSurface9 *rt = nullptr, *ds = nullptr, *bb = nullptr;
+    D3DSURFACE_DESC desc = {};
+    d->GetRenderTarget(0, &rt);
+    d->GetDepthStencilSurface(&ds);
+    d->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb);
+    if (rt) rt->GetDesc(&desc);
+    g_fp_target = {rt, desc.Width, desc.Height, (uint32_t)desc.Format, ds != nullptr, rt && rt == bb};
+    const FpTarget &t = g_fp_target;
+    // the late pass goes on into other back-buffer-sized targets, and ends at any other
+    if (g_fp_frame.late && (!rt || t.bb || t.w != g_bb_w || t.h != g_bb_h)) g_fp_frame.late = false;
+    fp_update();
+    if (rt) rt->Release();
+    if (ds) ds->Release();
+    if (bb) bb->Release();
+}
+
+// Before a Clear: one of depth without colour into a back-buffer-sized target, once the main pass has drawn, may
+// start the late pass. Its projection confirms it (d3d_fp_projection).
+void d3d_fp_clear(uint32_t flags) {
+    if (!(flags & D3DCLEAR_ZBUFFER) || (flags & D3DCLEAR_TARGET)) return;
+    const FpTarget &t = g_fp_target;
+    FpFrame &f = g_fp_frame;
+    if (!t.rt || t.bb || !g_bb_w || t.w != g_bb_w || t.h != g_bb_h || !f.seen_main || f.late) return;
+    f.late = true;
+    f.late_confirmed = false;
+    fp_update();
+}
+
+// The world camera's near plane (NiCamera W, see game_camera_read below), or 0.
+static float world_near(void) {
+    uint32_t root = M32(0x1B2E8BC), w = root >= 0x10000 ? M32(root + 0xB8) : 0;
+    float v = 0;
+    if (w >= 0x10000) memcpy(&v, MEM + w + 0xF8, 4);
+    return v;
+}
+
+// SetTransform(D3DTS_PROJECTION), m the guest's row-major matrix (row vectors): perspective has _34 = 1, and its near
+// plane is -_43 / _33. In the late pass the first projection confirms the pass (a near plane other than the world's)
+// and teaches the first-person near plane; a later one with another near plane ends it. Outside it, the projection
+// is a first-person one when its near plane is the one learnt.
+void d3d_fp_projection(const float *m) {
+    FpFrame &f = g_fp_frame;
+    const float near_plane = m[11] == 1.0f && m[10] != 0.0f ? -m[14] / m[10] : 0.0f;  // 0: not perspective
+    const float world = world_near();
+    auto same = [](float a, float b) { return a > 0 && b > 0 && fabsf(a - b) <= 1e-3f * b; };
+    g_proj_p33 = near_plane > 0 ? m[10] : 0.0f;
+    if (same(near_plane, world)) g_world_p33 = m[10];
+    if (f.late && !f.late_confirmed) {
+        if (near_plane <= 0 || same(near_plane, world)) {
+            f.late = false;  // not the first-person camera (the loading screen's model has the world's)
+        } else {
+            f.late_confirmed = true;
+            if (!same(near_plane, g_fp_near)) {
+                LOG("first-person near plane %g (world %g)", near_plane, world);
+                g_fp_near = near_plane;
+            }
+        }
+    } else if (f.late && !same(near_plane, g_fp_near)) {
+        f.late = false;
+    }
+    f.proj = same(near_plane, g_fp_near) && !same(near_plane, world);
+    fp_update();
+}
+
+/* First-person depth in the world's encoding. The scene's R32F depth target holds what the game's depth pixel
+ * shaders write: clip z / clip w through the projection in use, d = P33 (1 - near / z) with P33 = far / (far - near)
+ * (~1.00001). The world's draws use the world camera's near plane (15), the FP_DEPTH draws the first-person camera's
+ * (5), so a consumer decoding with one near plane (the immersive compositor, ImmersiveScreen.swift, and the offline
+ * tools) puts hands and weapons three times too far. The fix rewrites the value as it is written: for those draws
+ * only, the pixel shader bound is swapped for a copy of itself whose colour output x is passed through
+ *     d' = A d + B,   A = r P33w / P33fp,   B = P33w (1 - r),   r = world near / first-person near
+ * which is exactly P33w (1 - near_world / z): the world's encoding of the same view depth z. Both near planes and
+ * P33 come from the projections the game sets (d3d_fp_projection), never fixed numbers. d' < 0 for z below the
+ * world's near plane (down to 1 - r at the first-person near plane); R32F keeps it and decoders give
+ * z = near_world / (1 - d') as for every other pixel.
+ *
+ * Only the colour output changes: the vertex shader, clip z/w and so the z-buffer, the depth test between the
+ * first-person meshes and clipping stay exactly as the game drew them. Seen in Riverwood and Whiterun (iron sword,
+ * Flames, empty hands): the depth draws' pixel shaders are 7-instruction ps_3_0 programs, `rcp r0.x, v0.y;
+ * mul oC0.x, r0.x, v0.x; mov oC0.yzw, 1` with an alpha-tested variant (texld, texkill); the same shaders draw the
+ * prepass and the shadow-mask pass, which are left alone. The copy is made once per (shader, A, B) by rewriting the
+ * bytecode (fp_depth_patch): every write to oC0 goes to a free temporary, and the end gets `mov oC0.yzw, rT` and
+ * `mad oC0.x, rT.x, cK.x, cK.y` with A and B in a `def` of a free constant, so no shader constant the game sets is
+ * touched. A shader the rewrite does not understand is left as it is (logged once). The game shadows its own shader
+ * state (it skips SetPixelShader for the shader it thinks is bound), so the original is bound again as soon as the
+ * draws stop being FP_DEPTH (fp_update), before any other draw. The game's only later reader of the target, the
+ * depth-of-field composite, blurs nothing as close as the hands in either encoding.
+ *
+ * Cost: the hooks run on every draw, target change, Clear and projection (a few compares each); the swap is one
+ * GetPixelShader, a search of a few cached shaders and one SetPixelShader per FP_DEPTH draw (five a frame), and one
+ * SetPixelShader to put the original back. On by default: every consumer of the depth target then sees one
+ * encoding. LB_FP_DEPTH_SCALE=0 turns it off (and the hooks with it); LB_FP_DEPTH_SCALE=off@F[,F...] turns it off
+ * only on frames F (numbered as LB_SHOT numbers them), to compare the picture with and without it in one run. */
+struct FpDepthPatched {
+    IDirect3DPixelShader9 *original;  // held, so its address is not reused while it keys the cache
+    IDirect3DPixelShader9 *patched;   // null: the rewrite failed, draw with the original
+    float a, b;
+};
+static std::vector<FpDepthPatched> g_fp_depth_cache;
+static IDirect3DPixelShader9 *g_fp_depth_bound_original, *g_fp_depth_bound_patched;  // the swap in force
+
+static void fp_depth_scale_forget(void) {
+    for (FpDepthPatched &p : g_fp_depth_cache) {
+        if (p.original) p.original->Release();
+        if (p.patched) p.patched->Release();
+    }
+    g_fp_depth_cache.clear();
+    g_fp_depth_bound_original = g_fp_depth_bound_patched = nullptr;
+}
+
+/* A copy of the ps_2_0+ bytecode `in` (DWORD tokens up to and including the end token) whose colour output 0's x
+ * component is a * x + b. Empty if the shader is not one this can rewrite safely: shader model 1, no write to oC0,
+ * relative addressing of constants, or no free temporary or constant register. */
+static std::vector<uint32_t> fp_depth_patch(const uint32_t *in, size_t count, float a, float b) {
+    std::vector<uint32_t> none;
+    if (count < 2 || (in[0] >> 16) != 0xFFFF || ((in[0] >> 8) & 0xFF) < 2) return none;
+    auto reg_type = [](uint32_t t) { return ((t >> 28) & 7) | ((t >> 8) & 0x18); };
+    enum { D3DSPR_TEMP_ = 0, D3DSPR_CONST_ = 2, D3DSPR_COLOROUT_ = 8 };
+    const uint32_t op_dcl = 31, op_def = 81, op_defi = 48, op_defb = 47;
+    int max_temp = -1, max_const = -1;
+    uint32_t written = 0;  // write mask union of the oC0 writes
+    size_t end = 0, first_code = 0;
+    std::vector<size_t> oc0_dst;  // token indices of oC0 destinations
+    for (size_t i = 1; i < count;) {
+        const uint32_t tok = in[i], op = tok & 0xFFFF;
+        if (tok == 0x0000FFFF) { end = i; break; }
+        if (op == 0xFFFE) { i += 1 + ((tok >> 16) & 0x7FFF); continue; }  // comment (CTAB...)
+        if (!first_code) first_code = i;
+        const size_t len = (tok >> 24) & 0xF;
+        if (i + 1 + len > count) return none;
+        const uint32_t *arg = in + i + 1;
+        if (op == op_def || op == op_defi || op == op_defb) {
+            if (len && reg_type(arg[0]) == D3DSPR_CONST_ && op == op_def) max_const = std::max(max_const, (int)(arg[0] & 0x7FF));
+        } else if (op == op_dcl) {
+            // usage token, then the declared register (inputs, samplers): nothing to track
+        } else {
+            for (size_t j = 0; j < len; j++) {
+                const uint32_t t = arg[j], type = reg_type(t), num = t & 0x7FF;
+                if (type == D3DSPR_TEMP_) max_temp = std::max(max_temp, (int)num);
+                if (type == D3DSPR_CONST_) {
+                    max_const = std::max(max_const, (int)num);
+                    if (t & (1u << 13)) return none;  // c[a0 + n]: which constants are free is unknown
+                }
+                if (j == 0 && type == D3DSPR_COLOROUT_ && num == 0) {
+                    oc0_dst.push_back(i + 1);
+                    written |= (t >> 16) & 0xF;
+                }
+            }
+        }
+        i += 1 + len;
+    }
+    if (!end || oc0_dst.empty() || !(written & 1) || !first_code) return none;
+    const uint32_t temp = (uint32_t)(max_temp + 1), konst = (uint32_t)(max_const + 1);
+    if (temp >= 12 || konst >= 32) return none;  // stay within every ps_2_0+ limit
+    std::vector<uint32_t> out(in, in + end);
+    for (size_t at : oc0_dst) out[at] = (out[at] & ~(0x7u << 28) & ~(0x3u << 11) & ~0x7FFu) | temp;  // -> rT
+    const uint32_t param = 0x80000000u, oc0 = param | (1u << 11), rt = param | temp, c = param | (2u << 28) | konst;
+    uint32_t fa, fb, zero = 0;
+    memcpy(&fa, &a, 4);
+    memcpy(&fb, &b, 4);
+    const uint32_t def[] = {op_def | (5u << 24), c | (0xFu << 16), fa, fb, zero, zero};
+    out.insert(out.begin() + first_code, def, def + 6);
+    if (written & 0xE) {  // mov oC0.(written but x), rT
+        const uint32_t mov[] = {1u | (2u << 24), oc0 | ((written & 0xE) << 16), rt | (0xE4u << 16)};
+        out.insert(out.end(), mov, mov + 3);
+    }
+    // mad oC0.x, rT.x, cK.x, cK.y
+    const uint32_t mad[] = {4u | (4u << 24), oc0 | (1u << 16), rt | (0x00u << 16), c | (0x00u << 16), c | (0x55u << 16)};
+    out.insert(out.end(), mad, mad + 5);
+    out.push_back(0x0000FFFF);
+    return out;
+}
+
+// Before an FP_DEPTH draw: bind the rewritten copy of the game's pixel shader (fp_depth_patch).
+static void fp_depth_scale_draw(void) {
+    IDirect3DDevice9 *d = g_fp_device;
+    const float world = world_near();
+    if (!d || !g_fp_frame.proj || g_fp_near <= 0 || world <= g_fp_near * 1.0001f || g_proj_p33 <= 0) return;
+    if (!g_fp_depth_scale_off.empty() &&
+        std::find(g_fp_depth_scale_off.begin(), g_fp_depth_scale_off.end(), g_frame + 1) != g_fp_depth_scale_off.end())
+        return;
+    const float r = world / g_fp_near, p33w = g_world_p33 > 0 ? g_world_p33 : g_proj_p33;
+    const float a = r * p33w / g_proj_p33, b = p33w * (1.0f - r);
+    IDirect3DPixelShader9 *ps = nullptr;
+    if (FAILED(d->GetPixelShader(&ps)) || !ps) return;
+    ps->Release();  // the device still holds it; the cache takes its own reference
+    if (ps == g_fp_depth_bound_patched) return;  // still bound from the previous draw (the game skipped a set)
+    FpDepthPatched *hit = nullptr;
+    for (FpDepthPatched &p : g_fp_depth_cache)
+        if (p.original == ps && p.a == a && p.b == b) { hit = &p; break; }
+    if (!hit) {
+        FpDepthPatched p = {ps, nullptr, a, b};
+        ps->AddRef();
+        UINT size = 0;
+        std::vector<uint32_t> code;
+        if (SUCCEEDED(ps->GetFunction(nullptr, &size)) && size >= 8) {
+            code.resize(size / 4);
+            if (FAILED(ps->GetFunction(code.data(), &size))) code.clear();
+        }
+        const std::vector<uint32_t> patched = code.empty() ? code : fp_depth_patch(code.data(), code.size(), a, b);
+        if (patched.empty() || FAILED(d->CreatePixelShader((const DWORD *)patched.data(), &p.patched))) p.patched = nullptr;
+        LOG("first-person depth: pixel shader %p (%u bytes) %s, d' = %.6g d %+.6g (near %g -> %g)", (void *)ps, size,
+            p.patched ? "rewritten" : "NOT rewritten, its depth stays in the first-person encoding", a, b, g_fp_near,
+            world);
+        if (g_fp_depth_cache.size() > 256) fp_depth_scale_forget();  // near planes changing all the time: start over
+        g_fp_depth_cache.push_back(p);
+        hit = &g_fp_depth_cache.back();
+    }
+    if (!hit->patched) return;
+    d->SetPixelShader(hit->patched);
+    g_fp_depth_bound_original = ps;
+    g_fp_depth_bound_patched = hit->patched;
+}
+
+// The FP_DEPTH draws are over: give the game back the pixel shader it thinks is bound.
+static void fp_depth_scale_restore(void) {
+    if (!g_fp_depth_bound_patched) return;
+    IDirect3DDevice9 *d = g_fp_device;
+    IDirect3DPixelShader9 *ps = nullptr;
+    if (d && SUCCEEDED(d->GetPixelShader(&ps)) && ps) {
+        if (ps == g_fp_depth_bound_patched) d->SetPixelShader(g_fp_depth_bound_original);
+        ps->Release();
+    }
+    g_fp_depth_bound_original = g_fp_depth_bound_patched = nullptr;
+}
+
+// After CreateDevice: reads the switch once and learns the targets the device starts with.
+static void fp_init(IDirect3DDevice9 *d) {
+    static bool read;
+    if (!read) {
+        read = true;
+        const char *e = getenv("LB_FP_DEPTH_SCALE");
+        g_fp_depth_scale = !e || strcmp(e, "0") != 0;
+        if (e && !strncmp(e, "off@", 4))
+            for (const char *p = e + 4; p && *p;) {
+                g_fp_depth_scale_off.push_back(atoi(p));
+                p = strchr(p, ',');
+                if (p) p++;
+            }
+        g_d3d_fp = g_fp_depth_scale;
+        LOG("first-person depth in the world's encoding: %s%s", g_fp_depth_scale ? "on" : "off (LB_FP_DEPTH_SCALE=0)",
+            g_fp_depth_scale_off.empty() ? "" : " (off on the LB_FP_DEPTH_SCALE=off@ frames)");
+    }
+    fp_depth_scale_forget();  // a new device: shaders made for the old one are gone
+    if (!g_d3d_fp) return;
+    d3d_fp_target(d);
+}
+
+// At Present: a new frame.
+static void fp_present(void) {
+    if (!g_d3d_fp) return;
+    g_fp_frame.late = g_fp_frame.proj = false;
+    fp_update();
+    g_fp_frame = FpFrame();
 }
 
 // LB_SHOT=F[,F...]: write the backbuffer about to be presented on those
@@ -682,6 +1009,7 @@ void B_IDirect3DDevice9_Present(CPU *c) {
     touch_draw(d);
     { extern void hud_screen_present(IDirect3DDevice9 *); hud_screen_present(d); }
     shot_before_present(d);
+    fp_present();
     RECT vr = view_rect();
     const RECT *dst = ARG(2) ? (const RECT *)GPTR(ARG(2)) : (vr.left || vr.top) ? &vr : nullptr;
 #if defined(__APPLE__)
