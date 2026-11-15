@@ -387,3 +387,56 @@ offline before any compositor work.
   game's own sun-shadow mask. The flame's light on the world is in W (it is a light, not a first-person draw).
   The real layer (chunk 1.3) is drawn before tone mapping into its own target and has none of this unless the post
   chain runs for it. Its alpha also has to come from the pass itself, not from a depth difference.
+
+## 2026-11-14 — first-person depth in the world's encoding (M5, 1280×720; twcclegg/skyrim-apple#23)
+
+Reprojection put hands and weapons three times too far (above): the R32F scene-depth target holds d = P33 (1 − near/z)
+through whichever projection drew the pixel, and the late pass's five first-person depth draws use near 5, the world
+near 15. Fixed where the value is written, so every consumer (immersive compositor, stereo and VR180 tools, the
+hybrid) sees one encoding and the compositor is unchanged.
+
+- **The shaders** (`LB_D3DTRACE` + shader dumps of the FP_DEPTH draws, Riverwood): vertex shaders `WorldViewProj`
+  (c0–c3, or c180–c183 after 180 bone constants) with `mov o0.zw, r1` and `mov o1.xy, r1.zwzw`; pixel shaders
+  `rcp r0.x, v0.y; mul oC0.x, r0.x, v0.x` (plus an alpha-tested texld/texkill variant). The R32F value and the
+  z-buffer are the same clip z/w, so patching the projection constants would move the z-buffer too and clip
+  anything nearer than 15 units. The same shaders draw the prepass and the shadow mask.
+- **The fix** (`runtime/d3d9_bridge.cpp`, `fp_depth_scale_draw`): for FP_DEPTH draws only, the bound pixel shader is
+  swapped for a bytecode copy whose oC0.x is `A d + B` (A = r P33w/P33fp, B = P33w (1 − r), r = world near /
+  first-person near, from the projections the game sets; here d' = 3.00008 d − 2.00009), with A and B in a `def`
+  of a free constant; the game's shader goes back as soon as the FP_DEPTH draws end. Vertex shader, z-buffer, depth
+  test and clipping unchanged. On by default (it turns the pass hooks on); `LB_FP_DEPTH_SCALE=0` off,
+  `=off@F,...` off on frames F only.
+- **Depth, same held moment** (first-person-only triplets, eye shift 1e-6, clock held, rewrite off on the middle
+  frame): outside the first-person pixels the target is bit-identical with and without (819,652 of 921,600 pixels
+  in Riverwood; a few hundred world pixels in two Whiterun groups differ by one ulp between frames, as they do
+  without it); on the first-person pixels (1 − d) grows by 3.00009 (min/max 3.00008/3.00014 over 101,948 pixels).
+  Decoded with near 15: Riverwood hands and sword median z 99.9 → 33.3 units, Whiterun 110 → 36.7. No negative
+  values in these scenes (nearest 29.7 units).
+- **Reprojection against true stereo** (`stereo_capture.py --hybrid`, `stereo_compare.py --hybrid`, 3 groups each,
+  before = `LB_FP_DEPTH_SCALE=0`):
+
+  | | before | after | true |
+  |---|---|---|---|
+  | Riverwood sword+hand disparity (hands crop), px | 33.3–33.4 | 100.0–100.1 | 100.6–100.8 |
+  | Riverwood spell hand disparity (flame crop), px | 32.1–32.2 | 98.1 | 97.4–97.6 |
+  | Whiterun sword disparity, px | 31.9–32.0 | 96.7–96.9 | 97.6–97.8 |
+  | Riverwood hands crop, mean \|reproj − true\| L / R | 8.3–8.5 / 9.5–9.6 | 2.6–2.7 / 4.0–4.1 | |
+  | Riverwood flame crop, L / R | 19.4–20.8 / 18.0–19.2 | 7.5–8.9 / 5.4–6.6 | |
+  | Whiterun hands crop, L / R | 7.5–7.6 / 8.0–8.1 | 3.0 / 4.8 | |
+
+  The flame writes no depth and keeps the ground's disparity (its centroid numbers stay wrong, as expected). World
+  pixels 24 px clear of anything first-person: reprojection error 2.95–3.06 (Riverwood) and 2.0–2.2 / 1.6–1.75
+  (Whiterun) in the two runs, which caught different moments (W frames differ by 11–13/255 between runs); at one
+  moment the world's depth and picture are identical with and without (above and below).
+- **The game's own picture** (LB_STEREO_HOLD triplets, eye shift 1e-6, rewrite off on frame 2 of 3): frame 2 (off)
+  against frame 3 (on), hands crop: 0 pixels differ in all three Riverwood groups; Whiterun 0, 190 and 258 pixels,
+  at most 5 (sum of channels). Elsewhere only the flame and grass beside it move (Riverwood, left half; mean
+  0.008–0.010). Frame 1 against frame 3, both on, differs more (0.005–0.05) than off against on.
+- **Who reads the target in the game's frame** (traced per draw: textures bound whose level 0 is the target): 73
+  effect draws before the late pass (stage 1, the world's depth only), and after it a single draw, the depth-of-field
+  composite (Image, Blurred, Depth): z = c2.w / ((1 − d) c2.z + c2.y), blur = saturate((z − 25000) / 25000) × 0.5,
+  zero at hand distance in either encoding. Not checked: other weathers, interiors, dialogue DoF settings, presets
+  with SSAO.
+- **Cost:** the pass hooks, now always on, measured with timers around them: 14 µs per frame in all (draw 11.6 µs over
+  about 1,930 draws, render-target changes 2.1 µs, projections 0.6 µs), about 0.1% of a 60 Hz frame. The swap adds
+  one GetPixelShader and SetPixelShader per first-person depth draw.
