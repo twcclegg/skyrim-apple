@@ -234,10 +234,13 @@ func centroidX(_ box: Box, _ weight: (Int) -> Double) -> Double? {
     return s > 0 ? sx / s : nil
 }
 /// The shift dx (left x - right x) that best matches the left picture inside box with the right one, by weighted
-/// mean absolute luminance difference (weights from the left picture), refined to a fraction of a pixel.
+/// mean absolute luminance difference (weights from the left picture), refined to a fraction of a pixel. Shifts that
+/// move more than half the weight off the right picture are not tried: a few pixels left over can match by chance.
 func blockMatch(_ a: Picture, _ b: Picture, _ box: Box, range: Int = 200, weight: (Int) -> Double) -> Double? {
     var costs: [Int: Double] = [:]
     var best = Double.infinity, bestDx = 0
+    var total = 0.0
+    for y in box.y0..<box.y1 { for x in box.x0..<box.x1 { total += max(0, weight(y * width + x)) } }
     for dx in -range...range {
         var sum = 0.0, wsum = 0.0
         for y in box.y0..<box.y1 {
@@ -250,7 +253,7 @@ func blockMatch(_ a: Picture, _ b: Picture, _ box: Box, range: Int = 200, weight
                 wsum += w
             }
         }
-        if wsum <= 0 { continue }
+        if wsum <= 0 || wsum < 0.5 * total { continue }
         costs[dx] = sum / wsum
         if sum / wsum < best { best = sum / wsum; bestDx = dx }
     }
