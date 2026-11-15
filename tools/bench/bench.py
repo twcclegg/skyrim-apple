@@ -94,12 +94,17 @@ def key_script(scenario):
     # "console_later": [{"at": frame, "command": text}] - the console reopened after the first command's load (a
     # `bat` of commands that can't share the first console, e.g. the weather), then closed again.
     for later in scenario.get("console_later", []):
+        if later["at"] < frame:
+            fail(f"console_later at {later['at']} overlaps the console before it (busy until {frame})")
         frame = later["at"]
         entries.append(f"{frame}:`:2")
         more, frame = typed(later["command"], frame + 20)
         entries += more
         entries.append(f"{frame}:Return:2")
         entries.append(f"{frame + 30}:`:2")
+        frame += 32
+        if frame > scenario.get("exit_frame", frame):
+            fail(f"console_later {later['command']!r} ends at frame {frame}, after the exit frame")
     for held in scenario.get("keys", []):
         entries.append(f"{held['start']}:{held['key']}:{held['frames']}")
     if len(entries) > 256:
@@ -377,7 +382,8 @@ def execute(scenario, args):
         for frame, ms, present, work in frames:
             csv.write(f"{frame},{ms},{present},{'' if work is None else work}\n")
     summary["meta"] = {"scenario": scenario["name"], "label": label, "started_utc": started.isoformat(),
-                       "exited_cleanly": exited, "notes": notes[-40:], "log": logs[-1]}
+                       "exited_cleanly": exited, "notes": notes[-40:], "log": logs[-1],
+                       "phases": scenario.get("phases", {})}
     (out / "summary.json").write_text(json.dumps(summary, indent=2))
     print_summary(summary)
     print(f"bench: results in {out}")
@@ -406,6 +412,10 @@ def compare(baseline, candidate, threshold=0.05):
     for phase in b:
         if phase == "meta" or phase not in a or not a[phase].get("frames") or not b[phase].get("frames"):
             continue
+        spans = [run.get("meta", {}).get("phases", {}).get(phase) for run in (a, b)]
+        if None not in spans and spans[0] != spans[1]:  # older results don't record their phase frames
+            print(f"bench: WARNING phase {phase} covers frames {spans[0]} in the baseline, {spans[1]} here",
+                  file=sys.stderr)
         cells = []
         for key in ("mean_ms", "p95_ms", "p99_ms", "work_mean_ms", "work_p95_ms"):
             if key not in a[phase] or key not in b[phase]:
