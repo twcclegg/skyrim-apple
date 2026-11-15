@@ -128,6 +128,7 @@ static void edge_turn(void) {
  * Main thread only, except skyrim_head_set. */
 #include <math.h>
 #include <stdatomic.h>
+#include "motion_path.h"
 int skyrim_frame_camera(float out[18]);  /* runtime/d3d9_bridge.cpp */
 int skyrim_menu_open(void);
 static _Atomic float g_head_yaw, g_head_pitch;
@@ -729,7 +730,12 @@ void platform_present_hook(void) {
     }
     script_events();
 #if defined(__APPLE__)
-    if (pthread_main_np()) head_steer();
+    if (pthread_main_np()) {
+        head_steer();
+        /* The offset that goes with the camera just presented, for the compositor to follow between frames while
+         * the right stick turns the view (runtime/motion_path.h). */
+        motion_offset(motion_camera_time(), atomic_load(&g_head_offset), atomic_load(&g_head_anchored));
+    }
 #endif
 #ifdef LB_MAC_MAIN_PUMP
     if (pthread_main_np()) capture_mouse();
