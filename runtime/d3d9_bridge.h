@@ -28,6 +28,15 @@ extern int g_d3d_trace, g_bisect;
 bool d3d_skip_draw(void);
 void d3d_trace(CPU *c, const char *name, int nargs);
 
+/* First-person depth (d3d9_bridge.cpp): the first-person meshes' depth is written in the world's encoding. The
+ * hooks are called only while g_d3d_fp is set, which it is unless LB_FP_DEPTH_SCALE=0. */
+extern int g_d3d_fp;
+void d3d_fp_draw(void);                     // every Draw*Primitive*, before the draw
+void d3d_fp_target(IDirect3DDevice9 *d);    // after the render target 0 or the depth-stencil surface changed
+void d3d_fp_clear(uint32_t flags);          // before a Clear, with its D3DCLEAR_* flags
+void d3d_fp_projection(const float *m);     // SetTransform(D3DTS_PROJECTION), the guest's matrix
+bool hud_screen_in_pass(void);              // drawing a menu into the second screen's image (hud_screen.cpp)
+
 extern "C" {
 void *platform_window(void);
 void platform_present_hook(void);
