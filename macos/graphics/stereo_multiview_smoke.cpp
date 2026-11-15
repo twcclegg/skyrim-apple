@@ -25,6 +25,8 @@
 //   5. mono passes: the back buffer (one layer) with the two-layer automatic depth buffer renders with view 0's
 //      offset; a two-layer target with a one-layer depth surface renders mono into layer 0 and leaves layer 1 as
 //      cleared.
+//   6. reads of a two-layer render-target texture (drawn with multiview) see layer 0: StretchRect into the back
+//      buffer and fixed-function sampling both match layer 0 pixel for pixel.
 // With --multiview=off: multiview reports off, the 128x128 target has one layer, layer 1 cannot be read, and the
 // triangle moves with view 0's offset (set_clip_shift(k): -8 px), as before multiview.
 #include <SDL2/SDL.h>
@@ -463,6 +465,49 @@ static int run(bool multiview) {
           rest[0].count / 50 && c1.count == kPixels, "mono_mixed_attachments",
           "two-layer target + 256x256 one-layer depth: layer 0 triangle moved %+.2f (expect %+.2f), layer 1 %d of %d "
           "px still cleared", t0.cx - rest[0].cx, -kShiftPx, c1.count, kPixels);
+    }
+
+    // 6: D3D9 reads of a two-layer render-target texture see layer 0 (the left eye here): StretchRect into the
+    // back buffer, and sampling it with a fixed-function full-screen quad (point filter, pre-transformed).
+    dxvk_stereo_set_clip_shift(kK);
+    p.sceneFrame(texLevel, nullptr);
+    {
+      const auto src0 = p.read(texLevel, 0), src1 = p.read(texLevel, 1);
+      const Blob s0 = measureRgb(src0, kRed), s1 = measureRgb(src1, kRed);
+      r.expect(std::fabs(s0.cx - rest[0].cx + kShiftPx) <= 0.25 && std::fabs(s1.cx - rest[1].cx - kShiftPx) <= 0.25,
+          "rt_texture_multiview", "render-target texture: layer 0 moved %+.2f, layer 1 %+.2f (expect %+.2f, %+.2f)",
+          s0.cx - rest[0].cx, s1.cx - rest[1].cx, -kShiftPx, kShiftPx);
+
+      check(device->StretchRect(texLevel, nullptr, backbuffer, nullptr, D3DTEXF_NONE), "StretchRect");
+      const auto blit = p.read(backbuffer, 0);
+      r.expect(blit == src0 && blit != src1, "stretchrect_reads_layer0", "StretchRect result %s layer 0, %s layer 1",
+          blit == src0 ? "matches" : "differs from", blit == src1 ? "matches" : "differs from");
+
+      struct TexVertex { float x, y, z, rhw, u, v; };
+      const TexVertex quadTex[4] = { { -0.5f, -0.5f, 0.5f, 1.0f, 0.0f, 0.0f },
+                                     { kSize - 0.5f, -0.5f, 0.5f, 1.0f, 1.0f, 0.0f },
+                                     { -0.5f, kSize - 0.5f, 0.5f, 1.0f, 0.0f, 1.0f },
+                                     { kSize - 0.5f, kSize - 0.5f, 0.5f, 1.0f, 1.0f, 1.0f } };
+      p.bind(backbuffer, nullptr);
+      check(device->SetVertexShader(nullptr), "SetVertexShader(null)");
+      check(device->SetPixelShader(nullptr), "SetPixelShader(null)");
+      check(device->SetFVF(D3DFVF_XYZRHW | D3DFVF_TEX1), "SetFVF");
+      check(device->SetTexture(0, texture), "SetTexture");
+      check(device->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_POINT), "MINFILTER");
+      check(device->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_POINT), "MAGFILTER");
+      check(device->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1), "COLOROP");
+      check(device->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE), "COLORARG1");
+      check(device->Clear(0, nullptr, D3DCLEAR_TARGET, 0xFF000000u, 1.0f, 0), "Clear(back buffer)");
+      check(device->BeginScene(), "BeginScene");
+      check(device->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, quadTex, sizeof(TexVertex)), "DrawPrimitiveUP(textured)");
+      check(device->EndScene(), "EndScene");
+      check(device->SetTexture(0, nullptr), "SetTexture(null)");
+      check(device->SetVertexDeclaration(decl), "SetVertexDeclaration");
+      check(device->SetVertexShader(vs), "SetVertexShader");
+      check(device->SetPixelShader(ps), "SetPixelShader");
+      const auto sampled = p.read(backbuffer, 0);
+      r.expect(sampled == src0 && sampled != src1, "sample_reads_layer0", "sampled texture %s layer 0, %s layer 1",
+          sampled == src0 ? "matches" : "differs from", sampled == src1 ? "matches" : "differs from");
     }
   }
   dxvk_stereo_set_clip_offset(0.0f, 0.0f, 0.0f, 0.0f);
