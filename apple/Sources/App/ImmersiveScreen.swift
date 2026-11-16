@@ -267,6 +267,18 @@ final class ImmersiveCompositor: @unchecked Sendable {
     fragment float4 screen_fragment(Out in [[stage_in]], texture2d<float> image [[texture(0)]],
                                     texture2d<float> depth [[texture(1)]], constant Uniforms &u [[buffer(0)]]) {
         constexpr sampler linear_clamp(address::clamp_to_edge, filter::linear);
+        if (u.backplate != 0) {
+            // The fill behind the mesh, seen only through the gaps at depth edges: a wide blur of the picture, so a
+            // gap shows the colours around it instead of black, and no sharp second copy of a near object.
+            float3 sum = float3(0);
+            for (int i = 0; i < 12; i++) {
+                float a = float(i) * 0.5235988, rr = (i & 1) ? 0.035 : 0.018;
+                sum += image.sample(linear_clamp, saturate(in.uv + rr * float2(cos(a) * 0.5625, sin(a)))).rgb;
+            }
+            float3 b = sum / 12.0;
+            if (u.decode) b = select(pow((b + 0.055) / 1.055, 2.4), b / 12.92, b <= 0.04045);
+            return float4(b, 1);
+        }
         float2 uv = u.eyeRefine.w > 0 && u.hasDepth != 0 ? refined_uv(in, u, depth) : in.uv;
         float3 c = image.sample(linear_clamp, uv).rgb;
         if (u.sharpen > 0) {
@@ -521,6 +533,9 @@ final class ImmersiveCompositor: @unchecked Sendable {
     private lazy var followMode: String = getenv("LB_IMMERSIVE_FOLLOW").map { String(cString: $0) } ?? ""
     private var followHead: Bool { followMode == "1" || followMode == "yaw" }
     private var followYaw: Float?
+    /// LB_IMMERSIVE_HOLES (default on): the gaps the depth mesh leaves at object edges show a blurred fill at the
+    /// farthest depth instead of black; 0 = black.
+    private lazy var fillHoles: Bool = getenv("LB_IMMERSIVE_HOLES").map { String(cString: $0) != "0" } ?? true
     private var followRotation: simd_quatf?
     private func place(head: simd_float4x4) -> simd_float4x4 {
         if let screen, !followHead { return screen }
@@ -758,6 +773,17 @@ final class ImmersiveCompositor: @unchecked Sendable {
                     encoder.setVertexTexture(useDepth ? depthTexture : texture, index: 1)
                     encoder.setFragmentTexture(useDepth ? depthTexture : texture, index: 1)
                     let vertexCount = Int((Self.gridColumns - 1) * (Self.gridRows - 1) * 6)
+                    if useDepth && fillHoles {
+                        // First a blurred copy at the farthest depth; the mesh then draws over it, and the gaps
+                        // at depth edges show it instead of black (LB_IMMERSIVE_HOLES=0: black as before).
+                        var plate = uniforms
+                        plate.backplate = 1
+                        encoder.setVertexBytes(&plate, length: MemoryLayout<QuadUniforms>.stride, index: 0)
+                        encoder.setFragmentBytes(&plate, length: MemoryLayout<QuadUniforms>.stride, index: 0)
+                        encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: vertexCount)
+                        encoder.setVertexBytes(&uniforms, length: MemoryLayout<QuadUniforms>.stride, index: 0)
+                        encoder.setFragmentBytes(&uniforms, length: MemoryLayout<QuadUniforms>.stride, index: 0)
+                    }
                     encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: vertexCount)
                 }
                 encoder.endEncoding()
