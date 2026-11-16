@@ -204,7 +204,8 @@ final class ImmersiveCompositor: @unchecked Sendable {
         float toScreen = length(ray);
         if (u.backplate != 0) {
             float far = u.trueDepth != 0 ? toScreen * u.maxBehind / u.eyeBack - toScreen : u.maxBehind * edge_fade(uv);
-            p = eye + ray * (1.0 + far / toScreen);
+            // 0.2% beyond the far limit, so the mesh where it reaches that limit (the sky) wins the depth test.
+            p = eye + ray * ((1.0 + far / toScreen) * 1.002);
         } else if (u.hasDepth) {
             // Distances from the eye of the triangle's corners; a triangle whose far corner is more than (1 + tear)
             // times as far as its near one spans an object's edge.
@@ -771,18 +772,19 @@ final class ImmersiveCompositor: @unchecked Sendable {
                     encoder.setVertexTexture(useDepth ? depthTexture : texture, index: 1)
                     encoder.setFragmentTexture(useDepth ? depthTexture : texture, index: 1)
                     let vertexCount = Int((Self.gridColumns - 1) * (Self.gridRows - 1) * 6)
-                    if useDepth && fillHoles {
-                        // First a blurred copy at the farthest depth; the mesh then draws over it, and the gaps
-                        // at depth edges show it instead of black (LB_IMMERSIVE_HOLES=0: black as before).
+                    encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: vertexCount)
+                    if useDepth && fillHoles && refineSteps == 0 {
+                        // Then a blurred copy at the farthest depth, behind the mesh: it shows only through the
+                        // gaps at depth edges, instead of black (LB_IMMERSIVE_HOLES=0: black as before). Drawn
+                        // second so the depth test keeps the mesh wherever both lie at the far limit (the sky), and
+                        // the blur's taps are only shaded in the gaps. The per-pixel search (LB_IMMERSIVE_REFINE)
+                        // leaves no gaps, so then there is nothing to fill.
                         var plate = uniforms
                         plate.backplate = 1
                         encoder.setVertexBytes(&plate, length: MemoryLayout<QuadUniforms>.stride, index: 0)
                         encoder.setFragmentBytes(&plate, length: MemoryLayout<QuadUniforms>.stride, index: 0)
                         encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: vertexCount)
-                        encoder.setVertexBytes(&uniforms, length: MemoryLayout<QuadUniforms>.stride, index: 0)
-                        encoder.setFragmentBytes(&uniforms, length: MemoryLayout<QuadUniforms>.stride, index: 0)
                     }
-                    encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: vertexCount)
                 }
                 encoder.endEncoding()
             }
