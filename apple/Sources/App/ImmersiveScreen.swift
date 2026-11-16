@@ -532,10 +532,10 @@ final class ImmersiveCompositor: @unchecked Sendable {
             followRotation = eased
             let m = simd_float3x3(eased)
             let position = SIMD3<Float>(head.columns.3.x, head.columns.3.y, head.columns.3.z)
-            let center = position - m.columns.2 * Self.distance  // the head looks along -z
+            let center = position - m.columns.2 * Self.viewPlane  // the head looks along -z
             let placed = simd_float4x4(SIMD4<Float>(m.columns.0, 0), SIMD4<Float>(m.columns.1, 0),
                                        SIMD4<Float>(m.columns.2, 0), SIMD4<Float>(center, 1))
-            if screen == nil { log("screen locked to the head, \(Self.distance) m ahead") }
+            if screen == nil { log("screen locked to the head at the game's field of view") }
             screen = placed
             return placed
         }
@@ -678,6 +678,12 @@ final class ImmersiveCompositor: @unchecked Sendable {
             var model = anchor != nil ? place(head: head) : screen
             var halfSize: SIMD2<Float>? = nil
             var heldModel: simd_float4x4? = nil
+            if !headMode, followMode == "1", anchor != nil, game.has_camera != 0 {
+                // Locked to the head and as wide as the game's field of view: the frame fills the angles it was
+                // rendered for whichever way the head faces, at true depth.
+                let c = withUnsafeBytes(of: game.camera) { Array($0.bindMemory(to: Float.self)) }
+                halfSize = SIMD2(Self.viewPlane * c[13], Self.viewPlane * c[14])
+            }
             if headMode, anchor != nil {
                 let angles = headAngles(head)
                 if !publishedHead { skyrim_head_set(angles.yaw, angles.pitch, 1); publishedHead = true }
