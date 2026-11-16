@@ -1365,8 +1365,10 @@ class Lifter:
             return ["{ uint32_t t_ = %s; esp -= 4; M32(esp) = 0x%Xu; %s { static const FnEntry *ic_; "
                     "const FnEntry *e_ = __atomic_load_n(&ic_, __ATOMIC_RELAXED); "
                     "if (!(e_ && e_->addr == t_)) e_ = rt_ic_lookup(t_, &ic_); "
-                    "if (e_) { e_->fn(c); %s } else { %s rt_call(c, t_); %s } } }" % (
-                t, nxt, SPILL, RELOAD, SPILL_RT, RELOAD_RT)]
+                    "if (e_ && t_ < GUEST_THUNK_BASE) { e_->fn(c); %s } "
+                    "else if (e_) { %s e_->fn(c); %s } "  # a cached import shim: registers through the struct
+                    "else { %s rt_call(c, t_); %s } } }" % (
+                t, nxt, SPILL, RELOAD, SPILL_RT, RELOAD_RT, SPILL_RT, RELOAD_RT)]
         if x86.X86_GRP_RET in i.groups:
             n = op.imm if op else 0
             return ["esp += %d; %s return;" % (4 + n, SPILL)]

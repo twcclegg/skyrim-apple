@@ -269,16 +269,23 @@ void rt_call(CPU *c, uint32_t t) {
  * call count only see a site's first call. Unknown targets take the normal
  * path every time. */
 static int g_import_cache = -1;
+/* The import's immutable entry if a call site may cache it (LB_IMPORT_CACHE not 0, no per-import call counts
+ * being taken, a valid thunk with a shim), else NULL. */
+static const FnEntry *import_entry(uint32_t t) {
+    if (g_import_cache < 0) {
+        const char *v = getenv("LB_IMPORT_CACHE");
+        g_import_cache = !(v && *v == '0');
+    }
+    uint32_t i = (t - GUEST_THUNK_BASE) / 4;
+    if (g_import_cache && g_import_count <= 0 && !(t & 3) &&
+        i < __atomic_load_n(&g_nthunks, __ATOMIC_ACQUIRE) && g_thunk_entries[i].fn)
+        return &g_thunk_entries[i];
+    return NULL;
+}
 void rt_call_ic(CPU *c, uint32_t t, const FnEntry **cache) {
     if (t >= GUEST_THUNK_BASE) {
-        if (g_import_cache < 0) {
-            const char *v = getenv("LB_IMPORT_CACHE");
-            g_import_cache = !(v && *v == '0');
-        }
-        uint32_t i = (t - GUEST_THUNK_BASE) / 4;
-        if (g_import_cache && g_import_count <= 0 && !(t & 3) &&
-            i < __atomic_load_n(&g_nthunks, __ATOMIC_ACQUIRE) && g_thunk_entries[i].fn)
-            __atomic_store_n(cache, &g_thunk_entries[i], __ATOMIC_RELAXED);
+        const FnEntry *e = import_entry(t);
+        if (e) __atomic_store_n(cache, e, __ATOMIC_RELAXED);
     } else {
         const FnEntry *e = lookup_entry(t);
         if (e) {
@@ -290,11 +297,13 @@ void rt_call_ic(CPU *c, uint32_t t, const FnEntry **cache) {
     rt_call(c, t);
 }
 
-/* The lookup half of rt_call_ic, for call sites that then call the entry themselves (a lifted function
- * can be called straight from lifted code; anything else goes through rt_call). */
+/* The lookup half of rt_call_ic, for call sites that then call the entry themselves. An entry below
+ * GUEST_THUNK_BASE is a lifted function (or a host replacement's entry wrapper), callable straight from lifted
+ * code; one at or above it is an import shim, which reads and writes the registers in the CPU struct, so the
+ * call site hands them over around it (SPILL_RT/RELOAD_RT). As with rt_call_ic, a cached import skips
+ * rt_call's watchdog note and call count. */
 const FnEntry *rt_ic_lookup(uint32_t t, const FnEntry **cache) {
-    if (t >= GUEST_THUNK_BASE) return NULL;
-    const FnEntry *e = lookup_entry(t);
+    const FnEntry *e = t >= GUEST_THUNK_BASE ? import_entry(t) : lookup_entry(t);
     if (e) __atomic_store_n(cache, e, __ATOMIC_RELAXED);
     return e;
 }
