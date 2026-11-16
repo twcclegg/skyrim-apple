@@ -525,18 +525,28 @@ final class ImmersiveCompositor: @unchecked Sendable {
     }
 
     /// The screen, placed once: straight ahead of where the wearer is looking, level, at eye height.
-    /// LB_IMMERSIVE_FOLLOW (outside head tracking): 1 = the screen is locked to the head on every axis, always
-    /// straight ahead of the eyes whichever way they face (lying down looking at the ceiling included), eased so
-    /// small head motion doesn't shake it; "yaw" = it follows only the heading and stays level. Read once the game
-    /// is presenting.
-    private lazy var followMode: String = getenv("LB_IMMERSIVE_FOLLOW").map { String(cString: $0) } ?? ""
+    /// LB_IMMERSIVE_FOLLOW: 1 = the screen is locked to the head on every axis, always straight ahead of the eyes
+    /// whichever way they face (lying down looking at the ceiling included), eased so small head motion doesn't
+    /// shake it; "yaw" = it follows only the heading and stays level. With head tracking on, it applies to the
+    /// menu and loading screens only. Read once the game is presenting, as LB_IMMERSIVE_HEAD is.
+    private var followSetting: String?
+    private var followMode: String {
+        if let followSetting { return followSetting }
+        guard checkedDevice else { return "" }
+        let mode = getenv("LB_IMMERSIVE_FOLLOW").map { String(cString: $0) } ?? ""
+        followSetting = mode
+        if !mode.isEmpty { log("screen follows the head: \(mode)") }
+        return mode
+    }
     private var followHead: Bool { followMode == "1" || followMode == "yaw" }
     private var followYaw: Float?
     /// LB_IMMERSIVE_HOLES (default on): the gaps the depth mesh leaves at object edges show a blurred fill at the
     /// farthest depth instead of black; 0 = black.
     private lazy var fillHoles: Bool = getenv("LB_IMMERSIVE_HOLES").map { String(cString: $0) != "0" } ?? true
     private var followRotation: simd_quatf?
-    private func place(head: simd_float4x4) -> simd_float4x4 {
+    /// `distance`: how far ahead a head-locked screen (LB_IMMERSIVE_FOLLOW=1) sits; viewPlane when it is drawn at the
+    /// game's field of view, the window distance otherwise (menus), so its size and ray origin match how it is drawn.
+    private func place(head: simd_float4x4, distance: Float = ImmersiveCompositor.distance) -> simd_float4x4 {
         if let screen, !followHead { return screen }
         if followMode == "1" {
             let rotation = simd_quatf(simd_float3x3(SIMD3(head.columns.0.x, head.columns.0.y, head.columns.0.z),
@@ -546,23 +556,26 @@ final class ImmersiveCompositor: @unchecked Sendable {
             followRotation = eased
             let m = simd_float3x3(eased)
             let position = SIMD3<Float>(head.columns.3.x, head.columns.3.y, head.columns.3.z)
-            let center = position - m.columns.2 * Self.viewPlane  // the head looks along -z
+            let center = position - m.columns.2 * distance  // the head looks along -z
             let placed = simd_float4x4(SIMD4<Float>(m.columns.0, 0), SIMD4<Float>(m.columns.1, 0),
                                        SIMD4<Float>(m.columns.2, 0), SIMD4<Float>(center, 1))
             if screen == nil { log("screen locked to the head at the game's field of view") }
             screen = placed
             return placed
         }
-        var forward = -SIMD3<Float>(head.columns.2.x, 0, head.columns.2.z)
-        forward = length(forward) > 0.001 ? normalize(forward) : SIMD3<Float>(0, 0, -1)
+        let flat = -SIMD3<Float>(head.columns.2.x, 0, head.columns.2.z)
+        var forward = length(flat) > 0.001 ? normalize(flat) : SIMD3<Float>(0, 0, -1)
         if followHead {
-            let yaw = atan2(forward.x, -forward.z)
-            var eased = followYaw ?? yaw
-            var turn = yaw - eased
-            turn -= 2 * .pi * (turn / (2 * .pi)).rounded()
-            eased += turn * 0.08  // per compositor frame: about 0.15 s to catch up at 90 Hz
-            followYaw = eased
-            forward = SIMD3<Float>(sin(eased), 0, -cos(eased))
+            // Looking nearly straight up or down the heading is undefined: hold the last one.
+            if length(flat) > 0.1 || followYaw == nil {
+                let yaw = atan2(forward.x, -forward.z)
+                var eased = followYaw ?? yaw
+                var turn = yaw - eased
+                turn -= 2 * .pi * (turn / (2 * .pi)).rounded()
+                eased += turn * 0.08  // per compositor frame: about 0.15 s to catch up at 90 Hz
+                followYaw = eased
+            }
+            forward = SIMD3<Float>(sin(followYaw!), 0, -cos(followYaw!))
         }
         let back = -forward, up = SIMD3<Float>(0, 1, 0), right = normalize(cross(up, back))
         let center = SIMD3<Float>(head.columns.3.x, head.columns.3.y, head.columns.3.z) + forward * Self.distance
@@ -689,10 +702,11 @@ final class ImmersiveCompositor: @unchecked Sendable {
             let anchor = tracking.queryDeviceAnchor(atTimestamp: seconds)
             drawable.deviceAnchor = anchor
             let head = anchor?.originFromAnchorTransform ?? matrix_identity_float4x4
-            var model = anchor != nil ? place(head: head) : screen
+            let atFOV = !headMode && followMode == "1" && game.has_camera != 0
+            var model = anchor != nil ? place(head: head, distance: atFOV ? Self.viewPlane : Self.distance) : screen
             var halfSize: SIMD2<Float>? = nil
             var heldModel: simd_float4x4? = nil
-            if !headMode, followMode == "1", anchor != nil, game.has_camera != 0 {
+            if atFOV, anchor != nil {
                 // Locked to the head and as wide as the game's field of view: the frame fills the angles it was
                 // rendered for whichever way the head faces, at true depth.
                 let c = withUnsafeBytes(of: game.camera) { Array($0.bindMemory(to: Float.self)) }
