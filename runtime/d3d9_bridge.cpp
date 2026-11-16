@@ -653,13 +653,14 @@ static void fp_depth_scale_forget(void) {
 
 /* A copy of the ps_2_0+ bytecode `in` (DWORD tokens up to and including the end token) whose colour output 0's x
  * component is a * x + b. Empty if the shader is not one this can rewrite safely: shader model 1, no write to oC0,
- * relative addressing of constants, or no free temporary or constant register. */
+ * relative addressing of constants, subroutines (the outputs would be written after main's ret), or no free temporary
+ * or constant register. */
 static std::vector<uint32_t> fp_depth_patch(const uint32_t *in, size_t count, float a, float b) {
     std::vector<uint32_t> none;
     if (count < 2 || (in[0] >> 16) != 0xFFFF || ((in[0] >> 8) & 0xFF) < 2) return none;
     auto reg_type = [](uint32_t t) { return ((t >> 28) & 7) | ((t >> 8) & 0x18); };
     enum { D3DSPR_TEMP_ = 0, D3DSPR_CONST_ = 2, D3DSPR_COLOROUT_ = 8 };
-    const uint32_t op_dcl = 31, op_def = 81, op_defi = 48, op_defb = 47;
+    const uint32_t op_dcl = 31, op_def = 81, op_defi = 48, op_defb = 47, op_ret = 28, op_label = 30;
     int max_temp = -1, max_const = -1;
     uint32_t written = 0;  // write mask union of the oC0 writes
     size_t end = 0, first_code = 0;
@@ -672,6 +673,7 @@ static std::vector<uint32_t> fp_depth_patch(const uint32_t *in, size_t count, fl
         const size_t len = (tok >> 24) & 0xF;
         if (i + 1 + len > count) return none;
         const uint32_t *arg = in + i + 1;
+        if (op == op_ret || op == op_label) return none;  // the end is not main's end
         if (op == op_def || op == op_defi || op == op_defb) {
             if (len && reg_type(arg[0]) == D3DSPR_CONST_ && op == op_def) max_const = std::max(max_const, (int)(arg[0] & 0x7FF));
         } else if (op == op_dcl) {
