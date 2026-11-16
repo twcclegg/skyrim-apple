@@ -10,8 +10,6 @@ import SwiftUI
 /// The flat game image on a world-locked screen in a Full Space. Mono: both eyes see the same picture.
 enum ImmersiveScreen {
     static let spaceID = "skyrim.immersive.screen"
-    /// The immersive layer is presenting (main thread); set with the skyrimImmersiveRunning notification.
-    @MainActor static var isRunning = false
 }
 
 struct ImmersiveScreenConfiguration: CompositorLayerConfiguration {
@@ -290,7 +288,7 @@ final class ImmersiveCompositor: @unchecked Sendable {
         }
         skyrim_immersive_start()
         skyrim_sdl_set_window_ghost(1)
-        DispatchQueue.main.async { ImmersiveScreen.isRunning = true; NotificationCenter.default.post(name: .skyrimImmersiveRunning, object: true) }
+        DispatchQueue.main.async { NotificationCenter.default.post(name: .skyrimImmersiveRunning, object: true) }
         Task { [session, tracking] in
             do { try await session.run([tracking]) } catch { fputs("immersive: no world tracking: \(error)\n", stderr) }
         }
@@ -316,7 +314,7 @@ final class ImmersiveCompositor: @unchecked Sendable {
 
     private func finish() {
         skyrim_sdl_set_window_ghost(0)
-        DispatchQueue.main.async { ImmersiveScreen.isRunning = false; NotificationCenter.default.post(name: .skyrimImmersiveRunning, object: false) }
+        DispatchQueue.main.async { NotificationCenter.default.post(name: .skyrimImmersiveRunning, object: false) }
         if headMode { skyrim_head_set(0, 0, 0) }
         lastCommands?.waitUntilCompleted()
         skyrim_immersive_stop()
