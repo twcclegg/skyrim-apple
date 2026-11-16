@@ -9,14 +9,24 @@
  * Depends on x86.h only, so the test can compile this file on its own. */
 #include "x86.h"
 
+#pragma clang fp contract(off)  /* one rounding per operation, as the lifted body does */
+
 #ifdef GAME_SKYRIM
 /* 0x472580: which side of a plane a sphere is on. ecx = plane (normal x, y, z, then d), [esp+4] = sphere
  * (centre x, y, z, then radius), callee pops the argument. With dist = normal . centre - radius: returns 2
  * when dist <= -d, 1 when dist >= d, else 0 (also when either is NaN). Called from culling; about a quarter of
  * the main thread's lifted-code time in the world. The guest computes in x87 through two float temporaries in the argument slot; the same roundings are
  * kept here. */
+void f_472580_guest(CPU *c);
 void f_472580(CPU *c) {
     uint32_t esp = c->r[4], plane = c->r[1], sphere = M32(esp + 4);
+    /* With two NaN operands the host picks which payload survives by operand order, which the compiler is free
+     * to choose; NaN inputs never occur in culling, so they take the lifted body and match it exactly. */
+    for (int k = 0; k < 4; k++)
+        if (MF32(sphere + 4 * k) != MF32(sphere + 4 * k) || MF32(plane + 4 * k) != MF32(plane + 4 * k)) {
+            f_472580_guest(c);
+            return;
+        }
     uint32_t t1 = (c->top - 1) & 7, t2 = (c->top - 2) & 7;
     double dist = (double)MF32(sphere + 4) * (double)MF32(plane + 4);
     dist += (double)MF32(sphere) * (double)MF32(plane);

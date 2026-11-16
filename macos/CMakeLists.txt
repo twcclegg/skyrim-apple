@@ -47,6 +47,11 @@ add_subdirectory(graphics)
 
 file(GLOB RT_C CONFIGURE_DEPENDS "${SKYRIM_ROOT}/runtime/*.c")
 list(REMOVE_ITEM RT_C "${SKYRIM_ROOT}/runtime/main.c")
+# Native replacements of game functions (runtime/skyrim_native*.c) fall back to the lifted bodies
+# (f_XXXXXX_guest), which only exist in the generated game code, so they link with the game, not the runtime
+# the test executables share.
+file(GLOB RT_NATIVE_C CONFIGURE_DEPENDS "${SKYRIM_ROOT}/runtime/skyrim_native*.c")
+list(REMOVE_ITEM RT_C ${RT_NATIVE_C})
 file(GLOB RT_CPP CONFIGURE_DEPENDS "${SKYRIM_ROOT}/runtime/*.cpp")
 add_library(skyrim_runtime OBJECT ${RT_C} ${RT_CPP})
 target_include_directories(skyrim_runtime PUBLIC "${SKYRIM_ROOT}/runtime")
@@ -210,8 +215,12 @@ if(SKYRIM_BUILD_GAME)
     BYPRODUCTS "${CMAKE_CURRENT_BINARY_DIR}/skyrim_macos.build-start.json" VERBATIM)
   add_dependencies(skyrim_generated verify_game_inputs)
   add_dependencies(skyrim_runtime verify_game_inputs)
+  add_library(skyrim_natives OBJECT ${RT_NATIVE_C})
+  target_link_libraries(skyrim_natives PRIVATE skyrim_runtime)
+  target_compile_options(skyrim_natives PRIVATE -O2 -fno-strict-aliasing -fwrapv -fsigned-char
+    $<$<COMPILE_LANGUAGE:C>:-Werror=implicit-function-declaration>)
   add_executable(skyrim_macos "${SKYRIM_ROOT}/runtime/main.c"
-    $<TARGET_OBJECTS:skyrim_generated>)
+    $<TARGET_OBJECTS:skyrim_generated> $<TARGET_OBJECTS:skyrim_natives>)
   target_link_libraries(skyrim_macos PRIVATE skyrim_runtime)
   add_dependencies(skyrim_macos verify_game_inputs)
   set_property(TARGET skyrim_macos APPEND PROPERTY LINK_DEPENDS
