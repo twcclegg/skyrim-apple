@@ -150,7 +150,7 @@ final class ImmersiveCompositor: @unchecked Sendable {
     // Two triangles per grid cell, unindexed, so each vertex knows its whole triangle. With depth, each vertex moves
     // along the ray from the viewer's starting eye through its point on the screen, by how far that pixel is in the
     // game. A triangle spanning a depth jump (an object's edge against what is behind it) is dropped instead of
-    // stretched into streaks (see below). The backplate path (u.backplate) is no longer drawn.
+    // stretched into streaks (see below). The backplate (u.backplate) is drawn first, blurred, behind the mesh.
     vertex Out screen_vertex(uint id [[vertex_id]], constant Uniforms &u [[buffer(0)]],
                              texture2d<float> depth [[texture(1)]]) {
         const uint2 corners[6] = { uint2(0, 0), uint2(1, 0), uint2(0, 1), uint2(1, 0), uint2(1, 1), uint2(0, 1) };
@@ -221,6 +221,18 @@ final class ImmersiveCompositor: @unchecked Sendable {
     fragment float4 screen_fragment(Out in [[stage_in]], texture2d<float> image [[texture(0)]],
                                     texture2d<float> depth [[texture(1)]], constant Uniforms &u [[buffer(0)]]) {
         constexpr sampler linear_clamp(address::clamp_to_edge, filter::linear);
+        if (u.backplate != 0) {
+            // The fill behind the mesh, seen only through the gaps at depth edges: a wide blur of the picture, so a
+            // gap shows the colours around it instead of black, and no sharp second copy of a near object.
+            float3 sum = float3(0);
+            for (int i = 0; i < 12; i++) {
+                float a = float(i) * 0.5235988, rr = (i & 1) ? 0.035 : 0.018;
+                sum += image.sample(linear_clamp, saturate(in.uv + rr * float2(cos(a) * 0.5625, sin(a)))).rgb;
+            }
+            float3 b = sum / 12.0;
+            if (u.decode) b = select(pow((b + 0.055) / 1.055, 2.4), b / 12.92, b <= 0.04045);
+            return float4(b, 1);
+        }
         float2 uv = u.eyeRefine.w > 0 && u.hasDepth != 0 ? refined_uv(in, u, depth) : in.uv;
         float3 c = image.sample(linear_clamp, uv).rgb;
         if (u.decode) c = select(pow((c + 0.055) / 1.055, 2.4), c / 12.92, c <= 0.04045);
@@ -370,6 +382,10 @@ final class ImmersiveCompositor: @unchecked Sendable {
         session.stop()
         log("layer ended")
     }
+
+    /// LB_IMMERSIVE_HOLES (default on): the gaps the depth mesh leaves at object edges show a blurred fill at the
+    /// farthest depth instead of black; 0 = black.
+    private lazy var fillHoles: Bool = getenv("LB_IMMERSIVE_HOLES").map { String(cString: $0) != "0" } ?? true
 
     /// The screen, placed once: straight ahead of where the wearer is looking, level, at eye height.
     private func place(head: simd_float4x4) -> simd_float4x4 {
@@ -537,6 +553,17 @@ final class ImmersiveCompositor: @unchecked Sendable {
                     encoder.setVertexTexture(useDepth ? depthTexture : texture, index: 1)
                     encoder.setFragmentTexture(useDepth ? depthTexture : texture, index: 1)
                     let vertexCount = Int((Self.gridColumns - 1) * (Self.gridRows - 1) * 6)
+                    if useDepth && fillHoles {
+                        // First a blurred copy at the farthest depth; the mesh then draws over it, and the gaps
+                        // at depth edges show it instead of black (LB_IMMERSIVE_HOLES=0: black as before).
+                        var plate = uniforms
+                        plate.backplate = 1
+                        encoder.setVertexBytes(&plate, length: MemoryLayout<QuadUniforms>.stride, index: 0)
+                        encoder.setFragmentBytes(&plate, length: MemoryLayout<QuadUniforms>.stride, index: 0)
+                        encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: vertexCount)
+                        encoder.setVertexBytes(&uniforms, length: MemoryLayout<QuadUniforms>.stride, index: 0)
+                        encoder.setFragmentBytes(&uniforms, length: MemoryLayout<QuadUniforms>.stride, index: 0)
+                    }
                     encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: vertexCount)
                 }
                 encoder.endEncoding()
