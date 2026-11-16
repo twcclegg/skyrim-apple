@@ -83,6 +83,9 @@ struct SkyrimLauncherApp: App {
             }
         }
         .immersionStyle(selection: .constant(.full), in: .full)
+        // Only Play opens it: a relaunch after a run that was killed in the space must not come back inside it,
+        // where Play Immersive's openImmersiveSpace then fails because the space is already open.
+        .restorationBehavior(.disabled)
         // No Home indicator to catch the pointer or the eyes when looking up mid-game (Minecraft port, observed).
         .persistentSystemOverlays(.hidden)
         #endif
