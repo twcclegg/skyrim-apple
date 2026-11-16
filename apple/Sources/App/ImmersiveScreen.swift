@@ -189,7 +189,7 @@ final class ImmersiveCompositor: @unchecked Sendable {
     // Two triangles per grid cell, unindexed, so each vertex knows its whole triangle. With depth, each vertex moves
     // along the ray from the viewer's starting eye through its point on the screen, by how far that pixel is in the
     // game. A triangle spanning a depth jump (an object's edge against what is behind it) is dropped instead of
-    // stretched into streaks (see below). The backplate path (u.backplate) is no longer drawn.
+    // stretched into streaks (see below). The backplate (u.backplate) is drawn first, blurred, behind the mesh.
     vertex Out screen_vertex(uint id [[vertex_id]], constant Uniforms &u [[buffer(0)]],
                              texture2d<float> depth [[texture(1)]]) {
         const uint2 corners[6] = { uint2(0, 0), uint2(1, 0), uint2(0, 1), uint2(1, 0), uint2(1, 1), uint2(0, 1) };
