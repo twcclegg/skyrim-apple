@@ -63,6 +63,7 @@ static void dump(const char *what, CPU *c) {
 static uint64_t g_seen2, g_xmm;
 static uint32_t g_abi_esp, g_abi_args, g_ecx, g_edx;
 static int nt_stubbed;  /* 1: a replacement's direct calls go to the stub, as the guest's do in an exact test */
+static int nt_left;     /* this run left its lifted code through one of the lifter's own exits (nt_exit) */
 static uint64_t mixw(uint64_t h, uint32_t a, uint32_t end) {
     for (; end - a >= 8; a += 8) { uint64_t v; memcpy(&v, MEM + a, 8); h = (h ^ v) * 0x100000001B3ull; h ^= h >> 29; }
     for (; a != end; a += 4) { uint32_t v; memcpy(&v, MEM + a, 4); h = (h ^ v) * 0x100000001B3ull; h ^= h >> 29; }
@@ -95,6 +96,11 @@ static void stub_call(CPU *c) {
     if (g_seen & 2) c->c0 ^= 1;
 }
 void rt_call(CPU *c, uint32_t t) { g_seen = mix(g_seen, &t, 4); stub_call(c); }
+#ifdef NATIVE_TEST
+/* native_test.py rewrites the lifter's exits out of lifted code (a jump or call to an address with no lifted
+ * function, the jump-table default) to this, so the comparison can tell them from a skipped stubbed call. */
+static void nt_exit(CPU *c, uint32_t t) { nt_left = 1; rt_call(c, t); }
+#endif
 void rt_call_ic(CPU *c, uint32_t t, const FnEntry **cache) { (void)cache; rt_call(c, t); }
 void rt_unimpl(CPU *c, uint32_t a, const char *w) { (void)c; (void)a; g_why = w; siglongjmp(g_jb, 1); }
 void rt_int3(CPU *c, uint32_t a) { (void)c; (void)a; g_why = "int3"; siglongjmp(g_jb, 1); }
@@ -136,7 +142,7 @@ int main(int argc, char **argv) {
             g_trace = only != 0;
             g_rng = 0x9E3779B97F4A7C15ull * (t + 1) + (uint64_t)r * 7919; g_seen = 0xCBF29CE484222325ull; g_why = NULL;
 #ifdef NATIVE_TEST
-            g_seen2 = g_seen; g_abi_esp = g_abi_args = g_ecx = g_edx = 0; g_xmm = 0; nt_stubbed = 1;
+            g_seen2 = g_seen; g_abi_esp = g_abi_args = g_ecx = g_edx = 0; g_xmm = 0; nt_stubbed = 1; nt_left = 0;
 #endif
             for (uint32_t o = 0; o < SCR_SIZE; o += 4) {  /* floats and pointers back into the scratch area */
                 uint32_t v = rnd(), k = v % 4;
@@ -165,8 +171,8 @@ int main(int argc, char **argv) {
                    (unsigned long long)mix(0xCBF29CE484222325ull, &c, offsetof(CPU, thread)),
                    (unsigned long long)mix(0xCBF29CE484222325ull, MEM + SCR, SCR_SIZE), (unsigned long long)g_seen);
 #ifdef NATIVE_TEST
-            printf(" | ecx %08x edx %08x xmm %016llx callees %016llx", g_ecx, g_edx, (unsigned long long)g_xmm,
-                   (unsigned long long)g_seen2);
+            printf(" | ecx %08x edx %08x xmm %016llx callees %016llx left %d", g_ecx, g_edx, (unsigned long long)g_xmm,
+                   (unsigned long long)g_seen2, nt_left);
 #endif
             printf("\n");
         }
