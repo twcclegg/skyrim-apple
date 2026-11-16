@@ -261,7 +261,13 @@ struct LibraryView: View {
                 .task {
                     guard LauncherModel.benchImmersive, !LauncherModel.benchImmersiveStarted else { return }
                     LauncherModel.benchImmersiveStarted = true
-                    if case .opened = await openImmersiveSpace(id: ImmersiveScreen.spaceID) { startPlay() }
+                    // .opened, or the space is already up (restored from a killed run): play either way.
+                    switch await openImmersiveSpace(id: ImmersiveScreen.spaceID) {
+                    case .opened: startPlay()
+                    default:
+                        try? await Task.sleep(for: .seconds(1))
+                        if ImmersiveScreen.isRunning { startPlay() }
+                    }
                 }
             }
             #endif
