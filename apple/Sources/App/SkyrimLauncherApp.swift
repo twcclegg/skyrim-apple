@@ -43,12 +43,13 @@ struct SkyrimLauncherApp: App {
         // A conventional flat window. Immersive spaces stay out until windowed play is accepted.
         .defaultSize(width: 900, height: 840)
         .windowResizability(.contentMinSize)
-        // Every launch opens the launcher, whatever scenes the last run left open: a run that ended inside the
-        // game window (LB_GAME_SCENE=1) or the immersive space would otherwise come back as only that, with no
-        // launcher to start the game, which also leaves bench autoplay with nothing to press.
-        .defaultLaunchBehavior(.presented)
         #endif
         #if os(visionOS) && SKYRIM_NATIVE_RUNTIME
+        // Every launch opens the launcher, whatever scenes the last run left open: a run that ended inside the
+        // game window (LB_GAME_SCENE=1) or the immersive space would otherwise come back as only that, with no
+        // launcher to start the game, which also leaves bench autoplay with nothing to press. (visionOS 26; the
+        // native build targets 26.5, the launcher-only build 2.0.)
+        .defaultLaunchBehavior(.presented)
         // The glass comes from ImmersiveGhost, so it can go away while immersive play runs.
         .windowStyle(.plain)
         #endif
