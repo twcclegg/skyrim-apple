@@ -514,13 +514,31 @@ final class ImmersiveCompositor: @unchecked Sendable {
     }
 
     /// The screen, placed once: straight ahead of where the wearer is looking, level, at eye height.
-    /// LB_IMMERSIVE_FOLLOW=1 (outside head tracking): the screen stays ahead of the head's heading instead of where
-    /// it was first placed, level with the horizon (only left/right turning moves it), eased so small head motion
-    /// doesn't shake it. Read once the game is presenting.
-    private lazy var followHead: Bool = getenv("LB_IMMERSIVE_FOLLOW").map { String(cString: $0) == "1" } ?? false
+    /// LB_IMMERSIVE_FOLLOW (outside head tracking): 1 = the screen is locked to the head on every axis, always
+    /// straight ahead of the eyes whichever way they face (lying down looking at the ceiling included), eased so
+    /// small head motion doesn't shake it; "yaw" = it follows only the heading and stays level. Read once the game
+    /// is presenting.
+    private lazy var followMode: String = getenv("LB_IMMERSIVE_FOLLOW").map { String(cString: $0) } ?? ""
+    private var followHead: Bool { followMode == "1" || followMode == "yaw" }
     private var followYaw: Float?
+    private var followRotation: simd_quatf?
     private func place(head: simd_float4x4) -> simd_float4x4 {
         if let screen, !followHead { return screen }
+        if followMode == "1" {
+            let rotation = simd_quatf(simd_float3x3(SIMD3(head.columns.0.x, head.columns.0.y, head.columns.0.z),
+                                                    SIMD3(head.columns.1.x, head.columns.1.y, head.columns.1.z),
+                                                    SIMD3(head.columns.2.x, head.columns.2.y, head.columns.2.z)))
+            let eased = followRotation.map { simd_slerp($0, rotation, 0.15) } ?? rotation
+            followRotation = eased
+            let m = simd_float3x3(eased)
+            let position = SIMD3<Float>(head.columns.3.x, head.columns.3.y, head.columns.3.z)
+            let center = position - m.columns.2 * Self.distance  // the head looks along -z
+            let placed = simd_float4x4(SIMD4<Float>(m.columns.0, 0), SIMD4<Float>(m.columns.1, 0),
+                                       SIMD4<Float>(m.columns.2, 0), SIMD4<Float>(center, 1))
+            if screen == nil { log("screen locked to the head, \(Self.distance) m ahead") }
+            screen = placed
+            return placed
+        }
         var forward = -SIMD3<Float>(head.columns.2.x, 0, head.columns.2.z)
         forward = length(forward) > 0.001 ? normalize(forward) : SIMD3<Float>(0, 0, -1)
         if followHead {
