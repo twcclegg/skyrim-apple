@@ -1,0 +1,1 @@
+4488B0  # 3x3 matrix transpose (thiscall, used by 0x486C20) -> runtime/skyrim_native_g7.c

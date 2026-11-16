@@ -1,0 +1,5 @@
+# Group 8 native replacements (runtime/skyrim_native_g8.c), all checked at the calling convention (g8_abi.py)
+0xF531CC  # C runtime fabs(double)
+0x45C640  # bit n of a 64-bit mask, _allshl inlined
+0xACE100  # cull a bound against a culler's planes, 0x472580's test inlined
+0xF6029C  # C runtime SSE2 block copy (memcpy's aligned path)
