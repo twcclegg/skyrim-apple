@@ -92,6 +92,35 @@ TSO = os.environ.get("LIFT_TSO", "1") == "1"
 # anything else can see the CPU state: the end of the block, a call, a return, or a helper that takes `c`.
 # c->st[] and c->top therefore hold exactly what the plain model would hold at each of those points.
 X87CACHE = os.environ.get("LIFT_X87CACHE", "1") == "1"
+
+# The busiest Windows imports, emitted inline at call sites that name them directly (`call [iat]`, or a call to a
+# `jmp [iat]` stub) instead of going through the import dispatcher: a return-address push, a register spill and
+# reload, an uncached lookup and watchdog bookkeeping for what is often one atomic instruction. The bodies live in
+# runtime/import_inline.h, shared with the shims every other caller (a call through a register) still reaches.
+# All are stdcall: the arguments are at esp on entry and the callee pops them. LIFT_INLINE_IMPORTS=0 turns it off.
+INLINE_IMPORTS = os.environ.get("LIFT_INLINE_IMPORTS", "1") == "1"
+INLINE_IMPORT_BODIES = {  # KERNEL32 name: (argument count, statements; a0_.. are the arguments)
+    "InterlockedIncrement": (1, "eax = imp_InterlockedIncrement(a0_);"),
+    "InterlockedDecrement": (1, "eax = imp_InterlockedDecrement(a0_);"),
+    "InterlockedExchange": (2, "eax = imp_InterlockedExchange(a0_, a1_);"),
+    "InterlockedExchangeAdd": (2, "eax = imp_InterlockedExchangeAdd(a0_, a1_);"),
+    "InterlockedCompareExchange": (3, "eax = imp_InterlockedCompareExchange(a0_, a1_, a2_);"),
+    "TlsGetValue": (1, "eax = imp_TlsGetValue(c, a0_);"),
+    "GetCurrentThreadId": (0, "eax = imp_GetCurrentThreadId(c);"),
+    "GetLastError": (0, "eax = imp_GetLastError(c);"),
+    "SetLastError": (1, "imp_SetLastError(c, a0_); eax = 0;"),
+}
+
+
+def inline_import(name):
+    """The inline replacement for a call to import `name` ("KERNEL32.dll!TlsGetValue"), or None."""
+    dll, _, fn = name.partition("!")
+    spec = INLINE_IMPORT_BODIES.get(fn) if INLINE_IMPORTS and dll.lower().startswith("kernel32") else None
+    if not spec:
+        return None
+    n, body = spec
+    args = "".join("uint32_t a%d_ = M32(esp + %d); " % (k, 4 * k) for k in range(n))
+    return "{ /* %s */ %s%s esp += %d; }" % (fn, args, body, 4 * n)
 X87_LINE = re.compile(r"\bST\(|\bfpush\(|\bfpop\(|\bfstatus\(c\)|\bfxam\(c\)|\bfprem\(c|\bfpu_env\(c|c->top\b")
 X87_SYNC = re.compile(r"\bfxam\(c\)|\bfprem\(c|\bfpu_env\(c|c->top\b")
 X87_TOK = re.compile(r"fpush\(c, |fpop\(c\);|ST\((\d)\)( = (?!=))?|fcompare\(c, |fstatus\(c\)|c->c[0-3] = |;")
@@ -1297,6 +1326,10 @@ class Lifter:
                 # setjmp must run in this C frame so a later longjmp can return here
                 return ["{ esp -= 4; M32(esp) = 0x%Xu; %s if (setjmp(*rt_setjmp_slot(c, M32(esp + 4)))) { %s } "
                         "else { rt_setjmp3(c); %s } }" % (nxt, SPILL, RELOAD, RELOAD)]
+            if direct or (op.type == x86.X86_OP_MEM and not op.mem.base and not op.mem.index):
+                inline = inline_import(import_via(tgt))
+                if inline:
+                    return [inline]
             if direct:
                 return [self.call_direct(op.imm & 0xFFFFFFFF, nxt)]
             t = self.get(i, op, 4)
