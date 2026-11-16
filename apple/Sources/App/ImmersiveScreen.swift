@@ -514,15 +514,29 @@ final class ImmersiveCompositor: @unchecked Sendable {
     }
 
     /// The screen, placed once: straight ahead of where the wearer is looking, level, at eye height.
+    /// LB_IMMERSIVE_FOLLOW=1 (outside head tracking): the screen stays ahead of the head's heading instead of where
+    /// it was first placed, level with the horizon (only left/right turning moves it), eased so small head motion
+    /// doesn't shake it. Read once the game is presenting.
+    private lazy var followHead: Bool = getenv("LB_IMMERSIVE_FOLLOW").map { String(cString: $0) == "1" } ?? false
+    private var followYaw: Float?
     private func place(head: simd_float4x4) -> simd_float4x4 {
-        if let screen { return screen }
+        if let screen, !followHead { return screen }
         var forward = -SIMD3<Float>(head.columns.2.x, 0, head.columns.2.z)
         forward = length(forward) > 0.001 ? normalize(forward) : SIMD3<Float>(0, 0, -1)
+        if followHead {
+            let yaw = atan2(forward.x, -forward.z)
+            var eased = followYaw ?? yaw
+            var turn = yaw - eased
+            turn -= 2 * .pi * (turn / (2 * .pi)).rounded()
+            eased += turn * 0.08  // per compositor frame: about 0.15 s to catch up at 90 Hz
+            followYaw = eased
+            forward = SIMD3<Float>(sin(eased), 0, -cos(eased))
+        }
         let back = -forward, up = SIMD3<Float>(0, 1, 0), right = normalize(cross(up, back))
         let center = SIMD3<Float>(head.columns.3.x, head.columns.3.y, head.columns.3.z) + forward * Self.distance
         let placed = simd_float4x4(SIMD4<Float>(right, 0), SIMD4<Float>(up, 0), SIMD4<Float>(back, 0), SIMD4<Float>(center, 1))
+        if screen == nil { log("screen placed \(Self.distance) m ahead\(followHead ? ", following the head's heading" : "")") }
         screen = placed
-        log("screen placed \(Self.distance) m ahead")
         return placed
     }
 
