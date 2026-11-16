@@ -11,6 +11,8 @@ unsigned rt_module_count(unsigned m);
 
 #define MAX_THUNKS 8192
 static struct { ShimFn fn; const char *name; } g_thunks[MAX_THUNKS];
+/* One immutable table entry per thunk, so call-site caches can hold imports too (rt_call_ic). */
+static FnEntry g_thunk_entries[MAX_THUNKS];
 static uint32_t g_nthunks;
 static pthread_mutex_t g_thunk_lock = PTHREAD_MUTEX_INITIALIZER;
 
@@ -20,6 +22,8 @@ uint32_t rt_thunk(ShimFn fn, const char *name) {
     uint32_t i = g_nthunks;
     g_thunks[i].fn = fn;
     g_thunks[i].name = name;
+    g_thunk_entries[i].addr = GUEST_THUNK_BASE + i * 4;
+    g_thunk_entries[i].fn = fn;
     __atomic_store_n(&g_nthunks, i + 1, __ATOMIC_RELEASE);  /* entry visible before the count */
     pthread_mutex_unlock(&g_thunk_lock);
     return GUEST_THUNK_BASE + i * 4;
@@ -113,6 +117,30 @@ static void wd_bt(int sig) {
 }
 #endif
 
+/* LB_IMPORT_COUNT=1: calls per import, reported with the watchdog every 30 s (busiest first), to pick imports
+ * worth emitting inline in the lifter. Off by default: the counter is a shared atomic on every import call. */
+static int g_import_count = -1;
+static uint64_t g_thunk_calls[MAX_THUNKS], g_thunk_last[MAX_THUNKS];
+static void import_report(int seconds) {
+    uint32_t n = __atomic_load_n(&g_nthunks, __ATOMIC_ACQUIRE), top[16] = {0};
+    uint64_t d[16] = {0}, total = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        uint64_t k = __atomic_load_n(&g_thunk_calls[i], __ATOMIC_RELAXED), delta = k - g_thunk_last[i];
+        g_thunk_last[i] = k;
+        total += delta;
+        for (int j = 0; j < 16; j++)
+            if (delta > d[j]) {
+                memmove(&d[j + 1], &d[j], sizeof d[0] * (15 - j));
+                memmove(&top[j + 1], &top[j], sizeof top[0] * (15 - j));
+                d[j] = delta; top[j] = i;
+                break;
+            }
+    }
+    LOG("imports: %llu calls in %d s (%.0f/s)", (unsigned long long)total, seconds, (double)total / seconds);
+    for (int j = 0; j < 16 && d[j]; j++)
+        LOG("  %10.0f/s %5.1f%%  %s", (double)d[j] / seconds, 100.0 * d[j] / (total ? total : 1), g_thunks[top[j]].name);
+}
+
 static void *wd_thread(void *arg) {
     (void)arg;
     uint32_t last[WD_MAX] = {0}, still[WD_MAX] = {0};
@@ -130,6 +158,7 @@ static void *wd_thread(void *arg) {
         if (report && (f == lastf || tick % 6 == 0)) {
             LOG("watchdog %ds: frames %d%s", tick * 5, f, f == lastf ? " (no new frames)" : "");
             if (tick % 6 == 0) { extern void prof_report(void), cpu_report(void); prof_report(); cpu_report(); }
+            if (tick % 6 == 0 && g_import_count > 0) import_report(30);
             for (int i = 0; i < n; i++)
             {
                 uint32_t e = g_wd[i].esi, ok = e >= 0x10000 && e < 0xFFFFFFF0u;
@@ -159,6 +188,8 @@ static void *wd_thread(void *arg) {
 }
 
 void rt_watchdog_start(void) {
+    const char *ic = getenv("LB_IMPORT_COUNT");
+    g_import_count = ic && *ic == '1';
     pthread_t th;
     pthread_create(&th, NULL, wd_thread, NULL);
     pthread_detach(th);
@@ -169,6 +200,7 @@ void rt_call(CPU *c, uint32_t t) {
         uint32_t i = (t - GUEST_THUNK_BASE) / 4;
         if (i < __atomic_load_n(&g_nthunks, __ATOMIC_ACQUIRE)) {
             wd_note(c, g_thunks[i].name);
+            if (g_import_count > 0) __atomic_fetch_add(&g_thunk_calls[i], 1, __ATOMIC_RELAXED);
             TRACE("-> %s", g_thunks[i].name);
             if (!g_thunks[i].fn)
                 rt_fatal("unimplemented import %s (called from %08x)", g_thunks[i].name, M32(c->r[4]));
@@ -193,9 +225,22 @@ void rt_call(CPU *c, uint32_t t) {
 
 /* Indirect call from recompiled code with a per-call-site cache: remember the
  * target's table entry (immutable, so one pointer is a consistent pair).
- * Imports and unknown targets take the normal path every time. */
+ * Imports are cached too (LB_IMPORT_CACHE=0 turns that off): later calls from
+ * the site go straight to the shim, so the watchdog's last-import note and
+ * call count only see a site's first call. Unknown targets take the normal
+ * path every time. */
+static int g_import_cache = -1;
 void rt_call_ic(CPU *c, uint32_t t, const FnEntry **cache) {
-    if (t < GUEST_THUNK_BASE) {
+    if (t >= GUEST_THUNK_BASE) {
+        if (g_import_cache < 0) {
+            const char *v = getenv("LB_IMPORT_CACHE");
+            g_import_cache = !(v && *v == '0');
+        }
+        uint32_t i = (t - GUEST_THUNK_BASE) / 4;
+        if (g_import_cache && g_import_count <= 0 && !(t & 3) &&
+            i < __atomic_load_n(&g_nthunks, __ATOMIC_ACQUIRE) && g_thunk_entries[i].fn)
+            __atomic_store_n(cache, &g_thunk_entries[i], __ATOMIC_RELAXED);
+    } else {
         const FnEntry *e = lookup_entry(t);
         if (e) {
             __atomic_store_n(cache, e, __ATOMIC_RELAXED);

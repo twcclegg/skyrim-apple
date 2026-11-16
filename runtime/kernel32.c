@@ -2,6 +2,7 @@
 #define _GNU_SOURCE
 #include "game.h"
 #include "rt.h"
+#include "import_inline.h"
 #include "host_portability.h"
 #include <ctype.h>
 #include <dirent.h>
@@ -462,7 +463,7 @@ SHIM(GetExitCodeThread) {
     RET(t != NULL, 2);
 }
 
-SHIM(GetCurrentThreadId) { RET(M32(TEB(c) + 0x24), 0); }
+SHIM(GetCurrentThreadId) { RET(imp_GetCurrentThreadId(c), 0); }
 SHIM(GetCurrentProcessId) { RET(0x42, 0); }
 SHIM(GetCurrentThread) { RET(0xFFFFFFFEu, 0); }
 SHIM(GetCurrentProcess) { RET(0xFFFFFFFFu, 0); }
@@ -562,8 +563,8 @@ SHIM(Sleep) {
  * pools take one index each: with only 64, TlsAlloc failed while loading a
  * save, every pool shared index -1 and ran out of entries (0.17 crash).
  * Slots 64+ live in the TEB at +0x1800 (512 of them, to the end of the TEB). */
-#define TLS_SLOTS (64 + 512)
-static uint32_t tls_off(uint32_t i) { return i < 64 ? 0xE10 + 4 * i : 0x1800 + 4 * (i - 64); }
+#define TLS_SLOTS IMP_TLS_SLOTS
+#define tls_off imp_tls_off
 
 SHIM(TlsAlloc) {
     pthread_mutex_lock(&g_tlock);
@@ -584,10 +585,7 @@ SHIM(TlsFree) {
     if (ARG(0) < TLS_SLOTS) g_tls_used[ARG(0)] = 0;
     RET(ARG(0) < TLS_SLOTS, 1);
 }
-SHIM(TlsGetValue) {
-    rt_set_last_error(c, 0);
-    RET(ARG(0) < TLS_SLOTS ? M32(TEB(c) + tls_off(ARG(0))) : 0, 1);
-}
+SHIM(TlsGetValue) { RET(imp_TlsGetValue(c, ARG(0)), 1); }
 SHIM(TlsSetValue) {
     if (ARG(0) < TLS_SLOTS) M32(TEB(c) + tls_off(ARG(0))) = ARG(1);
     RET(ARG(0) < TLS_SLOTS, 2);
@@ -1332,9 +1330,9 @@ SHIM(VirtualFree) {
 }
 
 /* ===================== interlocked ===================== */
-SHIM(InterlockedIncrement) { __atomic_thread_fence(__ATOMIC_SEQ_CST); uint32_t r_ = __atomic_add_fetch((uint32_t *)(MEM + ARG(0)), 1, __ATOMIC_SEQ_CST); __atomic_thread_fence(__ATOMIC_SEQ_CST); RET(r_, 1); }
-SHIM(InterlockedDecrement) { __atomic_thread_fence(__ATOMIC_SEQ_CST); uint32_t r_ = __atomic_sub_fetch((uint32_t *)(MEM + ARG(0)), 1, __ATOMIC_SEQ_CST); __atomic_thread_fence(__ATOMIC_SEQ_CST); RET(r_, 1); }
-SHIM(InterlockedExchange) { __atomic_thread_fence(__ATOMIC_SEQ_CST); uint32_t r_ = __atomic_exchange_n((uint32_t *)(MEM + ARG(0)), ARG(1), __ATOMIC_SEQ_CST); __atomic_thread_fence(__ATOMIC_SEQ_CST); RET(r_, 2); }
+SHIM(InterlockedIncrement) { RET(imp_InterlockedIncrement(ARG(0)), 1); }
+SHIM(InterlockedDecrement) { RET(imp_InterlockedDecrement(ARG(0)), 1); }
+SHIM(InterlockedExchange) { RET(imp_InterlockedExchange(ARG(0), ARG(1)), 2); }
 
 /* ===================== time ===================== */
 static uint64_t now_ns(void) {
@@ -1433,8 +1431,8 @@ SHIM(VerSetConditionMask) {
     RET(ARG(0), 4);
 }
 SHIM(IsDebuggerPresent) { RET(0, 0); }
-SHIM(GetLastError) { RET(rt_get_last_error(c), 0); }
-SHIM(SetLastError) { rt_set_last_error(c, ARG(0)); RET(0, 1); }
+SHIM(GetLastError) { RET(imp_GetLastError(c), 0); }
+SHIM(SetLastError) { imp_SetLastError(c, ARG(0)); RET(0, 1); }
 SHIM(SetUnhandledExceptionFilter) { RET(0, 1); }
 SHIM(UnhandledExceptionFilter) { RET(0, 1); }
 SHIM(SetConsoleCtrlHandler) { RET(1, 2); }
@@ -1936,13 +1934,7 @@ SHIM(FormatMessageA) {
     RET(len, 7);
 }
 SHIM(LocalFree) { if (ARG(0)) gfree(ARG(0)); RET(0, 1); }
-SHIM(InterlockedCompareExchange) {
-    uint32_t exp = ARG(2);
-    __atomic_thread_fence(__ATOMIC_SEQ_CST);
-    __atomic_compare_exchange_n((uint32_t *)(MEM + ARG(0)), &exp, ARG(1), 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
-    __atomic_thread_fence(__ATOMIC_SEQ_CST);
-    RET(exp, 3);
-}
+SHIM(InterlockedCompareExchange) { RET(imp_InterlockedCompareExchange(ARG(0), ARG(1), ARG(2)), 3); }
 SHIM(lstrcmpiA) { RET((uint32_t)strcasecmp(GSTR(ARG(0)) ? GSTR(ARG(0)) : "", GSTR(ARG(1)) ? GSTR(ARG(1)) : ""), 2); }
 SHIM(IsDBCSLeadByte) { RET(0, 1); }
 SHIM(IsProcessorFeaturePresent) {
