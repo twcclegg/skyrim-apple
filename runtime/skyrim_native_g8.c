@@ -71,6 +71,7 @@ static inline uint32_t g8_plane_side(CPU *c, uint32_t plane, uint32_t sphere) {
 }
 /* the lifted code's indirect call through a per-call-site cache (see lift_terminator in tools/lift.py) */
 void rt_call_ic(CPU *c, uint32_t t, const FnEntry **cache);
+void rt_host_call_guest(CPU *c, void (*fn)(CPU *));
 
 void f_F531CC_guest(CPU *c);
 void f_472580(CPU *c);
@@ -186,7 +187,12 @@ void f_ACE100(CPU *c) {
     {
         static const FnEntry *ic_;
         const FnEntry *e_ = __atomic_load_n(&ic_, __ATOMIC_RELAXED);
-        if (e_ && e_->addr == t) e_->fn(c); else rt_call_ic(c, t, &ic_);
+        /* A cached lifted entry goes through rt_host_call_guest: with pinned registers a lifted function
+         * takes them in host registers, not from the CPU struct this host code keeps them in. A cached
+         * import shim (at or above GUEST_THUNK_BASE) uses the struct and is called directly. */
+        if (e_ && e_->addr == t) {
+            if (t >= GUEST_THUNK_BASE) e_->fn(c); else rt_host_call_guest(c, e_->fn);
+        } else rt_call_ic(c, t, &ic_);
     }
     uint32_t sp = c->r[4], ebx = c->r[3], eax = c->r[0];
     if (g8_tl8(ebx + 0x10D)) {
