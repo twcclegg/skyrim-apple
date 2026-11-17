@@ -871,7 +871,7 @@ struct FpFrame {
 static FpTarget g_fp_target;
 static FpFrame g_fp_frame;
 static IDirect3DDevice9 *g_fp_device;  // the device the hooks last saw
-static float g_fp_near;                // the first-person near plane, learnt from a late pass (0: not yet)
+static float g_fpd_near;                // the first-person near plane, learnt from a late pass (0: not yet)
 static float g_proj_p33;               // _33 of the projection set last (0: not perspective)
 static float g_world_p33;              // _33 of the last projection with the world camera's near plane (0: none yet)
 static bool g_fp_depth_scale;          // LB_FP_DEPTH_SCALE: on unless 0
@@ -884,7 +884,7 @@ static bool fp_depth_draw_now(void) {
     const FpTarget &t = g_fp_target;
     return g_fp_frame.fp && t.w == g_bb_w && t.h == g_bb_h && t.fmt == D3DFMT_R32F;
 }
-static void fp_update(void) {
+static void fpd_update(void) {
     FpFrame &f = g_fp_frame;
     const FpTarget &t = g_fp_target;
     f.fp = (f.late || f.proj) && t.rt && !t.bb && !hud_screen_in_pass();
@@ -916,7 +916,7 @@ void d3d_fp_target(IDirect3DDevice9 *d) {
     const FpTarget &t = g_fp_target;
     // the late pass goes on into other back-buffer-sized targets, and ends at any other
     if (g_fp_frame.late && (!rt || t.bb || t.w != g_bb_w || t.h != g_bb_h)) g_fp_frame.late = false;
-    fp_update();
+    fpd_update();
     if (rt) rt->Release();
     if (ds) ds->Release();
     if (bb) bb->Release();
@@ -931,11 +931,11 @@ void d3d_fp_clear(uint32_t flags) {
     if (!t.rt || t.bb || !g_bb_w || t.w != g_bb_w || t.h != g_bb_h || !f.seen_main || f.late) return;
     f.late = true;
     f.late_confirmed = false;
-    fp_update();
+    fpd_update();
 }
 
 // The world camera's near plane (NiCamera W, see game_camera_read below), or 0.
-static float world_near(void) {
+static float fpd_world_near(void) {
     uint32_t root = M32(0x1B2E8BC), w = root >= 0x10000 ? M32(root + 0xB8) : 0;
     float v = 0;
     if (w >= 0x10000) memcpy(&v, MEM + w + 0xF8, 4);
@@ -949,7 +949,7 @@ static float world_near(void) {
 void d3d_fp_projection(const float *m) {
     FpFrame &f = g_fp_frame;
     const float near_plane = m[11] == 1.0f && m[10] != 0.0f ? -m[14] / m[10] : 0.0f;  // 0: not perspective
-    const float world = world_near();
+    const float world = fpd_world_near();
     auto same = [](float a, float b) { return a > 0 && b > 0 && fabsf(a - b) <= 1e-3f * b; };
     g_proj_p33 = near_plane > 0 ? m[10] : 0.0f;
     if (same(near_plane, world)) g_world_p33 = m[10];
@@ -958,16 +958,16 @@ void d3d_fp_projection(const float *m) {
             f.late = false;  // not the first-person camera (the loading screen's model has the world's)
         } else {
             f.late_confirmed = true;
-            if (!same(near_plane, g_fp_near)) {
+            if (!same(near_plane, g_fpd_near)) {
                 LOG("first-person near plane %g (world %g)", near_plane, world);
-                g_fp_near = near_plane;
+                g_fpd_near = near_plane;
             }
         }
-    } else if (f.late && !same(near_plane, g_fp_near)) {
+    } else if (f.late && !same(near_plane, g_fpd_near)) {
         f.late = false;
     }
-    f.proj = same(near_plane, g_fp_near) && !same(near_plane, world);
-    fp_update();
+    f.proj = same(near_plane, g_fpd_near) && !same(near_plane, world);
+    fpd_update();
 }
 
 /* First-person depth in the world's encoding. The scene's R32F depth target holds what the game's depth pixel
@@ -991,7 +991,7 @@ void d3d_fp_projection(const float *m) {
  * `mad oC0.x, rT.x, cK.x, cK.y` with A and B in a `def` of a free constant, so no shader constant the game sets is
  * touched. A shader the rewrite does not understand is left as it is (logged once). The game shadows its own shader
  * state (it skips SetPixelShader for the shader it thinks is bound), so the original is bound again as soon as the
- * draws stop being FP_DEPTH (fp_update), before any other draw. The game's only later reader of the target, the
+ * draws stop being FP_DEPTH (fpd_update), before any other draw. The game's only later reader of the target, the
  * depth-of-field composite, blurs nothing as close as the hands in either encoding.
  *
  * Cost: the hooks run on every draw, target change, Clear and projection (a few compares each); the swap is one
@@ -1084,12 +1084,12 @@ static std::vector<uint32_t> fp_depth_patch(const uint32_t *in, size_t count, fl
 // Before an FP_DEPTH draw: bind the rewritten copy of the game's pixel shader (fp_depth_patch).
 static void fp_depth_scale_draw(void) {
     IDirect3DDevice9 *d = g_fp_device;
-    const float world = world_near();
-    if (!d || !g_fp_frame.proj || g_fp_near <= 0 || world <= g_fp_near * 1.0001f || g_proj_p33 <= 0) return;
+    const float world = fpd_world_near();
+    if (!d || !g_fp_frame.proj || g_fpd_near <= 0 || world <= g_fpd_near * 1.0001f || g_proj_p33 <= 0) return;
     if (!g_fp_depth_scale_off.empty() &&
         std::find(g_fp_depth_scale_off.begin(), g_fp_depth_scale_off.end(), g_frame + 1) != g_fp_depth_scale_off.end())
         return;
-    const float r = world / g_fp_near, p33w = g_world_p33 > 0 ? g_world_p33 : g_proj_p33;
+    const float r = world / g_fpd_near, p33w = g_world_p33 > 0 ? g_world_p33 : g_proj_p33;
     const float a = r * p33w / g_proj_p33, b = p33w * (1.0f - r);
     IDirect3DPixelShader9 *ps = nullptr;
     if (FAILED(d->GetPixelShader(&ps)) || !ps) return;
@@ -1110,7 +1110,7 @@ static void fp_depth_scale_draw(void) {
         const std::vector<uint32_t> patched = code.empty() ? code : fp_depth_patch(code.data(), code.size(), a, b);
         if (patched.empty() || FAILED(d->CreatePixelShader((const DWORD *)patched.data(), &p.patched))) p.patched = nullptr;
         LOG("first-person depth: pixel shader %p (%u bytes) %s, d' = %.6g d %+.6g (near %g -> %g)", (void *)ps, size,
-            p.patched ? "rewritten" : "NOT rewritten, its depth stays in the first-person encoding", a, b, g_fp_near,
+            p.patched ? "rewritten" : "NOT rewritten, its depth stays in the first-person encoding", a, b, g_fpd_near,
             world);
         if (g_fp_depth_cache.size() > 256) fp_depth_scale_forget();  // near planes changing all the time: start over
         g_fp_depth_cache.push_back(p);
@@ -1160,7 +1160,7 @@ static void fp_init(IDirect3DDevice9 *d) {
 static void fp_present(void) {
     if (!g_d3d_fp) return;
     g_fp_frame.late = g_fp_frame.proj = false;
-    fp_update();
+    fpd_update();
     g_fp_frame = FpFrame();
 }
 
