@@ -453,6 +453,8 @@ void d3d_trace(CPU *c, const char *name, int nargs) {
 // LB_BISECT=F: on frame F+2k, skip the k-th draw call of the frame and save
 // a screenshot after presenting it (finds which draw produces an artefact).
 int g_bisect, g_d3d_draws;
+static int g_last_class = -1;      // the class of the draw being made (d3d_passes_draw), for LB_SKIP_CLASS
+static uint32_t g_skip_class_mask;  // LB_SKIP_CLASS=depth,shadow,...: skip every draw of those classes (timing only)
 static int g_bisect_from = -1, g_draw_no;
 
 // LB_SKIP_DRAWS=F:A-B[,F:A-B...]: on frame F (the frame being drawn, as in LB_SHOT and LB_D3DTRACE: the number its
@@ -482,6 +484,7 @@ static bool skip_ranges_hit(void) {
 static bool fp_skip_now(void);  // LB_FP_SKIP, below
 
 bool d3d_skip_draw(void) {
+    if (g_skip_class_mask && g_last_class >= 0 && (g_skip_class_mask >> g_last_class & 1)) return true;
     if (!g_skip_ranges.empty() && skip_ranges_hit()) return true;
     if (fp_skip_now()) return true;
     int k = g_frame - g_bisect_from;
@@ -511,7 +514,8 @@ static void bisect_present(void) {
     g_draw_no = 0;
     if (!g_skip_ranges_read) skip_ranges_read();
     static const bool fp_skip = getenv("LB_FP_SKIP") || getenv("LB_STEREO_HYBRID");  // both skip draws
-    g_bisect = (g_frame >= g_bisect_from && g_frame < g_bisect_from + 160) || !g_skip_ranges.empty() || fp_skip;
+    g_bisect = (g_frame >= g_bisect_from && g_frame < g_bisect_from + 160) || !g_skip_ranges.empty() || fp_skip
+            || g_skip_class_mask;
 }
 
 // LB_PASSES=1 logs, at each Present, the frame's draw calls and primitives by the kind of pass they belong to, so
@@ -670,6 +674,7 @@ static void passdbg_flush(void) {
 
 void d3d_passes_draw(uint32_t prims) {
     int k = pass_class(prims);
+    g_last_class = k;
     PassFrame &f = g_pass_frame;
     f.cls[k].draws++;
     f.cls[k].prims += prims;
@@ -764,7 +769,13 @@ static void passes_init(IDirect3DDevice9 *d) {
         flame_init();
         const char *e = getenv("LB_PASSES"), *fp = getenv("LB_FP"), *eye = getenv("LB_STEREO_EYE_UNITS");
         g_passes_log = e ? atoi(e) : 0;
-        const bool fp_wanted = (fp && atoi(fp)) || getenv("LB_FP_SKIP") || (eye && atof(eye) != 0) || g_fp_flame;
+        if (const char *sc = getenv("LB_SKIP_CLASS")) {  // timing experiments: the picture is wrong by design
+            for (int c = 0; c < PASS_COUNT; c++)
+                if (strstr(sc, k_pass_names[c])) g_skip_class_mask |= 1u << c;
+            LOG("LB_SKIP_CLASS=%s: skipping pass classes mask %x", sc, g_skip_class_mask);
+        }
+        const bool fp_wanted = (fp && atoi(fp)) || getenv("LB_FP_SKIP") || (eye && atof(eye) != 0) || g_fp_flame
+                            || g_skip_class_mask;
         g_d3d_passes = g_passes_log || fp_wanted;
         // without an LB_D3DTRACE range, LB_PASSES=2 looks at the first frame
         g_passdbg = g_passes_log == 2 && !getenv("LB_D3DTRACE");
@@ -1702,6 +1713,117 @@ static void camera_log(void) {
  * draw. Without LB_STEREO_EYE_UNITS nothing changes, in DXVK either; with it but no LB_STEREO_FRAMES, the shaders
  * carry the shift with k = 0. */
 extern "C" void dxvk_stereo_set_clip_shift(float k);  // DXVK (dxvk_stereo.h)
+extern "C" void dxvk_stereo_set_view_clip_matrices(const float view0[16], const float view1[16]);
+
+/* Per-eye clip matrices for live single-pass stereo (stage 1 of rendering into the headset's own eye views).
+ * Each eye renders the game's scene through its own camera: M = P_eye * V_eye_from_game * inverse(P_game), in
+ * column-vector form on D3D clip space (x right, y up, z 0..w, w = view z), applied by DXVK to every perspective
+ * vertex of the main passes. View space is the game camera's (x right, y up, z forward, game units).
+ *   - P_game: from the game camera's frustum tangents (l r t b at unit distance), near and far.
+ *   - P_eye: from the eye's own tangents with the game's near and far (the eye's view of the same scene).
+ *   - V_eye_from_game: the eye's pose in the game camera's view space, inverted.
+ * skyrim_stereo_set_eyes gives the eyes (from the headset compositor); LB_STEREO_MATRIX=1 on the Mac uses the
+ * game's own frustum and +-LB_STEREO_EYE_UNITS sideways, which must equal the plain offset path exactly. */
+struct StereoEyes {
+    bool set = false;
+    float tangents[2][4];     // l r t b per eye, at unit distance
+    float eye_from_head[2][16];  // column-major, metres, visionOS head space (x right, y up, z back)
+    float units_per_metre = 70.0f;
+};
+static StereoEyes g_stereo_eyes;
+static std::mutex g_stereo_eyes_lock;
+extern "C" void skyrim_stereo_set_eyes(const float tangents[8], const float eye_from_head[32], float units_per_metre) {
+    std::lock_guard<std::mutex> hold(g_stereo_eyes_lock);
+    memcpy(g_stereo_eyes.tangents, tangents, sizeof g_stereo_eyes.tangents);
+    memcpy(g_stereo_eyes.eye_from_head, eye_from_head, sizeof g_stereo_eyes.eye_from_head);
+    if (units_per_metre > 0) g_stereo_eyes.units_per_metre = units_per_metre;
+    g_stereo_eyes.set = true;
+}
+
+// Column-major 4x4 helpers (m[c * 4 + r]).
+static void mat_mul(float out[16], const float a[16], const float b[16]) {
+    float t[16];
+    for (int c = 0; c < 4; c++)
+        for (int r = 0; r < 4; r++) {
+            float v = 0;
+            for (int k = 0; k < 4; k++) v += a[k * 4 + r] * b[c * 4 + k];
+            t[c * 4 + r] = v;
+        }
+    memcpy(out, t, sizeof t);
+}
+// D3D perspective projection, column-vector form: x_c = (2x - (r+l)z)/(r-l), y_c = (2y - (t+b)z)/(t-b),
+// z_c = f/(f-n) z - n f/(f-n), w_c = z.
+static void proj_d3d(float m[16], float l, float r, float t, float b, float n, float f) {
+    memset(m, 0, 16 * sizeof(float));
+    m[0] = 2.0f / (r - l);
+    m[5] = 2.0f / (t - b);
+    m[8] = -(r + l) / (r - l);
+    m[9] = -(t + b) / (t - b);
+    m[10] = f / (f - n);
+    m[11] = 1.0f;
+    m[14] = -n * f / (f - n);
+}
+// Its inverse (exact for the form above).
+static void proj_d3d_inverse(float m[16], float l, float r, float t, float b, float n, float f) {
+    memset(m, 0, 16 * sizeof(float));
+    const float a = f / (f - n), c = -n * f / (f - n);
+    m[0] = (r - l) / 2.0f;
+    m[5] = (t - b) / 2.0f;
+    m[12] = (r + l) / 2.0f;   // x = (x_c (r-l)/2 + w (r+l)/2) ...
+    m[13] = (t + b) / 2.0f;
+    m[14] = 1.0f;             // z = w_c
+    m[11] = 1.0f / c;         // w = (z_c - a w_c) / c
+    m[15] = -a / c;
+}
+/* The two eyes' clip matrices for the game camera `cam`. Returns false without eyes. */
+static bool stereo_eye_matrices(const GameCamera &cam, float d_units, float out[2][16], float near_override = 0) {
+    const float l = cam.frustum[0], r = cam.frustum[1], t = cam.frustum[2], b = cam.frustum[3];
+    const float n = near_override > 0 ? near_override : cam.frustum[4], f = cam.frustum[5];
+    if (!(r > l) || !(t > b) || !(n > 0) || !(f > n)) return false;
+    float inv_game[16];
+    proj_d3d_inverse(inv_game, l, r, t, b, n, f);
+    StereoEyes eyes;
+    { std::lock_guard<std::mutex> hold(g_stereo_eyes_lock); eyes = g_stereo_eyes; }
+    for (int e = 0; e < 2; e++) {
+        float p_eye[16], view[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
+        if (eyes.set) {
+            const float *tg = eyes.tangents[e];
+            proj_d3d(p_eye, tg[0], tg[1], tg[2], tg[3], n, f);
+            // Eye pose in head space (visionOS: z back) -> game view space (z forward), in game units: flip z.
+            const float *h = eyes.eye_from_head[e];
+            float pose[16];
+            for (int c = 0; c < 4; c++)
+                for (int rr = 0; rr < 4; rr++) {
+                    float v = h[c * 4 + rr];
+                    if ((rr == 2) != (c == 2)) v = -v;  // conjugate by diag(1,1,-1,1)
+                    pose[c * 4 + rr] = v;
+                }
+            pose[12] *= eyes.units_per_metre; pose[13] *= eyes.units_per_metre; pose[14] *= eyes.units_per_metre;
+            // view = inverse(pose) for a rigid pose: R^T and -R^T p
+            for (int c = 0; c < 3; c++)
+                for (int rr = 0; rr < 3; rr++) view[c * 4 + rr] = pose[rr * 4 + c];
+            for (int rr = 0; rr < 3; rr++)
+                view[12 + rr] = -(view[0 * 4 + rr] * pose[12] + view[1 * 4 + rr] * pose[13] + view[2 * 4 + rr] * pose[14]);
+        } else {
+            proj_d3d(p_eye, l, r, t, b, n, f);
+            view[12] = e == 0 ? d_units : -d_units;  // left eye at x = -d: view x' = x + d
+        }
+        float m[16];
+        mat_mul(m, view, inv_game);
+        mat_mul(out[e], p_eye, m);
+    }
+    return true;
+}
+/* The live matrices for the next frame: the world's, and the first-person draws' (their projection has its own
+ * near plane, 5 against the world's 15: with the world's inverse their eye offset would come out a third of what it
+ * should be). stereo_fp_changed switches between them as the first-person draws start and end. */
+static float g_live_m_world[2][16], g_live_m_fp[2][16];
+static bool g_live_m_valid, g_live_m_fp_valid;
+static bool stereo_matrix_mode(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("LB_STEREO_MATRIX"); on = e && !strcmp(e, "1"); }
+    return on == 1 || g_stereo_eyes.set;
+}
 extern "C" void dxvk_stereo_set_clip_offset(float x, float y, float z, float w);
 extern "C" int dxvk_stereo_enabled(void);
 extern "C" volatile int g_fake_clock_on;  // kernel32.c (rt_game_ns)
@@ -1847,6 +1969,11 @@ static void stereo_before_present(IDirect3DDevice9 *d) {
 static void stereo_fp_changed(int kind) {
     const StereoState &st = g_stereo;
     if (st.on && st.fp_only) dxvk_stereo_set_clip_shift(kind != FP_NONE ? st.k_applied : 0.0f);
+    // Live per-eye matrices: first-person draws through their own projection's inverse.
+    if (g_live_m_valid) {
+        const bool fp = kind != FP_NONE && g_live_m_fp_valid;
+        dxvk_stereo_set_view_clip_matrices(fp ? g_live_m_fp[0] : g_live_m_world[0], fp ? g_live_m_fp[1] : g_live_m_world[1]);
+    }
 }
 static bool stereo_skip_fp(void) { return g_stereo.skip_fp; }
 
@@ -1876,7 +2003,15 @@ static void stereo_after_present(void) {
         // Live single-pass stereo (LB_STEREO_MULTIVIEW=1, no capture frame): view 0 (layer 0) the left eye, view 1
         // mirrored to the right (dxvk_stereo.h), every frame.
         const float l = cam.frustum[0], r = cam.frustum[1];
-        if (r > l) k = 2.0f / (r - l) * -st.d;
+        float m[2][16];
+        if (stereo_matrix_mode() && stereo_eye_matrices(cam, st.d, m)) {
+            memcpy(g_live_m_world, m, sizeof m);
+            g_live_m_valid = true;
+            g_live_m_fp_valid = g_fp_near > 0 && stereo_eye_matrices(cam, st.d, g_live_m_fp, g_fp_near);
+            dxvk_stereo_set_view_clip_matrices(m[0], m[1]);  // the eyes' cameras; no offset on top
+        } else if (r > l) {
+            k = 2.0f / (r - l) * -st.d;
+        }
     }
     if (eye) st.cam_applied_valid = valid || (eye == 'C' && game_camera_read(&st.cam_applied));
     st.k_applied = k;
