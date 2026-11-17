@@ -143,6 +143,22 @@ static _Atomic float g_head_offset;  /* game heading minus head yaw: where the h
 static atomic_int g_head_anchored;
 /* For the compositor: the game heading (radians) that the head's yaw 0 maps to, or 0 with *valid = 0. */
 float skyrim_head_offset(int *valid) { *valid = atomic_load(&g_head_anchored); return atomic_load(&g_head_offset); }
+/* LB_HEAD_TEST's head, as head_steer last computed it (the Mac has no compositor to publish one). */
+static _Atomic float g_head_test_yaw, g_head_test_pitch;
+static atomic_int g_head_test_on;
+/* Where the head points now, in the game's terms: heading (radians, clockwise from north, as the game camera's)
+ * and pitch (up). From the compositor's latest pose (published every display refresh), or LB_HEAD_TEST's.
+ * Returns 0 while steering isn't anchored (menus, real mouse look) or no head is known. Any thread. */
+int skyrim_head_now(float *heading, float *pitch) {
+    if (!atomic_load(&g_head_anchored)) return 0;
+    float yaw, p;
+    if (atomic_load(&g_head_on)) { yaw = atomic_load(&g_head_yaw); p = atomic_load(&g_head_pitch); }
+    else if (atomic_load(&g_head_test_on)) { yaw = atomic_load(&g_head_test_yaw); p = atomic_load(&g_head_test_pitch); }
+    else return 0;
+    *heading = yaw + atomic_load(&g_head_offset);
+    *pitch = fmaxf(-1.1f, fminf(1.1f, p));
+    return 1;
+}
 static void head_note_event(const SDL_Event *e) {
     if (e->type == SDL_MOUSEMOTION && e->motion.which != SDL_TOUCH_MOUSEID
         && e->motion.which != LB_EDGE_TURN_MOUSEID && (e->motion.xrel || e->motion.yrel))
@@ -170,6 +186,11 @@ static void head_steer(void) {
     else if (test == 2) { float t = frame / 60.0f; head_yaw = 0.6f * sinf(t * 0.8f); head_pitch = 0.25f * sinf(t * 0.5f); }
     else if (atomic_load(&g_head_on)) { head_yaw = atomic_load(&g_head_yaw); head_pitch = atomic_load(&g_head_pitch); }
     else { if (anchored) { void input_head_stick(float, float); input_head_stick(0, 0); } anchored = 0; atomic_store(&g_head_anchored, 0); return; }
+    if (test) {  /* for skyrim_head_now */
+        atomic_store(&g_head_test_yaw, head_yaw);
+        atomic_store(&g_head_test_pitch, head_pitch);
+        atomic_store(&g_head_test_on, 1);
+    }
     float cam[18];
     if (!g_window) return;
     void input_head_stick(float x, float y);
