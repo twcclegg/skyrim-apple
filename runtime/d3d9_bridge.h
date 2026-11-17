@@ -24,9 +24,35 @@ static inline R bridge_call(T *self, R (STDMETHODCALLTYPE T::*m)(P...), A... a) 
     return (self->*m)(((P)(a))...);
 }
 
-extern int g_d3d_trace, g_bisect;
+extern int g_d3d_trace, g_bisect, g_d3d_draws;  /* g_d3d_draws: draw calls since the last Present */
 bool d3d_skip_draw(void);
 void d3d_trace(CPU *c, const char *name, int nargs);
+void d3d_trace_camera(const char *why);  // LB_D3DTRACE: the game's world camera near/far and FOVs at this call
+
+/* LB_PASSES (d3d9_bridge.cpp): draws and primitives per kind of pass, logged at each Present. 0 off, 1 the
+ * per-frame "pass" line, 2 also "passdbg" and "fpdbg" lines. The hooks are called only while g_d3d_passes is set:
+ * with LB_PASSES, or without logs when the first-person flag is wanted (LB_FP=1, LB_FP_SKIP, LB_STEREO_EYE_UNITS). */
+extern int g_d3d_passes;
+void d3d_passes_draw(uint32_t prims);          // every Draw*Primitive*, with its primitive count
+void d3d_passes_target(IDirect3DDevice9 *d);   // after the render target 0 or the depth-stencil surface changed
+void d3d_passes_clear(uint32_t flags);         // before a Clear, with its D3DCLEAR_* flags
+void d3d_passes_projection(const float *m);    // SetTransform(D3DTS_PROJECTION), the guest's matrix
+bool hud_screen_in_pass(void);                 // drawing a menu into the second screen's image (hud_screen.cpp)
+/* First-person draws (arms, weapon, spell hand and its effect; d3d9_bridge.cpp): whether the draw being made is one,
+ * and of which kind. C callers: skyrim_first_person_pass() returns the kind, skyrim_first_person_listen(fn) has fn
+ * called with the new kind on each change (on the device thread, nullptr to stop). */
+enum FpKind {
+    FP_NONE,     // not a first-person draw
+    FP_COLOUR,   // the late pass, lit, into the scene target (A16B16G16R16F, before tone mapping)
+    FP_DEPTH,    // the late pass, depth, into the scene's R32F depth target
+    FP_OTHER,    // the late pass into another back-buffer-sized target (Flames: one A8R8G8B8 draw)
+    FP_PREPASS,  // depth only, first in the main pass: hides the world behind the hands
+    FP_MASK,     // into the smaller (960x540 at 720p) pass, depth then red only (sun-shadow mask, inferred)
+    FP_KINDS
+};
+bool d3d_first_person(void);
+extern "C" int skyrim_first_person_pass(void);
+extern "C" void skyrim_first_person_listen(void (*fn)(int kind));
 
 /* First-person depth (d3d9_bridge.cpp): the first-person meshes' depth is written in the world's encoding. The
  * hooks are called only while g_d3d_fp is set, which it is unless LB_FP_DEPTH_SCALE=0. */
@@ -44,4 +70,7 @@ void platform_present_begin(void);
 void platform_present_end(void);
 /* time the 60 fps pacing slept after this Present, for the benchmark's per-frame work time */
 void platform_present_slept(double ms);
+/* draw calls the game made for the frame being presented, for the benchmark's per-frame log */
+void platform_present_draws(int draws);
+int platform_frame_count(void);
 }
