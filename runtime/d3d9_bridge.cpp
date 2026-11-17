@@ -603,6 +603,7 @@ static float g_fp_near;                // the first-person near plane, learnt fr
 static void (*g_fp_listener)(int kind);
 static void stereo_fp_changed(int kind);  // stereo captures with the eye offset on first-person draws only, below
 static bool stereo_skip_fp(void);         // stereo captures: a frame drawn with no first-person draws, below
+static void stereo_late_eyes(void);       // eye views, LB_EYE_LATE: the eyes turned toward the head, below
 
 // The kind of the first-person draw being made, from the target bound (FP_NONE outside first-person draws).
 static int fp_kind(void) {
@@ -838,6 +839,7 @@ void d3d_passes_draw(uint32_t prims) {
         dxvk_stereo_set_view_ui_offsets(on0, on1);
     }
     if (k == PASS_MAIN && g_depth_copy == 1 && !g_main_ds && g_pass_device) g_pass_device->GetDepthStencilSurface(&g_main_ds);
+    if (k == PASS_MAIN) stereo_late_eyes();
     if (g_passes_gpu) gpu_draw(k);
     PassFrame &f = g_pass_frame;
     f.cls[k].draws++;
@@ -2002,7 +2004,7 @@ static void proj_d3d_inverse(float m[16], float l, float r, float t, float b, fl
 }
 /* The two eyes' clip matrices for the game camera `cam`. Returns false without eyes. */
 static bool stereo_eye_matrices(const GameCamera &cam, float d_units, const StereoEyes &eyes, float out[2][16],
-                                float near_override = 0) {
+                                float near_override = 0, float far_scale = 1) {
     const float l = cam.frustum[0], r = cam.frustum[1], t = cam.frustum[2], b = cam.frustum[3];
     const float n = near_override > 0 ? near_override : cam.frustum[4], f = cam.frustum[5];
     if (!(r > l) || !(t > b) || !(n > 0) || !(f > n)) return false;
@@ -2012,7 +2014,7 @@ static bool stereo_eye_matrices(const GameCamera &cam, float d_units, const Ster
         float p_eye[16], view[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
         if (eyes.set) {
             const float *tg = eyes.tangents[e];
-            proj_d3d(p_eye, tg[0], tg[1], tg[2], tg[3], n, f);
+            proj_d3d(p_eye, tg[0], tg[1], tg[2], tg[3], n, f * far_scale);
             // Eye pose in head space (visionOS: z back) -> game view space (z forward), in game units: flip z.
             const float *h = eyes.eye_pose[e];
             float pose[16];
@@ -2208,6 +2210,79 @@ static bool stereo_live_multiview(void) {
 }
 
 // After Present: set the eye, and the clock, for the next frame.
+/* Eye views, stage 2 of plans/eye-views.md (LB_EYE_LATE=1): the game camera trails the head (head steering is a
+ * closed loop on the camera the game last presented, about 10 degrees behind a 27 deg/s sweep on the Mac), and
+ * each frame is rendered where its camera points. At the frame's first main-scene draw, when this frame's camera is
+ * known, the eyes are turned from the camera toward where the head points now (skyrim_head_now), by at most
+ * LB_EYE_LATE_MAX degrees each in heading and pitch (default 2: the compositor's default margin, so the eyes stay
+ * inside what the game culls for), and the matrices and the eyes this frame reports are redone with them. The
+ * compositor places each eye's picture by the reported pose, so the picture comes out where the head looks and
+ * only the remaining difference is corrected there. g_late_done: once per frame. */
+static bool g_late_done;
+extern "C" int skyrim_head_now(float *heading, float *pitch);  // platform_sdl.c
+static void stereo_late_eyes(void) {
+    if (g_late_done) return;
+    g_late_done = true;
+    static float max_rad = -1;
+    if (max_rad < 0) {
+        const char *e = getenv("LB_EYE_LATE");
+        const char *m = getenv("LB_EYE_LATE_MAX");
+        max_rad = e && !strcmp(e, "1") ? (m ? (float)atof(m) : 2.0f) * 0.017453293f : 0.0f;
+        if (max_rad > 0) LOG("eye views: late eyes, up to %.1f degrees toward the head", max_rad * 57.29578f);
+    }
+    if (max_rad <= 0 || !g_live_m_valid) return;
+    StereoEyes eyes;
+    { std::lock_guard<std::mutex> hold(g_stereo_eyes_lock); eyes = g_eyes_drawing; }
+    float heading, pitch;
+    GameCamera cam;
+    if (!eyes.set || menu_open() || !game_camera_read(&cam) || !skyrim_head_now(&heading, &pitch)) return;
+    // Forward is the rotation's first column; heading clockwise from north (+y), as head steering measures it.
+    const float game_yaw = atan2f(cam.rot[0], cam.rot[3]), game_pitch = asinf(fmaxf(-1.0f, fminf(1.0f, cam.rot[6])));
+    if (fabsf(game_pitch) > 1.2f) return;  // nearly straight up or down: the heading is meaningless
+    float dyaw = heading - game_yaw;
+    dyaw -= 6.2831853f * floorf((dyaw + 3.1415927f) / 6.2831853f);
+    const float dyaw_c = fmaxf(-max_rad, fminf(max_rad, dyaw));
+    const float dp_c = fmaxf(-max_rad, fminf(max_rad, pitch - game_pitch));
+    // In the camera's frame (x right, y up, z back, as the eye poses): R = Rx(-pitch_cam) Ry(-dyaw) Rx(pitch_cam + dp).
+    auto rx = [](float a, float m[9]) { float c = cosf(a), s = sinf(a); float r[9] = {1, 0, 0, 0, c, s, 0, -s, c}; memcpy(m, r, sizeof r); };
+    auto ry = [](float a, float m[9]) { float c = cosf(a), s = sinf(a); float r[9] = {c, 0, -s, 0, 1, 0, s, 0, c}; memcpy(m, r, sizeof r); };
+    auto mul3 = [](const float a[9], const float b[9], float o[9]) {  // column-major 3x3
+        float t[9];
+        for (int c = 0; c < 3; c++)
+            for (int r = 0; r < 3; r++) t[c * 3 + r] = a[0 * 3 + r] * b[c * 3 + 0] + a[1 * 3 + r] * b[c * 3 + 1] + a[2 * 3 + r] * b[c * 3 + 2];
+        memcpy(o, t, sizeof t);
+    };
+    float a[9], b[9], c[9], rot[9];
+    rx(-game_pitch, a); ry(-dyaw_c, b); rx(game_pitch + dp_c, c);
+    mul3(a, b, rot); mul3(rot, c, rot);
+    for (int e = 0; e < 2; e++) {
+        float *p = eyes.eye_pose[e], q[16];
+        for (int col = 0; col < 4; col++) {  // R applied to the pose's rotation columns and its position
+            for (int r = 0; r < 3; r++)
+                q[col * 4 + r] = rot[0 * 3 + r] * p[col * 4 + 0] + rot[1 * 3 + r] * p[col * 4 + 1] + rot[2 * 3 + r] * p[col * 4 + 2];
+            q[col * 4 + 3] = p[col * 4 + 3];
+        }
+        memcpy(p, q, sizeof q);
+    }
+    // Turning the eyes takes points on the game's far plane (the sky) past it: one at angle a off the camera's axis,
+    // turned by d toward the eye's, ends at depth f cos(a - d) / cos a = f (cos d + tan a sin d), largest at the
+    // frustum's corner. The eyes' far plane is that much farther (1% more), or the sky is clipped there.
+    const float corner = hypotf(fmaxf(-cam.frustum[0], cam.frustum[1]), fmaxf(cam.frustum[2], -cam.frustum[3]));
+    const float turn = hypotf(dyaw_c, dp_c);
+    const float far_scale = (cosf(turn) + corner * sinf(turn)) * 1.01f;
+    float m[2][16];
+    if (!stereo_eye_matrices(cam, g_stereo.d, eyes, m, 0, far_scale)) return;
+    memcpy(g_live_m_world, m, sizeof m);
+    g_live_m_fp_valid = g_fp_near > 0 && stereo_eye_matrices(cam, g_stereo.d, eyes, g_live_m_fp, g_fp_near, far_scale);
+    const bool fp = fp_kind() != FP_NONE && g_live_m_fp_valid;
+    dxvk_stereo_set_view_clip_matrices(fp ? g_live_m_fp[0] : m[0], fp ? g_live_m_fp[1] : m[1]);
+    { std::lock_guard<std::mutex> hold(g_stereo_eyes_lock); g_eyes_drawing = eyes; }
+    static int logged;
+    if (++logged % 300 == 1)
+        LOG("eye views: late eyes: head %.2f/%.2f deg from the camera, applied %.2f/%.2f", dyaw * 57.29578f,
+            (pitch - game_pitch) * 57.29578f, dyaw_c * 57.29578f, dp_c * 57.29578f);
+}
+
 /* LB_STEREO_TEST_EYES (Mac, no headset): feed skyrim_stereo_set_eyes as the compositor would. "game": the game's own
  * frustum for both eyes and +-LB_STEREO_EYE_UNITS sideways at 70 units per metre (must render exactly what the offset
  * path does); "l,r,t,b,separation_m": the left eye's tangents, the right eye's mirrored (-r, -l, t, b), the eyes
@@ -2235,6 +2310,7 @@ static void stereo_after_present(void) {
     StereoState &st = g_stereo;
     if (!st.on) return;
     { std::lock_guard<std::mutex> hold(g_stereo_eyes_lock); g_eyes_drawing = StereoEyes(); }
+    g_late_done = false;
     bool matrices_set = false;
     int base = 0, index = 0;
     const StereoSlot *slot = stereo_slot(g_frame + 1, &base, &index);
@@ -2483,6 +2559,7 @@ static void vr180_after_present(void) {
 static void stereo_before_present(IDirect3DDevice9 *) {}
 static void stereo_after_present(void) {}
 static void stereo_fp_changed(int) {}
+static void stereo_late_eyes(void) {}
 static bool stereo_skip_fp(void) { return false; }
 static void vr180_before_present(IDirect3DDevice9 *) {}
 static void vr180_after_present(void) {}
