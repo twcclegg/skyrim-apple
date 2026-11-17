@@ -932,7 +932,9 @@ static void passes_init(IDirect3DDevice9 *d) {
         flame_init();
         const char *e = getenv("LB_PASSES"), *fp = getenv("LB_FP"), *eye = getenv("LB_STEREO_EYE_UNITS");
         g_passes_log = e ? atoi(e) : 0;
-        g_depth_copy = getenv("LB_DEPTH_COPY") && atoi(getenv("LB_DEPTH_COPY")) ? 1 : 0;
+        // On by default with single-pass stereo (where the pass would be drawn twice); LB_DEPTH_COPY=0/1 decides.
+        const char *dc = getenv("LB_DEPTH_COPY"), *mv = getenv("LB_STEREO_MULTIVIEW");
+        g_depth_copy = dc ? (atoi(dc) ? 1 : 0) : (mv && !strcmp(mv, "1") ? 1 : 0);
         if (g_depth_copy) LOG("LB_DEPTH_COPY: the R32F depth pass is a copy of the main pass's depth");
         if (const char *sc = getenv("LB_SKIP_CLASS")) {  // timing experiments: the picture is wrong by design
             for (int c = 0; c < PASS_COUNT; c++)
