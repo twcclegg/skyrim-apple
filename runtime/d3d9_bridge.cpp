@@ -1428,7 +1428,20 @@ static void shot_before_present(IDirect3DDevice9 *d) {
 
 // The back buffer about to be presented to <save>/shot-<tag>.bmp, and with depth the scene's depth target to
 // <save>/depth-<tag>.f32.
+static void shot_write_layer(IDirect3DDevice9 *d, const char *tag, bool depth, unsigned layer);
 static void shot_write(IDirect3DDevice9 *d, const char *tag, bool depth) {
+    shot_write_layer(d, tag, depth, 0);
+#if defined(__APPLE__)
+    // Stereo back buffer (LB_STEREO_PRESENT): eye 2's picture as shot-<tag>-layer1.bmp
+    IDirect3DSurface9 *back = nullptr;
+    if (SUCCEEDED(d->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &back)) && back) {
+        const bool two = dxvk_stereo_surface_layers(back) == 2;
+        back->Release();
+        if (two) shot_write_layer(d, tag, false, 1);
+    }
+#endif
+}
+static void shot_write_layer(IDirect3DDevice9 *d, const char *tag, bool depth, unsigned layer) {
     if (depth) shot_depth(d, tag);
     IDirect3DSurface9 *back = nullptr, *copy = nullptr;
     D3DSURFACE_DESC desc;
@@ -1437,11 +1450,16 @@ static void shot_write(IDirect3DDevice9 *d, const char *tag, bool depth) {
     if (SUCCEEDED(hr)) hr = back->GetDesc(&desc);
     if (SUCCEEDED(hr) && desc.Format != D3DFMT_X8R8G8B8 && desc.Format != D3DFMT_A8R8G8B8) hr = E_FAIL;
     if (SUCCEEDED(hr)) hr = d->CreateOffscreenPlainSurface(desc.Width, desc.Height, desc.Format, D3DPOOL_SYSTEMMEM, &copy, nullptr);
+#if defined(__APPLE__)
+    if (SUCCEEDED(hr)) hr = layer ? (HRESULT)dxvk_stereo_get_render_target_data_layer(d, back, copy, layer) : d->GetRenderTargetData(back, copy);
+#else
     if (SUCCEEDED(hr)) hr = d->GetRenderTargetData(back, copy);
+#endif
     if (SUCCEEDED(hr)) hr = copy->LockRect(&locked, nullptr, D3DLOCK_READONLY);
     if (SUCCEEDED(hr)) {
         char path[1100];
-        snprintf(path, sizeof path, "%s/shot-%s.bmp", g_save_dir, tag);
+        if (layer) snprintf(path, sizeof path, "%s/shot-%s-layer%u.bmp", g_save_dir, tag, layer);
+        else snprintf(path, sizeof path, "%s/shot-%s.bmp", g_save_dir, tag);
         FILE *out = fopen(path, "wb");
         uint32_t w = desc.Width, h = desc.Height, row = (w * 3 + 3) & ~3u, size = 54 + row * h;
         uint8_t header[54] = {'B', 'M'};
