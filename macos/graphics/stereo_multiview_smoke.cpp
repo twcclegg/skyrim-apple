@@ -508,6 +508,46 @@ static int run(bool multiview) {
       const auto sampled = p.read(backbuffer, 0);
       r.expect(sampled == src0 && sampled != src1, "sample_reads_layer0", "sampled texture %s layer 0, %s layer 1",
           sampled == src0 ? "matches" : "differs from", sampled == src1 ? "matches" : "differs from");
+
+      // 7: a compiled pixel shader (ps_3_0: texld r0, v0, s0; mov oC0, r0) sampling the two-layer texture. In a
+      // multiview pass into the two-layer target each view reads its own layer (arrayed 2D sampler at
+      // gl_ViewIndex); in a mono pass into the back buffer it reads layer 0. Same pre-transformed quad (w = 1,
+      // unshifted) and point filter as above.
+      static const DWORD kSamplePs[] = {
+        0xFFFF0300u,                                   // ps_3_0
+        0x0200001Fu, 0x80000005u, 0x90030000u,         // dcl_texcoord0 v0.xy
+        0x0200001Fu, 0x90000000u, 0xA00F0800u,         // dcl_2d s0
+        0x03000042u, 0x800F0000u, 0x90E40000u, 0xA0E40800u,  // texld r0, v0, s0
+        0x02000001u, 0x800F0800u, 0x80E40000u,         // mov oC0, r0
+        0x0000FFFFu };
+      IDirect3DPixelShader9* samplePs = nullptr;
+      check(device->CreatePixelShader(kSamplePs, &samplePs), "CreatePixelShader(texld)");
+      auto drawSampled = [&](IDirect3DSurface9* rt) {
+        p.bind(rt, nullptr);
+        check(device->SetVertexShader(nullptr), "SetVertexShader(null)");
+        check(device->SetPixelShader(samplePs), "SetPixelShader(texld)");
+        check(device->SetFVF(D3DFVF_XYZRHW | D3DFVF_TEX1), "SetFVF");
+        check(device->SetTexture(0, texture), "SetTexture");
+        check(device->Clear(0, nullptr, D3DCLEAR_TARGET, 0xFF000000u, 1.0f, 0), "Clear");
+        check(device->BeginScene(), "BeginScene");
+        check(device->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, quadTex, sizeof(TexVertex)), "DrawPrimitiveUP(texld)");
+        check(device->EndScene(), "EndScene");
+        check(device->SetTexture(0, nullptr), "SetTexture(null)");
+      };
+      drawSampled(target);
+      const auto mv0 = p.read(target, 0), mv1 = p.read(target, 1);
+      r.expect(mv0 == src0 && mv1 == src1, "shader_sample_per_view",
+          "ps_3_0 texld in a multiview pass: layer 0 %s source layer 0, layer 1 %s source layer 1",
+          mv0 == src0 ? "matches" : "differs from", mv1 == src1 ? "matches" : "differs from");
+      drawSampled(backbuffer);
+      const auto mono = p.read(backbuffer, 0);
+      r.expect(mono == src0 && mono != src1, "shader_sample_mono_layer0",
+          "ps_3_0 texld in a mono pass: %s layer 0, %s layer 1",
+          mono == src0 ? "matches" : "differs from", mono == src1 ? "matches" : "differs from");
+      samplePs->Release();
+      check(device->SetVertexDeclaration(decl), "SetVertexDeclaration");
+      check(device->SetVertexShader(vs), "SetVertexShader");
+      check(device->SetPixelShader(ps), "SetPixelShader");
     }
   }
   dxvk_stereo_set_clip_offset(0.0f, 0.0f, 0.0f, 0.0f);
