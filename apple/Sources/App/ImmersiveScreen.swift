@@ -360,6 +360,13 @@ final class ImmersiveCompositor: @unchecked Sendable {
     private lazy var eyeMarginDegrees: Float = getenv("LB_EYE_MARGIN").flatMap { Float(String(cString: $0)) } ?? 2
     /// What was last given to skyrim_stereo_set_eyes, so it is only called when the eyes or the window change.
     private var givenEyes: [Float] = []
+    /// The game goes back to its own frustum (tracking lost, a menu without a camera, the layer ending).
+    private func dropEyes() {
+        guard !givenEyes.isEmpty else { return }
+        givenEyes = []
+        skyrim_stereo_clear_eyes()
+        log("eyes dropped: the game renders its own frustum")
+    }
 
     /// Gives the game the eyes of this drawable's first two views: their tangents clipped to the window and their
     /// poses relative to the device, whose starting place the frame's rays start from (the game camera follows the
@@ -580,6 +587,7 @@ final class ImmersiveCompositor: @unchecked Sendable {
         skyrim_sdl_set_window_ghost(0)
         DispatchQueue.main.async { NotificationCenter.default.post(name: .skyrimImmersiveRunning, object: false) }
         if headMode { skyrim_head_set(0, 0, 0) }
+        dropEyes()
         lastCommands?.waitUntilCompleted()
         skyrim_immersive_stop()
         session.stop()
@@ -787,6 +795,7 @@ final class ImmersiveCompositor: @unchecked Sendable {
                 let c = withUnsafeBytes(of: game.camera) { Array($0.bindMemory(to: Float.self)) }
                 halfSize = SIMD2(Self.viewPlane * c[13], Self.viewPlane * c[14])
             }
+            if anchor == nil { dropEyes() }
             if headMode, anchor != nil {
                 let angles = headAngles(head)
                 if !publishedHead { skyrim_head_set(angles.yaw, angles.pitch, 1); publishedHead = true }
@@ -797,10 +806,11 @@ final class ImmersiveCompositor: @unchecked Sendable {
                         let settings = readDepthSettings()
                         if settings.on, settings.units > 0 { metersPerUnit = headDepthScale / settings.units }
                     }
-                    if eyeViews, depthTexture != nil, metersPerUnit != nil {
-                        giveEyes(drawable, camera: c, unitsPerMetre: readDepthSettings().units / headDepthScale)
-                    }
                     if let poses = framePoses(camera: c, shownAt: seconds, metersPerUnit: metersPerUnit) {
+                        // Only while the frame is placed by the head: the eyes are relative to it.
+                        if eyeViews, depthTexture != nil, metersPerUnit != nil {
+                            giveEyes(drawable, camera: c, unitsPerMetre: readDepthSettings().units / headDepthScale)
+                        }
                         model = poses.model
                         heldModel = poses.held
                         // Frustum tangents right and top: the frame covers exactly the angles it was rendered for.
@@ -810,6 +820,7 @@ final class ImmersiveCompositor: @unchecked Sendable {
                 // Menus and loading come without a camera: show them on a screen placed ahead of where the head
                 // looks as they appear, not where the session started.
                 if halfSize == nil, lastTracked { screen = nil; model = place(head: head) }
+                if halfSize == nil { dropEyes() }
                 lastTracked = halfSize != nil
             }
             // The point between the eyes, in the device's space: the eye separation is scaled about it.
