@@ -166,7 +166,7 @@ const Cached &cached(const Entry &entry) {
 }
 
 const CachedDepth &depth_texture(const Entry &entry) {
-    static const CachedDepth none;
+    static const CachedDepth none{};
     if (!entry.depth || !g_export) return none;
     auto found = g_depth_cache.find(entry.depth);
     if (found != g_depth_cache.end()) return found->second;
