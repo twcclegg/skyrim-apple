@@ -33,6 +33,8 @@ typedef struct skyrim_immersive_frame {
     void *depth_texture;
     float camera[18];
     int has_camera;
+    void *texture_eye2;        /* stereo (LB_STEREO_PRESENT): the right eye's picture and depth; NULL when mono */
+    void *depth_texture_eye2;
 } skyrim_immersive_frame;
 int skyrim_frame_camera(float out[18]);  /* runtime/d3d9_bridge.cpp */
 }
@@ -45,7 +47,7 @@ struct Entry {
     uint64_t image = 0;
     uint64_t frame = 0;
     uint64_t depth = 0;
-    uint32_t slot = 0, width = 0, height = 0, format = 0;
+    uint32_t slot = 0, width = 0, height = 0, format = 0, layers = 1, depth_layers = 0;
     float camera[18] = {};
     bool has_camera = false;
     bool valid = false;
@@ -55,7 +57,12 @@ struct Entry {
 
 struct Cached {
     id<MTLTexture> sampled;
+    id<MTLTexture> sampled_eye2;  /* layer 1 of a stereo tap image */
     bool decode = false;
+};
+struct CachedDepth {
+    id<MTLTexture> depth;
+    id<MTLTexture> depth_eye2;
 };
 
 std::mutex g_lock;
@@ -67,7 +74,7 @@ Entry g_shown;
 std::atomic<uint32_t> g_mailbox_drops;  /* frames pushed out of a full mailbox by the game thread */
 void *g_cache_state;
 std::unordered_map<uint64_t, Cached> g_cache;
-std::unordered_map<uint64_t, id<MTLTexture>> g_depth_cache;  /* R32Float, sampled as it is */
+std::unordered_map<uint64_t, CachedDepth> g_depth_cache;  /* R32Float, sampled as it is */
 PFN_vkExportMetalObjectsEXT g_export;
 
 uint64_t now_ns() { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW); }
@@ -84,6 +91,8 @@ Entry entry_of(const dxvk_present_tap_frame *frame) {
     entry.height = frame->height;
     entry.format = frame->vk_format;
     entry.depth = frame->depth_vk_image;
+    entry.layers = frame->layers ? frame->layers : 1;
+    entry.depth_layers = frame->depth_layers;
     entry.has_camera = skyrim_frame_camera(entry.camera) != 0;  /* called inside this frame's Present */
     entry.valid = true;
     return entry;
@@ -129,10 +138,25 @@ const Cached &cached(const Entry &entry) {
         VkExportMetalObjectsInfoEXT info = {VK_STRUCTURE_TYPE_EXPORT_METAL_OBJECTS_INFO_EXT, &texture};
         g_export((VkDevice)entry.device, &info);
         id<MTLTexture> exported = texture.mtlTexture;
-        result.sampled = [exported newTextureViewWithPixelFormat:MTLPixelFormatBGRA8Unorm_sRGB];
-        if (!result.sampled) {
-            result.sampled = exported;
-            result.decode = true;
+        if (entry.layers >= 2 && exported.arrayLength >= 2) {
+            // Stereo: one 2D view per eye (layer), so the compositor samples plain 2D textures either way.
+            auto layer = [&](NSUInteger i, MTLPixelFormat format) {
+                return [exported newTextureViewWithPixelFormat:format textureType:MTLTextureType2D
+                                                        levels:NSMakeRange(0, 1) slices:NSMakeRange(i, 1)];
+            };
+            result.sampled = layer(0, MTLPixelFormatBGRA8Unorm_sRGB);
+            result.sampled_eye2 = layer(1, MTLPixelFormatBGRA8Unorm_sRGB);
+            if (!result.sampled || !result.sampled_eye2) {
+                result.sampled = layer(0, exported.pixelFormat);
+                result.sampled_eye2 = layer(1, exported.pixelFormat);
+                result.decode = true;
+            }
+        } else {
+            result.sampled = [exported newTextureViewWithPixelFormat:MTLPixelFormatBGRA8Unorm_sRGB];
+            if (!result.sampled) {
+                result.sampled = exported;
+                result.decode = true;
+            }
         }
         fprintf(stderr, "immersive: slot %u exported %lux%lu, VkFormat %u, Metal format %lu, sRGB view %d\n", entry.slot,
                 (unsigned long)exported.width, (unsigned long)exported.height, entry.format,
@@ -141,8 +165,9 @@ const Cached &cached(const Entry &entry) {
     return g_cache[entry.image] = result;
 }
 
-id<MTLTexture> depth_texture(const Entry &entry) {
-    if (!entry.depth || !g_export) return nil;
+const CachedDepth &depth_texture(const Entry &entry) {
+    static const CachedDepth none;
+    if (!entry.depth || !g_export) return none;
     auto found = g_depth_cache.find(entry.depth);
     if (found != g_depth_cache.end()) return found->second;
     VkExportMetalTextureInfoEXT texture = {VK_STRUCTURE_TYPE_EXPORT_METAL_TEXTURE_INFO_EXT};
@@ -153,7 +178,16 @@ id<MTLTexture> depth_texture(const Entry &entry) {
     id<MTLTexture> exported = texture.mtlTexture;
     fprintf(stderr, "immersive: slot %u depth exported %lux%lu, Metal format %lu\n", entry.slot,
             (unsigned long)exported.width, (unsigned long)exported.height, (unsigned long)exported.pixelFormat);
-    return g_depth_cache[entry.depth] = exported;
+    CachedDepth result;
+    if (entry.depth_layers >= 2 && exported.arrayLength >= 2) {
+        result.depth = [exported newTextureViewWithPixelFormat:exported.pixelFormat textureType:MTLTextureType2D
+                                                        levels:NSMakeRange(0, 1) slices:NSMakeRange(0, 1)];
+        result.depth_eye2 = [exported newTextureViewWithPixelFormat:exported.pixelFormat textureType:MTLTextureType2D
+                                                             levels:NSMakeRange(0, 1) slices:NSMakeRange(1, 1)];
+    } else {
+        result.depth = exported;
+    }
+    return g_depth_cache[entry.depth] = result;
 }
 
 }  // namespace
@@ -317,7 +351,12 @@ extern "C" int skyrim_immersive_acquire(skyrim_immersive_frame *out) {
     out->needs_srgb_decode = texture.decode ? 1 : 0;
     out->width = g_shown.width;
     out->height = g_shown.height;
-    out->depth_texture = (__bridge void *)depth_texture(g_shown);
+    const CachedDepth &depth = depth_texture(g_shown);
+    out->depth_texture = (__bridge void *)depth.depth;
+    if (texture.sampled_eye2) {
+        out->texture_eye2 = (__bridge void *)texture.sampled_eye2;
+        out->depth_texture_eye2 = (__bridge void *)depth.depth_eye2;
+    }
     memcpy(out->camera, g_shown.camera, sizeof out->camera);
     out->has_camera = g_shown.has_camera ? 1 : 0;
     return 1;

@@ -41,6 +41,11 @@ typedef struct skyrim_immersive_frame {
      * columns are forward, up, right; position; frustum tangents left, right, top, bottom; near; far. */
     float camera[18];
     int has_camera;
+    /* Stereo (LB_STEREO_PRESENT with LB_STEREO_MULTIVIEW): the right eye's picture and depth, rendered by the game
+     * from a camera moved LB_STEREO_EYE_UNITS to the right (the left eye in texture / depth_texture, moved to the
+     * left); NULL when the frame is mono. Same lifetime as texture. */
+    void *texture_eye2;
+    void *depth_texture_eye2;
 } skyrim_immersive_frame;
 void skyrim_immersive_start(void);
 void skyrim_immersive_stop(void);
