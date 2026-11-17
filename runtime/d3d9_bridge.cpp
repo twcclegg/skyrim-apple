@@ -1725,7 +1725,14 @@ static void pace_present(void) {
         std::unique_lock<std::mutex> guard(lock);
         if (interval_ns < 0) {
             const char *e = getenv("LB_MAX_FPS");
+#if defined(__APPLE__) && defined(TARGET_OS_VISION) && TARGET_OS_VISION
+            // Apple Vision Pro: 45 fps on every second 90 Hz refresh (display ticks); the compositor reprojects
+            // each frame to the head pose of both refreshes. The budget per game frame is then 22 ms, room for
+            // both eyes. LB_MAX_FPS overrides (60, 90, 0 = off).
+            int fps = e ? atoi(e) : 45;
+#else
             int fps = e ? atoi(e) : 60;
+#endif
             interval_ns = fps > 0 ? 1000000000ll / fps : 0;
             LOG("present pacing: %s %d fps (LB_MAX_FPS)", fps > 0 ? "at most" : "off,", fps > 0 ? fps : 0);
         }
