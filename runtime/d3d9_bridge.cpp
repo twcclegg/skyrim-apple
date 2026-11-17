@@ -463,6 +463,11 @@ static IDirect3DSurface9 *g_main_ds;   // the main pass's depth-stencil this fra
 static IDirect3DDevice9 *g_pass_device;
 static bool g_depth_copied;
 extern "C" long dxvk_copy_depth_to_float(void *device, void *depthStencil, void *floatTarget);
+extern "C" void dxvk_stereo_set_view_ui_offsets(const float view0[4], const float view1[4]);
+/* Live stereo: the interface (pass class ui: menus, HUD) at LB_STEREO_HUD_DEPTH metres (default 2) instead of at
+ * infinity. g_ui_k is view 0's clip offset for a point at that depth, set each frame by stereo_after_present. */
+static float g_ui_k;
+static bool g_ui_shift_on;
 static uint32_t g_skip_class_mask;  // LB_SKIP_CLASS=depth,shadow,...: skip every draw of those classes (timing only)
 static int g_bisect_from = -1, g_draw_no;
 
@@ -824,6 +829,11 @@ static void gpu_init(IDirect3DDevice9 *d) {
 void d3d_passes_draw(uint32_t prims) {
     int k = pass_class(prims);
     g_last_class = k;
+    if (g_ui_k != 0 && (k == PASS_UI) != g_ui_shift_on) {
+        g_ui_shift_on = k == PASS_UI;
+        const float on0[4] = {g_ui_shift_on ? g_ui_k : 0.0f, 0, 0, 0}, on1[4] = {g_ui_shift_on ? -g_ui_k : 0.0f, 0, 0, 0};
+        dxvk_stereo_set_view_ui_offsets(on0, on1);
+    }
     if (k == PASS_MAIN && g_depth_copy == 1 && !g_main_ds && g_pass_device) g_pass_device->GetDepthStencilSurface(&g_main_ds);
     if (g_passes_gpu) gpu_draw(k);
     PassFrame &f = g_pass_frame;
@@ -962,6 +972,11 @@ static bool depth_copy_draw(void) {
 
 static void passes_present(void) {
     g_depth_copied = false;
+    if (g_ui_shift_on) {
+        static const float zero[4] = {0, 0, 0, 0};
+        dxvk_stereo_set_view_ui_offsets(zero, zero);
+        g_ui_shift_on = false;
+    }
     if (g_main_ds) { g_main_ds->Release(); g_main_ds = nullptr; }
     if (!g_d3d_passes) return;
     g_pass_frame.fp_late = g_pass_frame.fp_proj = false;
@@ -2185,6 +2200,14 @@ static void stereo_after_present(void) {
         // mirrored to the right (dxvk_stereo.h), every frame.
         const float l = cam.frustum[0], r = cam.frustum[1];
         float m[2][16];
+        if (r > l) {
+            static float hud_units = -1;
+            if (hud_units < 0) {
+                const char *h = getenv("LB_STEREO_HUD_DEPTH");
+                hud_units = (h && atof(h) > 0 ? (float)atof(h) : 2.0f) * 70.0f;  // metres at 70 units per metre
+            }
+            g_ui_k = 2.0f / (r - l) * -st.d / hud_units;  // a point hud_units away: clip offset k / w, w = depth
+        }
         if (stereo_matrix_mode() && stereo_eye_matrices(cam, st.d, m)) {
             memcpy(g_live_m_world, m, sizeof m);
             g_live_m_valid = true;
