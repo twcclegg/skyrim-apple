@@ -281,6 +281,17 @@ static uint32_t mode_count(int *ww, int *wh, int64_t *an, int64_t *ad, uint32_t 
     mode_aspect(*ww, *wh, an, ad);
     int64_t t = (int64_t)*ww * *ad / *an;
     *top = (uint32_t)(t < *wh ? t : *wh);
+    /* An explicit LB_WINDOW is the largest mode, at its own aspect, whatever the window is: on visionOS the window
+     * is the system's, so LB_WINDOW=1280x1024 was not in the list and the game refused to start ("Your display
+     * doesn't support the selected resolution", the simulator, 17 Nov). The smaller modes follow at that aspect. */
+    static int lw = -1, lh = -1;
+    if (lw < 0) {
+        lw = lh = 0;
+        if (const char *e = getenv("LB_WINDOW")) {
+            if (sscanf(e, "%dx%d", &lw, &lh) != 2 || lw < 16 || lh < 16) lw = lh = 0;
+        }
+    }
+    if (lw) { *an = lw; *ad = lh; *top = (uint32_t)lh; }
     uint32_t n = 1;  // the largest size that fits the window
     for (uint32_t h : k_mode_heights) if (h < *top) n++;
     return n;
