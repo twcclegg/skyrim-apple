@@ -282,6 +282,7 @@ void pass_render(CPU *c, uint32_t menu, Target &t) {
     g_rt = nullptr;
     t.valid = true;
     g_dirty = true;
+    if (g_d3d_passes) d3d_passes_target(d);  // the game's targets are back, set past the bridge
 }
 
 void render_hud(CPU *c, uint32_t menu) {
@@ -359,6 +360,8 @@ void layout(RECT *hud, RECT *fav, RECT *fav_src) {
 }
 } // namespace
 
+bool hud_screen_in_pass(void) { return in_pass(); }
+
 // ---------------------------------------------------------------- bridge
 // Hand-written device methods (see tools/gen_d3d9_bridge.py): plain
 // pass-through except during a menu pass on our target.
@@ -394,6 +397,7 @@ void B_IDirect3DDevice9_SetRenderTarget(CPU *c) {
     }
     HRESULT hr = d->SetRenderTarget(ARG(1), s);
     if (g_d3d_fp && ARG(1) == 0) d3d_fp_target(d);
+    if (g_d3d_passes && ARG(1) == 0) d3d_passes_target(d);
     RET((uint32_t)hr, 3);
 }
 void B_IDirect3DDevice9_SetDepthStencilSurface(CPU *c) {
@@ -403,13 +407,18 @@ void B_IDirect3DDevice9_SetDepthStencilSurface(CPU *c) {
     if (in_pass() && s && s == g_from_ds) s = g_ds;
     HRESULT hr = d->SetDepthStencilSurface(s);
     if (g_d3d_fp) d3d_fp_target(d);
+    if (g_d3d_passes) d3d_passes_target(d);
     RET((uint32_t)hr, 2);
 }
 void B_IDirect3DDevice9_Clear(CPU *c) {
     auto *d = (IDirect3DDevice9 *)com_host(ARG(0));
     uint32_t n = ARG(1);
     const D3DRECT *rects = (const D3DRECT *)GPTR(ARG(2));
-    if (g_d3d_trace) fprintf(stderr, "D3D %d IDirect3DDevice9::Clear flags %x z %g\n", platform_frame_count(), ARG(3), ARGF(5));
+    if (g_d3d_trace) {
+        fprintf(stderr, "D3D %d IDirect3DDevice9::Clear flags %x z %g\n", platform_frame_count(), ARG(3), ARGF(5));
+        d3d_trace_camera("Clear");
+    }
+    if (g_d3d_passes) d3d_passes_clear(ARG(3));
     if (g_d3d_fp) d3d_fp_clear(ARG(3));
     if (in_pass() && g_on_rt && n && rects) {
         D3DRECT r[16];
@@ -423,6 +432,9 @@ void B_IDirect3DDevice9_Clear(CPU *c) {
 void B_IDirect3DDevice9_SetViewport(CPU *c) {
     auto *d = (IDirect3DDevice9 *)com_host(ARG(0));
     auto *v = (const D3DVIEWPORT9 *)GPTR(ARG(1));
+    if (g_d3d_trace && v)
+        fprintf(stderr, "D3D %d IDirect3DDevice9::SetViewport %u %u %u %u z %g %g\n", platform_frame_count(),
+                (unsigned)v->X, (unsigned)v->Y, (unsigned)v->Width, (unsigned)v->Height, v->MinZ, v->MaxZ);
     if (in_pass() && g_on_rt && v) {
         g_guest_vp = *v;
         D3DVIEWPORT9 s = *v;

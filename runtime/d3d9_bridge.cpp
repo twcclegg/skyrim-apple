@@ -1,6 +1,8 @@
 // Guest<->host Direct3D 9 bridge: COM object registry and the methods
 // that need hand-written marshalling (structures with pointers, locks,
 // presentation). Everything else is generated into d3d9_bridge_gen.cpp.
+#include <unistd.h>
+#include <dirent.h>
 #include <SDL2/SDL.h>
 #ifdef __APPLE__
 #include <TargetConditionals.h>
@@ -27,6 +29,7 @@ bool bc_surface_target(void *surf, void **tex, uint32_t *sub);
 #include <vector>
 #include <map>
 #include <algorithm>
+#include <string>
 
 // ---------------------------------------------------------------- registry
 namespace {
@@ -363,6 +366,7 @@ void B_IDirect3D9_GetAdapterDisplayMode(CPU *c) {
 }
 
 static void fp_init(IDirect3DDevice9 *d);  // first-person depth, below
+static void passes_init(IDirect3DDevice9 *d);  // LB_PASSES, below
 
 void B_IDirect3D9_CreateDevice(CPU *c) {
     auto *d3d = (IDirect3D9 *)com_host(ARG(0));
@@ -380,6 +384,7 @@ void B_IDirect3D9_CreateDevice(CPU *c) {
     if (SUCCEEDED(hr)) { g_bb_w = pp.BackBufferWidth; g_bb_h = pp.BackBufferHeight; }
     if (SUCCEEDED(hr)) { extern void hud_screen_device(IDirect3DDevice9 *); hud_screen_device(dev); }
     if (SUCCEEDED(hr)) fp_init(dev);
+    if (SUCCEEDED(hr)) passes_init(dev);
     if (ARG(6)) M32(ARG(6)) = SUCCEEDED(hr) ? d3d9_wrap(dev, IFACE_IDirect3DDevice9) : 0;
     LOG("CreateDevice -> %08x", (uint32_t)hr);
     RET(hr, 7);
@@ -420,17 +425,21 @@ void B_IDirect3DDevice9_Reset(CPU *c) {
     pp_to_guest(&pp, ARG(1));
     if (SUCCEEDED(hr)) { g_bb_w = pp.BackBufferWidth; g_bb_h = pp.BackBufferHeight; }
     if (SUCCEEDED(hr) && g_d3d_fp) d3d_fp_target(d);  // Reset binds the back buffer again
+    if (SUCCEEDED(hr) && g_d3d_passes) d3d_passes_target(d);  // Reset binds the back buffer again
     LOG("Reset %ux%u -> %08x", pp.BackBufferWidth, pp.BackBufferHeight, (uint32_t)hr);
     RET(hr, 2);
 }
 
-// LB_D3DTRACE=from:to logs every generated bridge call made during those
+// LB_D3DTRACE=from:to[,from:to...] logs every generated bridge call made during those
 // frames (counted by Present) to stderr.
 int g_d3d_trace;
-static int g_frame, g_trace_from = -1, g_trace_to = -1;
+static int g_frame, g_trace_from = -1;
 
+static void trace_camera_changed(void);
 void d3d_trace(CPU *c, const char *name, int nargs) {
-    fprintf(stderr, "D3D %d %s", g_frame, name);
+    trace_camera_changed();
+    if (strstr(name, "Draw")) fprintf(stderr, "D3D %d #%d %s", g_frame, g_d3d_draws, name);
+    else fprintf(stderr, "D3D %d %s", g_frame, name);
     for (int i = 1; i <= nargs; i++) fprintf(stderr, " %x", ARG(i));
     if (strstr(name, "ConstantF") && ARG(2))
         for (uint32_t i = 0; i < ARG(3) * 4 && i < 64; i++)
@@ -443,10 +452,38 @@ void d3d_trace(CPU *c, const char *name, int nargs) {
 
 // LB_BISECT=F: on frame F+2k, skip the k-th draw call of the frame and save
 // a screenshot after presenting it (finds which draw produces an artefact).
-int g_bisect;
+int g_bisect, g_d3d_draws;
 static int g_bisect_from = -1, g_draw_no;
 
+// LB_SKIP_DRAWS=F:A-B[,F:A-B...]: on frame F (the frame being drawn, as in LB_SHOT and LB_D3DTRACE: the number its
+// Present will have) skip draws A to B, counted from 0 at the frame's first draw (the #n of LB_D3DTRACE's lines).
+// With LB_SHOT=F the picture shows what those draws contributed. Experiments only.
+struct SkipRange { int frame, from, to; };
+static std::vector<SkipRange> g_skip_ranges;
+static bool g_skip_ranges_read;
+static void skip_ranges_read(void) {
+    g_skip_ranges_read = true;
+    for (const char *e = getenv("LB_SKIP_DRAWS"); e && *e;) {
+        SkipRange r = {};
+        int n = sscanf(e, "%d:%d-%d", &r.frame, &r.from, &r.to);
+        if (n == 2) r.to = r.from;
+        if (n >= 2) g_skip_ranges.push_back(r);
+        e = strchr(e, ',');
+        if (e) e++;
+    }
+    if (!g_skip_ranges.empty()) LOG("LB_SKIP_DRAWS: %zu ranges", g_skip_ranges.size());
+}
+static bool skip_ranges_hit(void) {
+    const int frame = g_frame + 1, draw = g_d3d_draws - 1;  // g_d3d_draws already counts this draw
+    for (const SkipRange &r : g_skip_ranges)
+        if (r.frame == frame && draw >= r.from && draw <= r.to) return true;
+    return false;
+}
+static bool fp_skip_now(void);  // LB_FP_SKIP, below
+
 bool d3d_skip_draw(void) {
+    if (!g_skip_ranges.empty() && skip_ranges_hit()) return true;
+    if (fp_skip_now()) return true;
     int k = g_frame - g_bisect_from;
     return k >= 0 && !(k & 1) && g_draw_no++ == k / 2;
 }
@@ -472,7 +509,335 @@ static void bisect_present(void) {
 #endif
     }
     g_draw_no = 0;
-    g_bisect = g_frame >= g_bisect_from && g_frame < g_bisect_from + 160;
+    if (!g_skip_ranges_read) skip_ranges_read();
+    static const bool fp_skip = getenv("LB_FP_SKIP") || getenv("LB_STEREO_HYBRID");  // both skip draws
+    g_bisect = (g_frame >= g_bisect_from && g_frame < g_bisect_from + 160) || !g_skip_ranges.empty() || fp_skip;
+}
+
+// LB_PASSES=1 logs, at each Present, the frame's draw calls and primitives by the kind of pass they belong to, so
+// we can tell how much of a frame a second eye would have to draw again (twcclegg/skyrim-apple#23):
+//   pass <frame> shadow=<draws>/<prims> refl=.. main=.. depth=.. fp=.. mask=.. fx=.. post=.. ui=.. other=.. rt=<changes>
+// <frame> is the one in the same frame's "ft" line (LB_FRAMETIMES), the classes add up to its draw count, and rt
+// counts changes of render target 0. LB_PASSES=2 also logs each run of draws of one class into one target, in the
+// LB_D3DTRACE frames (without it, the first frame), to check the classes against a real frame:
+//   passdbg <frame> <class> <w>x<h> fmt=<D3DFORMAT> ds=<depth-stencil bound> draws=<n> prims=<n>
+// and, every frame, a line on the first-person pass (d3d_first_person):
+//   fpdbg <frame> runs=<n> mask=<draws> prepass=<draws> colour=<draws> other=<draws> depth=<draws>
+//         draws=#<first>-#<last> near=<first-person near plane> [UNEXPECTED]
+// Off, it costs one branch per draw call, target change and Clear. g_d3d_passes turns the hooks on: also without
+// LB_PASSES when the first-person flag is wanted (LB_FP=1, LB_FP_SKIP, or LB_STEREO_EYE_UNITS set), then with no logs.
+int g_d3d_passes;
+static int g_passes_log;  // LB_PASSES: 0 no lines, 1 pass lines, 2 also passdbg and fpdbg lines
+enum PassClass {
+    PASS_SHADOW, PASS_REFL, PASS_MAIN, PASS_DEPTH, PASS_FP, PASS_MASK, PASS_FX, PASS_POST, PASS_UI, PASS_OTHER, PASS_COUNT
+};
+static const char *const k_pass_names[PASS_COUNT] = {"shadow", "refl", "main", "depth", "fp",
+                                                     "mask",   "fx",   "post", "ui",    "other"};
+struct PassTotals { int draws; uint32_t prims; };  // per class and frame (a GPU time per class would go here too)
+struct PassTarget { void *rt; uint32_t w, h, fmt; bool ds, bb; };  // what draws go to now (rt: identity only)
+struct PassFrame {
+    PassTotals cls[PASS_COUNT];
+    int rt_changes;
+    bool seen_main, seen_depth, seen_bb;  // a main / depth / back buffer draw happened this frame
+    // First-person detection (d3d_first_person, below)
+    bool fp_late;                         // in the late pass: after its Clear of depth only, until its projection ends
+    bool fp_late_confirmed;               // ... and its projection was seen to be the first-person one
+    bool fp_proj;                         // the projection set last is the first-person one
+    bool fp;                              // fp_late || fp_proj, and a target that allows it
+    bool fp_last_draw;                    // the frame's previous draw was a first-person one
+    int fp_runs, fp_kind_draws[FP_KINDS]; // runs of consecutive first-person draws; draws by kind (index = kind)
+    int fp_first, fp_last;                // frame draw numbers (#n of LB_D3DTRACE) of the first and last of them
+};
+struct PassRun { int cls; int draws; uint32_t prims; PassTarget t; };  // LB_PASSES=2: draws since the last line
+static PassTarget g_pass_target;
+static PassFrame g_pass_frame;
+static PassRun g_pass_run = {-1, 0, 0, {}};
+static bool g_passdbg;
+
+/* First-person draws (twcclegg/skyrim-apple#23, stage 1): the arms, the weapon, the spell hand and the hand's effect,
+ * drawn with the game's first-person camera, whose projection has its own near plane (5; the world's is 15). Traced in
+ * Riverwood (TESV 1.9.32.0.8, low preset, 1280x720) with empty hands, a sword, and a sword plus Flames, a frame draws
+ * the first-person meshes in three places, each time after a SetTransform(D3DTS_PROJECTION) with that near plane:
+ *   mask     into the 960x540 pass (the "refl" class), first depth only, then writing red only: the hands in what
+ *            looks like the screen-space sun-shadow mask (10 draws with a sword: 5 + 5)
+ *   prepass  first thing in the main pass on the scene target, colour writes off: the hands' depth, so the world is not
+ *            drawn behind them (5 draws). Skipping the late pass leaves flat silhouettes in the clear colour there.
+ *   late     after the world's effects and the sun's first occlusion query, still before tone mapping:
+ *              Clear(ZBUFFER only, z 1)   on the scene target; its colour (the world) stays
+ *              colour  the meshes with lighting, then the hand's effect (Flames: 3 more additive draws)
+ *              other   with Flames, one draw into a cleared A8R8G8B8 target of back-buffer size (the fire's)
+ *              Clear(ZBUFFER only) on the scene's R32F depth target, which keeps the world's depth (not cleared)
+ *              depth   the opaque meshes again (5), writing their depth over the world's
+ *            then the scene target with the world's projection again (the sun's second query) and the post chain.
+ * The flag is on during the late pass (from its Clear of depth only into a back-buffer-sized target, once the main
+ * pass has drawn, until a projection with another near plane or a target that is not back-buffer-sized), and
+ * whenever the projection set last has the near plane learnt from the late pass and not the world camera's. So the
+ * mask and prepass draws are caught only once a late pass was seen (from the second first-person frame on).
+ * Third person has no such Clear and no such projection. The loading screen's model has a Clear of depth only but the
+ * world's near plane, and is not counted. The game keeps drawing the first-person pass under menus that show the
+ * world (the Tab menu), so the flag is on there too.
+ * The flag is set and cleared on the thread making the device calls, between draws, so code on the bridge's draw path
+ * (DXVK per-draw state, a stereo shift) can read it for the draw being made. It needs the pass hooks: LB_PASSES,
+ * LB_FP=1, LB_FP_SKIP or LB_STEREO_EYE_UNITS; otherwise it is always off. */
+static float g_fp_near;                // the first-person near plane, learnt from a late pass (0: not yet)
+static void (*g_fp_listener)(int kind);
+static void stereo_fp_changed(int kind);  // stereo captures with the eye offset on first-person draws only, below
+static bool stereo_skip_fp(void);         // stereo captures: a frame drawn with no first-person draws, below
+
+// The kind of the first-person draw being made, from the target bound (FP_NONE outside first-person draws).
+static int fp_kind(void) {
+    const PassFrame &f = g_pass_frame;
+    if (!f.fp) return FP_NONE;
+    const PassTarget &t = g_pass_target;
+    if (t.w != g_bb_w || t.h != g_bb_h) return FP_MASK;
+    if (t.fmt == D3DFMT_R32F) return FP_DEPTH;
+    if (t.fmt != D3DFMT_A16B16G16R16F) return FP_OTHER;
+    return f.fp_late ? FP_COLOUR : FP_PREPASS;
+}
+static void fp_update(void) {
+    PassFrame &f = g_pass_frame;
+    const PassTarget &t = g_pass_target;
+    const int before = fp_kind();
+    f.fp = (f.fp_late || f.fp_proj) && t.rt && !t.bb && !hud_screen_in_pass();
+    const int now = fp_kind();
+    if (now != before) {
+        stereo_fp_changed(now);
+        if (g_fp_listener) g_fp_listener(now);
+    }
+}
+bool d3d_first_person(void) { return g_pass_frame.fp; }
+extern "C" int skyrim_first_person_pass(void) { return fp_kind(); }
+extern "C" void skyrim_first_person_listen(void (*fn)(int kind)) { g_fp_listener = fn; }
+
+// The class of a draw, from the targets bound and what the frame drew before. Sizes are relative to the back
+// buffer (CreateDevice/Reset), never absolute. First match wins. "Seen" means it matches the Riverwood frame
+// traced with LB_D3DTRACE (docs/perf/LOG.md, 2026-11-10); everything else is unverified, check it with LB_PASSES=2.
+//   ui      a menu drawn into the second screen's image (hud_screen.cpp, Android dual screen only), or a draw into
+//           the back buffer after its first one: the HUD and menus over the final image (unverified)
+//   post    the first draw into the back buffer, if it is a quad (<= 2 primitives): the final image (unverified)
+//   fp      a first-person draw (d3d_first_person, above; seen in Riverwood with empty hands, a sword and Flames),
+//           whatever the target: the late pass, and its prepass and mask draws otherwise counted as main and refl
+//   depth   an R32F colour target of back-buffer size: the scene's depth drawn again (seen, 638 draws)
+//   main    an A16B16G16R16F target of back-buffer size with a depth-stencil bound, before the depth pass (size and
+//           format seen, 620 draws; the depth-stencil and "before" unverified)
+//   fx      the same target after the depth pass (unverified)
+//   shadow  a depth-stencil bound, target not of back-buffer aspect: the 512x1024 shadow map, also the two 512x512
+//           targets of the traced frame (unverified)
+//   refl    a depth-stencil bound, back-buffer aspect but smaller: the reflection (960x540 at 1280x720 seen; that
+//           it has a depth-stencil and the shadow mask has none is unverified)
+//   post    no depth-stencil and <= 2 primitives: full-screen quads, the luminance chain and filters (unverified)
+//   mask    no depth-stencil, back-buffer aspect but smaller: the deferred sun-shadow mask (unverified)
+//   fx      any other draw into a back-buffer-sized target after the depth pass (unverified)
+//   other   the rest
+static int pass_class(uint32_t prims) {
+    const PassTarget &t = g_pass_target;
+    PassFrame &f = g_pass_frame;
+    bool bb_size = g_bb_w && t.w == g_bb_w && t.h == g_bb_h;
+    int64_t skew = (int64_t)t.w * g_bb_h - (int64_t)t.h * g_bb_w;  // within a pixel of height: back-buffer aspect
+    bool bb_aspect = g_bb_w && t.w && (skew < 0 ? -skew : skew) <= (int64_t)g_bb_w;
+    bool smaller = t.w < g_bb_w;
+    if (hud_screen_in_pass()) return PASS_UI;
+    if (t.bb) {
+        bool first = !f.seen_bb;
+        f.seen_bb = true;
+        return first && prims <= 2 ? PASS_POST : PASS_UI;
+    }
+    if (bb_size && t.fmt == D3DFMT_R32F) {
+        f.seen_depth = true;
+        return f.fp ? PASS_FP : PASS_DEPTH;
+    }
+    if (bb_size && t.fmt == D3DFMT_A16B16G16R16F && t.ds) {
+        if (f.seen_depth) return f.fp ? PASS_FP : PASS_FX;
+        f.seen_main = true;
+        return f.fp ? PASS_FP : PASS_MAIN;
+    }
+    if (f.fp) return PASS_FP;
+    if (t.ds && !bb_aspect) return PASS_SHADOW;
+    if (t.ds && smaller) return PASS_REFL;
+    if (!t.ds && prims <= 2) return PASS_POST;
+    if (!t.ds && bb_aspect && smaller) return PASS_MASK;
+    if (bb_size && f.seen_depth) return PASS_FX;
+    return PASS_OTHER;
+}
+
+static void passdbg_flush(void) {
+    const PassRun &r = g_pass_run;
+    if (r.cls >= 0 && r.draws)
+        LOG("passdbg %d %s %ux%u fmt=%u ds=%d draws=%d prims=%u", platform_frame_count(), k_pass_names[r.cls], r.t.w,
+            r.t.h, r.t.fmt, r.t.ds ? 1 : 0, r.draws, r.prims);
+    g_pass_run = {-1, 0, 0, {}};
+}
+
+void d3d_passes_draw(uint32_t prims) {
+    int k = pass_class(prims);
+    PassFrame &f = g_pass_frame;
+    f.cls[k].draws++;
+    f.cls[k].prims += prims;
+    if (f.fp) {
+        if (!f.fp_runs) f.fp_first = g_d3d_draws - 1;  // g_d3d_draws already counts this draw
+        if (!f.fp_last_draw) f.fp_runs++;
+        f.fp_last = g_d3d_draws - 1;
+        f.fp_kind_draws[fp_kind()]++;
+    }
+    f.fp_last_draw = f.fp;
+    if (!g_passdbg) return;
+    PassRun &r = g_pass_run;
+    if (k != r.cls || g_pass_target.rt != r.t.rt || g_pass_target.ds != r.t.ds) {
+        passdbg_flush();
+        r.cls = k;
+        r.t = g_pass_target;
+    }
+    r.draws++;
+    r.prims += prims;
+}
+
+void d3d_passes_target(IDirect3DDevice9 *d) {
+    IDirect3DSurface9 *rt = nullptr, *ds = nullptr, *bb = nullptr;
+    D3DSURFACE_DESC desc = {};
+    d->GetRenderTarget(0, &rt);
+    d->GetDepthStencilSurface(&ds);
+    d->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb);
+    if (rt) rt->GetDesc(&desc);
+    if ((void *)rt != g_pass_target.rt) g_pass_frame.rt_changes++;
+    g_pass_target = {rt, desc.Width, desc.Height, (uint32_t)desc.Format, ds != nullptr, rt && rt == bb};
+    const PassTarget &t = g_pass_target;
+    // the late first-person pass goes on into other back-buffer-sized targets, and ends at any other
+    if (g_pass_frame.fp_late && (!rt || t.bb || t.w != g_bb_w || t.h != g_bb_h)) g_pass_frame.fp_late = false;
+    fp_update();
+    if (rt) rt->Release();
+    if (ds) ds->Release();
+    if (bb) bb->Release();
+}
+
+// A Clear of depth without colour into a back-buffer-sized target, once the main pass has drawn: the late
+// first-person pass may start (d3d_first_person). Its projection confirms it (d3d_passes_projection).
+void d3d_passes_clear(uint32_t flags) {
+    if (!(flags & D3DCLEAR_ZBUFFER) || (flags & D3DCLEAR_TARGET)) return;
+    const PassTarget &t = g_pass_target;
+    PassFrame &f = g_pass_frame;
+    if (!t.rt || t.bb || !g_bb_w || t.w != g_bb_w || t.h != g_bb_h || !f.seen_main || f.fp_late) return;
+    f.fp_late = true;
+    f.fp_late_confirmed = false;
+    fp_update();
+}
+
+// The world camera's near plane (NiCamera W, see game_camera_read below), or 0.
+static float world_near(void) {
+    uint32_t root = M32(0x1B2E8BC), w = root >= 0x10000 ? M32(root + 0xB8) : 0;
+    float v = 0;
+    if (w >= 0x10000) memcpy(&v, MEM + w + 0xF8, 4);
+    return v;
+}
+
+// SetTransform(D3DTS_PROJECTION), m the guest's row-major matrix (row vectors): perspective has _34 = 1, and its near
+// plane is -_43 / _33. In the late pass the first projection confirms the pass (a near plane other than the world's)
+// and teaches the first-person near plane; a later one with another near plane ends it. Outside it, the projection
+// is a first-person one when its near plane is the one learnt.
+void d3d_passes_projection(const float *m) {
+    PassFrame &f = g_pass_frame;
+    const float near_plane = m[11] == 1.0f && m[10] != 0.0f ? -m[14] / m[10] : 0.0f;  // 0: not perspective
+    const float world = world_near();
+    auto same = [](float a, float b) { return a > 0 && b > 0 && fabsf(a - b) <= 1e-3f * b; };
+    if (f.fp_late && !f.fp_late_confirmed) {
+        if (near_plane <= 0 || same(near_plane, world)) {
+            f.fp_late = false;  // not the first-person camera (the loading screen's model has the world's)
+        } else {
+            f.fp_late_confirmed = true;
+            if (!same(near_plane, g_fp_near)) {
+                LOG("first-person near plane %g (world %g)", near_plane, world);
+                g_fp_near = near_plane;
+            }
+        }
+    } else if (f.fp_late && !same(near_plane, g_fp_near)) {
+        f.fp_late = false;
+    }
+    f.fp_proj = same(near_plane, g_fp_near) && !same(near_plane, world);
+    fp_update();
+}
+
+// After CreateDevice: reads the switches once and learns the targets the device starts with.
+static void passes_init(IDirect3DDevice9 *d) {
+    static bool read;
+    if (!read) {
+        read = true;
+        const char *e = getenv("LB_PASSES"), *fp = getenv("LB_FP"), *eye = getenv("LB_STEREO_EYE_UNITS");
+        g_passes_log = e ? atoi(e) : 0;
+        const bool fp_wanted = (fp && atoi(fp)) || getenv("LB_FP_SKIP") || (eye && atof(eye) != 0);
+        g_d3d_passes = g_passes_log || fp_wanted;
+        // without an LB_D3DTRACE range, LB_PASSES=2 looks at the first frame
+        g_passdbg = g_passes_log == 2 && !getenv("LB_D3DTRACE");
+        if (g_passes_log) LOG("LB_PASSES=%d: draws per pass class logged at each Present", g_passes_log);
+        else if (fp_wanted) LOG("first-person pass detection on (LB_FP, LB_FP_SKIP or LB_STEREO_EYE_UNITS)");
+    }
+    if (!g_d3d_passes) return;
+    d3d_passes_target(d);
+    g_pass_frame.rt_changes = 0;
+}
+
+// At Present: the frame's line, then a new frame. LB_PASSES=2 follows the LB_D3DTRACE frames (g_d3d_trace is
+// already set for the next one).
+static void passes_present(void) {
+    if (!g_d3d_passes) return;
+    g_pass_frame.fp_late = g_pass_frame.fp_proj = false;
+    fp_update();
+    if (!g_passes_log) { g_pass_frame = PassFrame(); return; }
+    passdbg_flush();
+    const PassFrame &f = g_pass_frame;
+    if (g_passes_log == 2) {
+        // Seen in first person: 3 runs (mask, prepass, late), colour >= depth > 0, prepass = depth. Anything with
+        // first-person draws but no colour draws, or more than 3 runs, is flagged.
+        const int *k = f.fp_kind_draws;
+        const bool odd = f.fp_runs && (!k[FP_COLOUR] || k[FP_DEPTH] > k[FP_COLOUR] || f.fp_runs > 3);
+        LOG("fpdbg %d runs=%d mask=%d prepass=%d colour=%d other=%d depth=%d draws=#%d-#%d near=%g%s",
+            platform_frame_count(), f.fp_runs, k[FP_MASK], k[FP_PREPASS], k[FP_COLOUR], k[FP_OTHER], k[FP_DEPTH],
+            f.fp_runs ? f.fp_first : -1, f.fp_runs ? f.fp_last : -1, g_fp_near, odd ? " UNEXPECTED" : "");
+    }
+    char line[512];
+    int n = snprintf(line, sizeof line, "pass %d", platform_frame_count());
+    for (int i = 0; i < PASS_COUNT && n < (int)sizeof line; i++)
+        n += snprintf(line + n, sizeof line - n, " %s=%d/%u", k_pass_names[i], g_pass_frame.cls[i].draws,
+                      g_pass_frame.cls[i].prims);
+    LOG("%s rt=%d", line, g_pass_frame.rt_changes);
+    g_pass_frame = PassFrame();
+    g_passdbg = g_passes_log == 2 && g_d3d_trace;
+}
+
+// LB_FP_SKIP=MODE (every frame) or MODE@F[,MODE@F...] (only frames F, numbered as LB_SHOT numbers them): skip
+// first-person draws. MODE is all, late (colour, other and depth: the visible pass and its depth), colour (colour and
+// other), depth, prepass or mask; several joined by +, e.g. prepass+mask. Experiments: with LB_SHOT the picture
+// shows what those draws contribute.
+static bool fp_skip_now(void) {
+    static int mode = -1;               // every frame: bit per FP_* kind
+    static std::map<int, int> frames;   // or per frame
+    if (mode < 0) {
+        mode = 0;
+        auto parse = [](const char *m, const char *end) {
+            int bits = 0;
+            while (m < end) {
+                const char *plus = (const char *)memchr(m, '+', end - m);
+                const std::string w(m, plus ? plus : end);
+                bits |= w == "all" ? ~0 : w == "late" ? (1 << FP_COLOUR | 1 << FP_OTHER | 1 << FP_DEPTH)
+                        : w == "colour" ? (1 << FP_COLOUR | 1 << FP_OTHER) : w == "depth" ? 1 << FP_DEPTH
+                        : w == "prepass" ? 1 << FP_PREPASS : w == "mask" ? 1 << FP_MASK : 0;
+                m = plus ? plus + 1 : end;
+            }
+            return bits;
+        };
+        const char *e = getenv("LB_FP_SKIP");
+        for (const char *item = e; item && *item;) {
+            const char *comma = strchr(item, ','), *end = comma ? comma : item + strlen(item);
+            const char *at = (const char *)memchr(item, '@', end - item);
+            if (at) frames[atoi(at + 1)] = parse(item, at);
+            else mode = parse(item, end);
+            item = comma ? comma + 1 : nullptr;
+        }
+        if (e) LOG("LB_FP_SKIP: every frame %x, %zu frames listed", mode, frames.size());
+    }
+    const int k = fp_kind();
+    if (k == FP_NONE) return false;
+    if (stereo_skip_fp()) return true;
+    auto it = frames.find(g_frame + 1);
+    return ((it != frames.end() ? it->second : mode) >> k) & 1;
 }
 
 // ---------------------------------------------------------------- first-person depth
@@ -832,7 +1197,8 @@ static bool menu_open(void) {
 extern "C" int skyrim_menu_open(void) { return menu_open() ? 1 : 0; }
 #endif
 
-static void shot_depth(IDirect3DDevice9 *d) {
+// tag: the file name after "depth-" / "shot-" (the frame number, plus the eye for stereo captures).
+static void shot_depth(IDirect3DDevice9 *d, const char *tag) {
     IDirect3DSurface9 *depth = d3d_scene_depth_target(), *copy = nullptr;
     D3DSURFACE_DESC desc;
     D3DLOCKED_RECT locked;
@@ -843,7 +1209,7 @@ static void shot_depth(IDirect3DDevice9 *d) {
     if (SUCCEEDED(hr)) hr = copy->LockRect(&locked, nullptr, D3DLOCK_READONLY);
     if (SUCCEEDED(hr)) {
         char path[1100];
-        snprintf(path, sizeof path, "%s/depth-%05d.f32", g_save_dir, g_frame);
+        snprintf(path, sizeof path, "%s/depth-%s.f32", g_save_dir, tag);
         FILE *out = fopen(path, "wb");
         if (out) {
             uint32_t size[2] = {desc.Width, desc.Height};
@@ -859,6 +1225,8 @@ static void shot_depth(IDirect3DDevice9 *d) {
     if (copy) copy->Release();
 }
 
+static void shot_write(IDirect3DDevice9 *d, const char *tag, bool depth);
+
 static void shot_before_present(IDirect3DDevice9 *d) {
     static int frames[16], count = -1;
     if (count < 0) {
@@ -873,7 +1241,15 @@ static void shot_before_present(IDirect3DDevice9 *d) {
     int wanted = 0;
     for (int i = 0; i < count; i++) wanted |= frames[i] == g_frame;
     if (!wanted) return;
-    shot_depth(d);
+    char tag[32];
+    snprintf(tag, sizeof tag, "%05d", g_frame);
+    shot_write(d, tag, true);
+}
+
+// The back buffer about to be presented to <save>/shot-<tag>.bmp, and with depth the scene's depth target to
+// <save>/depth-<tag>.f32.
+static void shot_write(IDirect3DDevice9 *d, const char *tag, bool depth) {
+    if (depth) shot_depth(d, tag);
     IDirect3DSurface9 *back = nullptr, *copy = nullptr;
     D3DSURFACE_DESC desc;
     D3DLOCKED_RECT locked;
@@ -885,7 +1261,7 @@ static void shot_before_present(IDirect3DDevice9 *d) {
     if (SUCCEEDED(hr)) hr = copy->LockRect(&locked, nullptr, D3DLOCK_READONLY);
     if (SUCCEEDED(hr)) {
         char path[1100];
-        snprintf(path, sizeof path, "%s/shot-%05d.bmp", g_save_dir, g_frame);
+        snprintf(path, sizeof path, "%s/shot-%s.bmp", g_save_dir, tag);
         FILE *out = fopen(path, "wb");
         uint32_t w = desc.Width, h = desc.Height, row = (w * 3 + 3) & ~3u, size = 54 + row * h;
         uint8_t header[54] = {'B', 'M'};
@@ -1027,6 +1403,26 @@ static bool game_camera_read(GameCamera *out) {
     return true;
 }
 
+/* LB_D3DTRACE: the world camera's frustum (tangents l r t b, near, far) and the PlayerCamera FOVs, at a call that
+ * may start a pass (Clear), and whenever they change between two traced calls. */
+static float g_trace_cam[8];
+void d3d_trace_camera(const char *why) {
+    float v[8] = {};
+    uint32_t root = M32(0x1B2E8BC), w = root >= 0x10000 ? M32(root + 0xB8) : 0, pc = M32(0x12E7288);
+    if (w >= 0x10000) memcpy(v, MEM + w + 0xE8, 24);
+    if (pc >= 0x10000) { memcpy(v + 6, MEM + pc + 0xAC, 4); memcpy(v + 7, MEM + pc + 0xB0, 4); }
+    memcpy(g_trace_cam, v, sizeof v);
+    fprintf(stderr, "D3D %d camera(%s) l %.4f r %.4f t %.4f b %.4f near %.3f far %.0f fov %.1f/%.1f\n", g_frame, why,
+            v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]);
+}
+static void trace_camera_changed(void) {
+    float v[8] = {};
+    uint32_t root = M32(0x1B2E8BC), w = root >= 0x10000 ? M32(root + 0xB8) : 0, pc = M32(0x12E7288);
+    if (w >= 0x10000) memcpy(v, MEM + w + 0xE8, 24);
+    if (pc >= 0x10000) { memcpy(v + 6, MEM + pc + 0xAC, 4); memcpy(v + 7, MEM + pc + 0xB0, 4); }
+    if (memcmp(v, g_trace_cam, sizeof v)) d3d_trace_camera("changed");
+}
+
 /* The camera of the frame being presented, for the immersive compositor (ipad/immersive_bridge.mm reads it from
  * the present tap's callback, which runs inside Present on this thread). */
 static GameCamera g_frame_camera;
@@ -1066,22 +1462,419 @@ static void camera_log(void) {
             f[0], f[1], f[2], f[3], f[4], f[5], fov, fov1);
 }
 
+#if defined(__APPLE__)
+/* True two-eye stereo captures (experiment, Mac): render chosen frames from a camera moved sideways, to compare
+ * with the compositor's depth reprojection (tools/stereo_capture.py, tools/stereo_compare.py).
+ *
+ *   LB_STEREO_EYE_UNITS=d   half the eye separation in game units (2.24 = 32 mm at 70 units per metre). Also
+ *                           what turns the shader code on inside DXVK (dxvk_stereo.h), so it must be set at launch.
+ *   LB_STEREO_FRAMES=list   comma-separated items F, A-B or A-B:S (groups starting at A, A+S, ... up to B; S
+ *                           defaults to, and is at least, the group's length). Each base F starts a group of frames,
+ *                           each drawn one way and written as <save>/shot-F-<slot>.bmp with stereo-F-<slot>.txt (the
+ *                           eye shift and camera used) and, for some, depth-F-<slot>.f32. By default a triplet:
+ *                             L  frame F, the left eye     R  F+1, the right eye     C  F+2, the centre (+ depth)
+ *   LB_STEREO_PASSES=firstperson
+ *                           L and R shift only the first-person draws (d3d_first_person: the mask, prepass and late
+ *                           pass, every kind), with no shift for the rest of the frame: hands, weapon and spell
+ *                           effect truly per eye over the centre eye's world (twcclegg/skyrim-apple#23 chunk 1.2).
+ *                           L and R then write depth too. DXVK reads the same variable: any value but size or all
+ *                           keeps its default pass rule (viewports of the back buffer's aspect), which the
+ *                           first-person draws meet, the 960x540 mask pass included. The mask is shifted with the
+ *                           rest because it is sampled at the hands' screen position when the late pass lights them:
+ *                           left at the centre position, the shifted hands would read the world's shadow there.
+ *   LB_STEREO_HYBRID=1      each group is six frames of one game moment, for judging the first-person hybrid
+ *                           against full true stereo and reprojection (tools/stereo_compare.py --hybrid):
+ *                             L, R, C   as above (C with depth)
+ *                             FL, FR    the left and right eye on first-person draws only, as with
+ *                                       LB_STEREO_PASSES=firstperson (with depth)
+ *                             W         the centre with every first-person draw skipped: the world alone (+ depth)
+ *                           The game clock is held for the group (as LB_VR180 does: 1 us per frame), so animation,
+ *                           effects and eye adaptation should not move between the six frames.
+ *   LB_STEREO_HOLD=1        hold the game clock over plain triplets too.
+ *
+ * The left eye sits at view-space x = -d. Seen from there a point at view x is at x + d, so its clip x grows by
+ * P00*d: it moves right on screen. DXVK applies pos.x -= k, so k = P00 * e with e = -d for the left eye (k < 0,
+ * clip x grows) and e = +d for the right eye. P00 = 2 / (tan_right - tan_left) from the world camera's frustum
+ * tangents (equal to 1 / tan_right for the game's symmetric frustum). The first-person camera has the same field
+ * of view (65, docs/perf/LOG.md 2026-11-14), so the same k is right for its draws.
+ *
+ * The shift for frame N+1 is set right after frame N's Present returns, so the whole of frame N+1, from its
+ * first draw, renders from one eye; on first-person-only frames it is switched on and off as the first-person flag
+ * changes (stereo_fp_changed), between draws on the thread making the device calls, which DXVK picks up at the next
+ * draw. Without LB_STEREO_EYE_UNITS nothing changes, in DXVK either; with it but no LB_STEREO_FRAMES, the shaders
+ * carry the shift with k = 0. */
+extern "C" void dxvk_stereo_set_clip_shift(float k);  // DXVK (dxvk_stereo.h)
+extern "C" void dxvk_stereo_set_clip_offset(float x, float y, float z, float w);
+extern "C" int dxvk_stereo_enabled(void);
+extern "C" volatile int g_fake_clock_on;  // kernel32.c (rt_game_ns)
+extern "C" volatile uint64_t g_fake_clock_ns;
+extern "C" uint64_t rt_game_ns(void);
+
+struct StereoSlot {
+    const char *tag;  // file name part after the base frame
+    char eye;         // 'L', 'R' or 'C'
+    bool fp_only;     // the shift on first-person draws only
+    bool skip_fp;     // no first-person draws at all
+    bool depth;       // also write the scene's depth target
+};
+static const StereoSlot k_triplet[] = {
+    {"L", 'L', false, false, false}, {"R", 'R', false, false, false}, {"C", 'C', false, false, true}};
+static const StereoSlot k_triplet_fp[] = {
+    {"L", 'L', true, false, true}, {"R", 'R', true, false, true}, {"C", 'C', false, false, true}};
+static const StereoSlot k_hybrid[] = {
+    {"L", 'L', false, false, false}, {"R", 'R', false, false, false}, {"C", 'C', false, false, true},
+    {"FL", 'L', true, false, true},  {"FR", 'R', true, false, true},  {"W", 'C', false, true, true}};
+
+struct StereoState {
+    bool init = false, on = false;
+    float d = 0;
+    std::vector<int> bases;
+    const StereoSlot *slots = k_triplet;
+    int group = 3;              // frames per group
+    bool hold = false;          // hold the game clock over each group
+    uint64_t hold_t0 = 0;       // the held clock's start
+    bool holding = false;
+    float k_applied = 0;        // the shift the frame being presented was drawn with (first-person draws only on
+    bool fp_only = false;       //   fp_only frames)
+    bool skip_fp = false;       // the frame being drawn skips its first-person draws
+    GameCamera cam_applied{};   // the camera k_applied was computed from
+    bool cam_applied_valid = false;
+};
+static StereoState g_stereo;
+
+static void stereo_init(void) {
+    StereoState &st = g_stereo;
+    st.init = true;
+    const char *d = getenv("LB_STEREO_EYE_UNITS"), *f = getenv("LB_STEREO_FRAMES");
+    if (!d || !f || !*f || atof(d) == 0) return;
+    st.d = (float)fabs(atof(d));
+    const char *passes = getenv("LB_STEREO_PASSES"), *hybrid = getenv("LB_STEREO_HYBRID"),
+               *hold = getenv("LB_STEREO_HOLD");
+    if (hybrid && atoi(hybrid)) {
+        st.slots = k_hybrid;
+        st.group = 6;
+        st.hold = true;
+    } else if (passes && !strcmp(passes, "firstperson")) {
+        st.slots = k_triplet_fp;
+    }
+    if (hold && atoi(hold)) st.hold = true;
+    for (const char *e = f; e && *e;) {
+        int a = 0, b = 0, step = st.group, n = 0;
+        if (sscanf(e, "%d-%d:%d%n", &a, &b, &step, &n) == 3 || sscanf(e, "%d-%d%n", &a, &b, &n) == 2) {
+            if (step < st.group) step = st.group;  // groups must not overlap
+            for (int x = a; x <= b && st.bases.size() < 256; x += step) st.bases.push_back(x);
+        } else if (sscanf(e, "%d", &a) == 1) {
+            st.bases.push_back(a);
+        }
+        e = strchr(e, ',');
+        if (e) e++;
+    }
+    st.on = !st.bases.empty();
+    LOG("stereo capture: d %.3f units, %zu groups of %d (%s%s), DXVK shader shift %s", st.d, st.bases.size(),
+        st.group, st.slots == k_hybrid ? "hybrid: L R C FL FR W" : st.slots == k_triplet_fp ? "first person only"
+                                                                                            : "L R C",
+        st.hold ? ", game clock held" : "",
+        dxvk_stereo_enabled() ? "on" : "OFF (LB_STEREO_EYE_UNITS must be set at launch)");
+}
+
+// The slot frame renders in a stereo group, with the group's base frame and the slot's index; null if none.
+static const StereoSlot *stereo_slot(int frame, int *base, int *index = nullptr) {
+    for (int b : g_stereo.bases) {
+        if (frame >= b && frame < b + g_stereo.group) {
+            *base = b;
+            if (index) *index = frame - b;
+            return &g_stereo.slots[frame - b];
+        }
+    }
+    return nullptr;
+}
+
+static void stereo_write_info(const char *tag, const StereoSlot &slot, int base) {
+    char path[1100];
+    snprintf(path, sizeof path, "%s/stereo-%s.txt", g_save_dir, tag);
+    FILE *out = fopen(path, "w");
+    if (!out) return;
+    const StereoState &st = g_stereo;
+    const char eye = slot.eye;
+    const float *f = st.cam_applied.frustum;
+    const float p00 = st.cam_applied_valid && f[1] != f[0] ? 2.0f / (f[1] - f[0]) : 0.0f;
+    fprintf(out, "frame %d\nbase %d\neye %c\nslot %s\neye_units %.6f\neye_x %.6f\nclip_shift_k %.9g\np00 %.9g\n",
+            g_frame, base, eye, slot.tag, st.d, eye == 'L' ? -st.d : eye == 'R' ? st.d : 0.0f, st.k_applied, p00);
+    fprintf(out, "passes %s\nfirst_person_only %d\nfirst_person_skipped %d\nfirst_person_near %.9g\nclock_held %d\n"
+            "menu_open %d\n", slot.fp_only ? "firstperson" : getenv("LB_STEREO_PASSES") ? getenv("LB_STEREO_PASSES")
+                                                                                         : "screen",
+            slot.fp_only ? 1 : 0, slot.skip_fp ? 1 : 0, g_fp_near, st.holding ? 1 : 0, menu_open() ? 1 : 0);
+    // The camera the shift came from (read at the previous Present) and the camera at this Present.
+    auto put_cam = [&](const char *name, const GameCamera &c, bool valid) {
+        if (!valid) { fprintf(out, "%s none\n", name); return; }
+        fprintf(out, "%s_frustum_lrtb_near_far %.9g %.9g %.9g %.9g %.9g %.9g\n", name, c.frustum[0], c.frustum[1],
+                c.frustum[2], c.frustum[3], c.frustum[4], c.frustum[5]);
+        fprintf(out, "%s_rot", name);
+        for (float v : c.rot) fprintf(out, " %.9g", v);
+        fprintf(out, "\n%s_pos %.9g %.9g %.9g\n", name, c.pos[0], c.pos[1], c.pos[2]);
+    };
+    put_cam("cam_used", st.cam_applied, st.cam_applied_valid);
+    GameCamera now;
+    const bool now_valid = game_camera_read(&now);
+    put_cam("cam_present", now, now_valid);
+    fclose(out);
+}
+
+// Before Present: capture the frame if it belongs to a group.
+static void stereo_before_present(IDirect3DDevice9 *d) {
+    if (!g_stereo.init) stereo_init();
+    if (!g_stereo.on) return;
+    int base = 0;
+    const StereoSlot *slot = stereo_slot(g_frame, &base);
+    if (!slot) return;
+    char tag[32];
+    snprintf(tag, sizeof tag, "%05d-%s", base, slot->tag);
+    shot_write(d, tag, slot->depth);
+    stereo_write_info(tag, *slot, base);
+    LOG("stereo capture: frame %d slot %s k %.6g%s -> shot-%s.bmp", g_frame, slot->tag, g_stereo.k_applied,
+        slot->fp_only ? " (first person only)" : slot->skip_fp ? " (no first person)" : "", tag);
+}
+
+// The first-person flag changed (fp_update): on first-person-only frames the shift follows it.
+static void stereo_fp_changed(int kind) {
+    const StereoState &st = g_stereo;
+    if (st.on && st.fp_only) dxvk_stereo_set_clip_shift(kind != FP_NONE ? st.k_applied : 0.0f);
+}
+static bool stereo_skip_fp(void) { return g_stereo.skip_fp; }
+
+// After Present: set the eye, and the clock, for the next frame.
+static void stereo_after_present(void) {
+    StereoState &st = g_stereo;
+    if (!st.on) return;
+    int base = 0, index = 0;
+    const StereoSlot *slot = stereo_slot(g_frame + 1, &base, &index);
+    const char eye = slot ? slot->eye : 0;
+    float k = 0;
+    GameCamera cam;
+    const bool valid = (eye == 'L' || eye == 'R') && game_camera_read(&cam);
+    if (valid) {
+        const float l = cam.frustum[0], r = cam.frustum[1];
+        if (r > l) k = 2.0f / (r - l) * (eye == 'L' ? -st.d : st.d);
+        st.cam_applied = cam;
+    } else if (eye == 'L' || eye == 'R') {
+        LOG("stereo capture: frame %d eye %c: no world camera, rendering the centre eye", g_frame + 1, eye);
+    }
+    if (eye) st.cam_applied_valid = valid || (eye == 'C' && game_camera_read(&st.cam_applied));
+    st.k_applied = k;
+    st.fp_only = slot && slot->fp_only;
+    st.skip_fp = slot && slot->skip_fp;
+    // The first-person flag is off between frames (passes_present), so a first-person-only frame starts unshifted.
+    dxvk_stereo_set_clip_shift(st.fp_only && fp_kind() == FP_NONE ? 0.0f : k);
+    if (st.hold) {
+        if (slot && (index == 0 || !st.holding)) {
+            // Each group holds its own moment: real time at its start, read from the clock rt_game_ns gives when not
+            // held (kernel32.c now_ns), since rt_game_ns is the held clock between back-to-back groups (an A-B range
+            // steps by the group's length by default). Those jump forward to the next group's moment, as the clock
+            // does when let go between groups, rather than going back to the first group's.
+            struct timespec ts;
+            clock_gettime(CLOCK_MONOTONIC, &ts);
+            st.hold_t0 = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+            g_fake_clock_ns = st.hold_t0;  // before the switch, so no thread reads a stale held value (or 0)
+            st.holding = true;
+            g_fake_clock_on = 1;
+        } else if (!slot && st.holding) {
+            st.holding = false;
+            g_fake_clock_on = 0;
+        }
+        if (st.holding) g_fake_clock_ns = st.hold_t0 + (uint64_t)index * 1000ull;
+    }
+}
+/* LB_VR180=start:count[:tan] (offline capture, Mac): a stereo 180-degree video, rendered by the game itself.
+ *
+ * From frame `start`, every block of 16 frames is one video frame (count blocks). Frame 0 of a block advances the
+ * game clock by 1/24 s; frames 1..15 render the same moment from rig L, R, C (eyes at x = -e, +e, 0 along the
+ * camera's right axis, e = LB_VR180_EYE units, default 2.24 = 32 mm) and faces 0..4 (front, left, right, up, down;
+ * square frustum +-tan, default 1.1). Each face frame writes <save>/shot-B-RK.bmp, stereo-B-RK.txt and, for rig C,
+ * depth-B-CK.f32 (B = the block's first frame). tools: scratchpad vr180/stitch, vr180/reproject.
+ *
+ * How: the game recomputes the world camera's rotation and position during its update every frame, then culls and
+ * renders. The override is written at BeginScene, after the update and before culling, so the game culls and
+ * renders the turned view natively (shadows, LOD, effects), and the first-person arms stay where they are in the
+ * world. The eye's offset is not a camera move: first-person geometry is drawn as if the camera stood at the
+ * game's own camera position, so a moved camera gives the arms, weapon and spell hand no parallax. Instead DXVK
+ * adds the offset to every perspective vertex in clip space (dxvk_stereo_set_clip_offset; it needs
+ * LB_STEREO_EYE_UNITS set at launch, and LB_STEREO_PASSES=size so square shadow maps of another size are left
+ * alone: keep the face size different from iShadowMapResolution). The game clock (rt_game_ns, kernel32.c) is scripted from `start` on: it moves 1 us per frame within a
+ * block, so animation, effects and eye adaptation hold still across the 15 renders.
+ *
+ * LB_VR180_PENDING=n (default 30): before a block starts, wait while more than n shot-*.bmp files are in the save
+ * folder, so a stitcher deleting its inputs keeps disk use bounded. */
+struct Vr180 {
+    bool init = false, on = false;
+    int start = 0, count = 0, pending = 30;
+    float tan = 1.1f, e = 2.24f;
+    uint64_t t0 = 0;
+    float frustum0[6];
+    bool have_frustum0 = false;
+    int rig_frame = -1;
+    GameCamera rig{};
+    bool rig_valid = false;
+};
+static Vr180 g_vr;
+static void vr180_init(void) {
+    g_vr.init = true;
+    const char *e = getenv("LB_VR180");
+    if (!e || sscanf(e, "%d:%d:%f", &g_vr.start, &g_vr.count, &g_vr.tan) < 2 || g_vr.count <= 0) return;
+    if (const char *x = getenv("LB_VR180_EYE")) g_vr.e = (float)atof(x);
+    if (const char *x = getenv("LB_VR180_PENDING")) g_vr.pending = atoi(x);
+    g_vr.on = true;
+    LOG("vr180: %d blocks from frame %d, tan %.3f, eye %.3f units", g_vr.count, g_vr.start, g_vr.tan, g_vr.e);
+}
+// Frame f's place: -1 outside, else block index; *slot = 0 (clock frame) or 1..15 (rig*5 + face + 1).
+static int vr180_slot(int f, int *slot) {
+    if (!g_vr.on || f < g_vr.start || f >= g_vr.start + 16 * g_vr.count) return -1;
+    *slot = (f - g_vr.start) % 16;
+    return (f - g_vr.start) / 16;
+}
+static const char kRig[3] = {'L', 'R', 'C'};
+// The face basis in rig coordinates (x right, y up, z forward): forward, up, right.
+static const float kFace[5][3][3] = {
+    {{0, 0, 1}, {0, 1, 0}, {1, 0, 0}},    // front
+    {{-1, 0, 0}, {0, 1, 0}, {0, 0, 1}},   // left
+    {{1, 0, 0}, {0, 1, 0}, {0, 0, -1}},   // right
+    {{0, 1, 0}, {0, 0, -1}, {1, 0, 0}},   // up
+    {{0, -1, 0}, {0, 0, 1}, {1, 0, 0}},   // down
+};
+// At BeginScene of the frame being rendered (g_frame + 1): turn the camera for a face frame.
+extern "C++" void vr180_scene_hook(void) {
+    if (!g_vr.init) vr180_init();
+    if (!g_vr.on) return;
+    const int f = g_frame + 1;
+    int slot = 0;
+    const int block = vr180_slot(f, &slot);
+    uint32_t root = M32(0x1B2E8BC), w = root >= 0x10000 ? M32(root + 0xB8) : 0;
+    if (w < 0x10000) return;
+    if (!g_vr.have_frustum0) { memcpy(g_vr.frustum0, MEM + w + 0xE8, sizeof g_vr.frustum0); g_vr.have_frustum0 = true; }
+    if (block < 0 || slot == 0) {
+        memcpy(MEM + w + 0xE8, g_vr.frustum0, 4 * 4);  // l r t b back to the game's
+        return;
+    }
+    if (g_vr.rig_frame != f) {  // the game's own camera of this frame, before any override (BeginScene may repeat)
+        g_vr.rig_valid = game_camera_read(&g_vr.rig);
+        g_vr.rig_frame = f;
+    }
+    if (!g_vr.rig_valid) return;
+    const int rig = (slot - 1) / 5, face = (slot - 1) % 5;
+    // Gamebryo camera: world rotation columns are forward, up, right (world coordinates).
+    const float *R = g_vr.rig.rot;
+    const float F[3] = {R[0], R[3], R[6]}, U[3] = {R[1], R[4], R[7]}, X[3] = {R[2], R[5], R[8]};
+    auto world = [&](const float v[3], float out[3]) {
+        for (int i = 0; i < 3; i++) out[i] = v[0] * X[i] + v[1] * U[i] + v[2] * F[i];
+    };
+    float fw[3], up[3], rt[3];
+    world(kFace[face][0], fw); world(kFace[face][1], up); world(kFace[face][2], rt);
+    const float rot[9] = {fw[0], up[0], rt[0], fw[1], up[1], rt[1], fw[2], up[2], rt[2]};
+    const float fr[4] = {-g_vr.tan, g_vr.tan, g_vr.tan, -g_vr.tan};
+    memcpy(MEM + w + 0x54, rot, sizeof rot);
+    memcpy(MEM + w + 0xE8, fr, sizeof fr);
+    (void)block;
+}
+// Before Present: write the face frame's files.
+static void vr180_before_present(IDirect3DDevice9 *d) {
+    int slot = 0;
+    const int block = vr180_slot(g_frame, &slot);
+    if (block < 0 || slot == 0) return;
+    const int rig = (slot - 1) / 5, face = (slot - 1) % 5, base = g_vr.start + 16 * block;
+    char tag[32];
+    snprintf(tag, sizeof tag, "%05d-%c%d", base, kRig[rig], face);
+    shot_write(d, tag, rig == 2);
+    char path[1100];
+    snprintf(path, sizeof path, "%s/stereo-%s.txt", g_save_dir, tag);
+    if (FILE *out = fopen(path, "w")) {
+        IDirect3DSurface9 *back = nullptr;
+        D3DSURFACE_DESC desc{};
+        if (SUCCEEDED(d->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &back))) { back->GetDesc(&desc); back->Release(); }
+        const float *R = g_vr.rig.rot, *P = g_vr.rig.pos;
+        fprintf(out, "frame %d\nblock %d\nbase %d\nrig %c\nface %d\ntan %.9g\nnear %.9g\nfar %.9g\neye_x %.9g\n"
+                "width %u\nheight %u\nunits_per_metre 70\n", g_frame, block, base, kRig[rig], face, g_vr.tan,
+                g_vr.rig.frustum[4], g_vr.rig.frustum[5], rig == 0 ? -g_vr.e : rig == 1 ? g_vr.e : 0.0f,
+                desc.Width, desc.Height);
+        fprintf(out, "rig_rot %.9g %.9g %.9g %.9g %.9g %.9g %.9g %.9g %.9g\nrig_pos %.9g %.9g %.9g\n", R[0], R[1],
+                R[2], R[3], R[4], R[5], R[6], R[7], R[8], P[0], P[1], P[2]);
+        fclose(out);
+    }
+}
+static int vr180_pending_shots(void) {
+    int n = 0;
+    if (DIR *dir = opendir(g_save_dir)) {
+        while (struct dirent *ent = readdir(dir))
+            if (!strncmp(ent->d_name, "shot-", 5) && strstr(ent->d_name, ".bmp")) n++;
+        closedir(dir);
+    }
+    return n;
+}
+// After Present: the clock for the next frame, and backpressure before a block starts.
+static void vr180_after_present(void) {
+    if (!g_vr.init) vr180_init();
+    if (!g_vr.on) return;
+    const int f = g_frame + 1;
+    if (f < g_vr.start) return;
+    if (!g_fake_clock_on) { g_vr.t0 = rt_game_ns(); g_fake_clock_ns = g_vr.t0; g_fake_clock_on = 1; }
+    const int k = f - g_vr.start;
+    if (k % 16 == 0 && k / 16 < g_vr.count && g_vr.pending > 0) {
+        for (int waited = 0; vr180_pending_shots() > g_vr.pending; waited++) {
+            if (waited % 60 == 0) LOG("vr180: block %d waits for the stitcher (%d shots pending)", k / 16, vr180_pending_shots());
+            usleep(500000);
+        }
+    }
+    g_fake_clock_ns = g_vr.t0 + (uint64_t)(k / 16) * 41666667ull + (uint64_t)k * 1000ull;
+    {   /* The next frame's eye offset, in the face's view space: t = ex * (rig x axis), and dclip = t * P with the
+         * square frustum (P00 = P11 = 1/tan, P23 = 1). For z, P22 = far / (far - near) would be exact, but the sky
+         * and clouds are drawn pinned to the far plane (z = w), and that pushes them past it (they vanish from one
+         * eye on the left and right faces). Taking P22 as 1 keeps z = w pinned; for everything else the error is
+         * (P22 - 1) * tz, about 1e-4 in clip z. */
+        int slot = 0;
+        const int block = vr180_slot(f, &slot);
+        float off[4] = {0, 0, 0, 0};
+        if (block >= 0 && slot > 0 && g_vr.have_frustum0) {
+            const int rig = (slot - 1) / 5, face = (slot - 1) % 5;
+            const float ex = rig == 0 ? -g_vr.e : rig == 1 ? g_vr.e : 0.0f;
+            const float tx = ex * kFace[face][2][0], ty = ex * kFace[face][1][0], tz = ex * kFace[face][0][0];
+            off[0] = tx / g_vr.tan; off[1] = ty / g_vr.tan; off[2] = tz; off[3] = tz;
+        }
+        dxvk_stereo_set_clip_offset(off[0], off[1], off[2], off[3]);
+    }
+    if (k % 16 == 0 && k / 16 < g_vr.count && (k / 16) % 10 == 0) LOG("vr180: block %d of %d", k / 16, g_vr.count);
+}
+#else
+static void stereo_before_present(IDirect3DDevice9 *) {}
+static void stereo_after_present(void) {}
+static void stereo_fp_changed(int) {}
+static bool stereo_skip_fp(void) { return false; }
+static void vr180_before_present(IDirect3DDevice9 *) {}
+static void vr180_after_present(void) {}
+void vr180_scene_hook(void) {}
+#endif
+
 void B_IDirect3DDevice9_Present(CPU *c) {
     auto *d = (IDirect3DDevice9 *)com_host(ARG(0));
+    static std::vector<std::pair<int, int>> trace_ranges;  // LB_D3DTRACE=from:to[,from:to...]
     if (g_trace_from < 0) {
-        const char *e = getenv("LB_D3DTRACE");
         g_trace_from = 1 << 30;
-        if (e) sscanf(e, "%d:%d", &g_trace_from, &g_trace_to);
+        for (const char *e = getenv("LB_D3DTRACE"); e && *e;) {
+            int a = 0, b = 0;
+            if (sscanf(e, "%d:%d", &a, &b) == 2) trace_ranges.push_back({a, b});
+            e = strchr(e, ',');
+            if (e) e++;
+        }
     }
     g_frame++;
     camera_log();
-    g_d3d_trace = g_frame >= g_trace_from && g_frame <= g_trace_to;
+    g_d3d_trace = 0;
+    for (const auto &r : trace_ranges) g_d3d_trace |= g_frame >= r.first && g_frame <= r.second;
     if (g_d3d_trace) fprintf(stderr, "D3D %d Present\n", g_frame);
     extern void touch_draw(IDirect3DDevice9 *d);
     touch_draw(d);
     { extern void hud_screen_present(IDirect3DDevice9 *); hud_screen_present(d); }
     shot_before_present(d);
     fp_present();
+    stereo_before_present(d);
+    vr180_before_present(d);
     RECT vr = view_rect();
     const RECT *dst = ARG(2) ? (const RECT *)GPTR(ARG(2)) : (vr.left || vr.top) ? &vr : nullptr;
 #if defined(__APPLE__)
@@ -1095,6 +1888,9 @@ void B_IDirect3DDevice9_Present(CPU *c) {
     game_fov_apply();
     dxvk_present_tap_set_depth(menu_open() ? nullptr : d3d_scene_depth_target());
 #endif
+    platform_present_draws(g_d3d_draws);
+    g_d3d_draws = 0;
+    passes_present();
     platform_present_begin();
     HRESULT hr = d->Present((const RECT *)GPTR(ARG(1)), dst, nullptr, (const RGNDATA *)GPTR(ARG(4)));
     platform_present_end();
@@ -1102,6 +1898,8 @@ void B_IDirect3DDevice9_Present(CPU *c) {
     dxvk_present_tap_set_depth(nullptr);
     d3d_scene_depth_reset();
 #endif
+    stereo_after_present();
+    vr180_after_present();
     pace_present();
     platform_present_hook();
     bisect_present();

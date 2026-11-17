@@ -14,11 +14,46 @@ come from private game files).
 
 1. Launches the installed app with `-SkyrimBenchAutoPlay YES`. The launcher presses Play once the files verify,
    without its input gate. It never installs anything.
-2. The launch environment turns on `LB_FRAMETIMES=1` (one `ft <frame> <ms> <Present ms>` log line per frame) and
+2. The launch environment turns on `LB_FRAMETIMES=1` (one `ft <frame> <ms> <Present ms> <work ms> <draw calls>`
+   log line per frame) and
    `LB_EXIT_FRAME` (a clean quit), and passes the scenario's input as `LB_KEYS` and its screenshot frames as
    `LB_SHOT`.
 3. Pulls the new log and screenshots, then writes `frametimes.csv`, `summary.json` (per phase: fps, mean, median,
-   p95, p99, max, frames over 33/50/250 ms, Present time), `env.json` and the device console.
+   p95, p99, max, frames over 33/50/250 ms, Present time, work time, draw calls per frame), `env.json` and the device console. A screenshot
+   stalls its frame for 50-300 ms (a GPU readback and two files written), so those frames are left out of the
+   statistics; `summary.json` lists them under `meta.screenshot_frames`. On a Mac it also records how much the
+   system swapped during the run (`meta.paging_mb`) and warns past 1 GB: with little memory, swapping can make
+   a run several times slower for no reason in the build under test.
+
+## Draws per pass (`LB_PASSES`)
+
+`--env LB_PASSES=1` adds one line per frame next to the `ft` line, with the frame's draw calls and primitives by
+the kind of pass they belong to (the classes add up to the `ft` draw count; `rt` counts render-target changes):
+
+    pass <frame> shadow=<draws>/<prims> refl=… main=… depth=… fp=… mask=… fx=… post=… ui=… other=… rt=<n>
+
+The classes are guessed from the bound targets (size and format relative to the back buffer, whether a
+depth-stencil is bound, depth-only clears, quads); the rules and which of them are unverified are in
+`runtime/d3d9_bridge.cpp` (`pass_class`). `LB_PASSES=2` also logs, for the frames in `LB_D3DTRACE=<from>:<to>` (the
+first frame without it), one `passdbg <frame> <class> <w>x<h> fmt=<n> ds=<0|1> draws=<n> prims=<n>` line per run
+of draws of one class into one target, to check the rules against a real frame.
+
+## GPU busy time and per-pass-class counts
+
+Both are optional; a log without them parses as before.
+
+- GPU busy: runs set `LB_POWER_LOG_S=2` (unless the scenario or `--env` sets it), so the game prints
+  `dxvk: gpu busy <N>%, <X> ms per frame over <F> frames` every 2 s on stderr. `summary.json` gets a top-level
+  `gpu` object: `{"windows", "frames", "gpu_busy_ms", "gpu_busy_pct"}`, both means weighted by each window's frame
+  count. These lines carry no frame numbers, so they can't be tied to phases: the figure covers the whole run
+  (loading and menus included). `compare` prints it as one line.
+- Pass classes: with `LB_PASSES=1` (add `--env LB_PASSES=1`) the game prints one line per frame,
+  `pass <frame> shadow=<draws>/<prims> refl=... main=620/41233/3.21 ... rt=<n>`. Every `key=a/b[/c]` is parsed
+  generically, so new classes or the third number (GPU ms) need no parser change. Each phase (and `overall`)
+  gets `passes`: `{class: {"frames", "draws_mean", "prims_mean", "gpu_ms_mean"}}`; `gpu_ms_mean` appears only when
+  the lines carry it, and a single-number key such as `rt` gives `{"frames", "value_mean"}`. Screenshot frames are
+  excluded, as for frame times. `compare` prints a per-class table (draws, prims, GPU ms; baseline->candidate and
+  the ratio) per phase when both runs have `passes`. Pass lines are read from the game log and the console.
 
 ## Scenarios
 
