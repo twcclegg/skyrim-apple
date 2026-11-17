@@ -633,8 +633,10 @@ extern "C" void skyrim_first_person_listen(void (*fn)(int kind)) { g_fp_listener
 // buffer (CreateDevice/Reset), never absolute. First match wins. "Seen" means it matches the Riverwood frame
 // traced with LB_D3DTRACE (docs/perf/LOG.md, 2026-11-10); everything else is unverified, check it with LB_PASSES=2.
 //   ui      a menu drawn into the second screen's image (hud_screen.cpp, Android dual screen only), or a draw into
-//           the back buffer after its first one: the HUD and menus over the final image (unverified)
-//   post    the first draw into the back buffer, if it is a quad (<= 2 primitives): the final image (unverified)
+//           the back buffer after the first since it was bound: the HUD and menus over the final image (seen: 17
+//           draws after the final image in Riverwood)
+//   post    the first draw into the back buffer since it was bound, if it is a quad (<= 2 primitives): the final
+//           image (seen in Riverwood; the game also draws one quad into the back buffer earlier in the frame)
 //   fp      a first-person draw (d3d_first_person, above; seen in Riverwood with empty hands, a sword and Flames),
 //           whatever the target: the late pass, and its prepass and mask draws otherwise counted as main and refl
 //   depth   an R32F colour target of back-buffer size: the scene's depth drawn again (seen, 638 draws)
@@ -867,6 +869,10 @@ void d3d_passes_target(IDirect3DDevice9 *d) {
     d->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb);
     if (rt) rt->GetDesc(&desc);
     if ((void *)rt != g_pass_target.rt) g_pass_frame.rt_changes++;
+    // Each time the back buffer is bound again its first quad is the final image (post), not the interface: the
+    // game also draws a quad into the back buffer earlier in the frame, as a scratch target (Riverwood, frame 2700
+    // traced with LB_PASSES=2: a 1-draw run long before the final image and the HUD).
+    if ((void *)rt != g_pass_target.rt && rt && rt == bb) g_pass_frame.seen_bb = false;
     if (g_passes_gpu && ((void *)rt != g_pass_target.rt || (ds != nullptr) != g_pass_target.ds)) gpu_target();
     g_pass_target = {rt, desc.Width, desc.Height, (uint32_t)desc.Format, ds != nullptr, rt && rt == bb};
     const PassTarget &t = g_pass_target;
