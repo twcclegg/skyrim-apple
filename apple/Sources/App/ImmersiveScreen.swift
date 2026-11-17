@@ -98,6 +98,8 @@ private struct QuadUniforms {
     /// Where the frame goes without the player's movement since it was rendered (see heldWithin).
     var heldModel: simd_float4x4
     var halfSize: SIMD2<Float>
+    /// The centre of the frame's rectangle on its plane (non-zero for an eye's asymmetric frustum).
+    var screenCentre: SIMD2<Float>
     var decode: UInt32
     var hasDepth: UInt32
     /// Grid columns and rows (vertices per row, rows).
@@ -137,7 +139,7 @@ final class ImmersiveCompositor: @unchecked Sendable {
     #include <metal_stdlib>
     using namespace metal;
     struct Uniforms {
-        float4x4 viewProjection; float4x4 model; float4x4 heldModel; float2 halfSize; uint decode; uint hasDepth;
+        float4x4 viewProjection; float4x4 model; float4x4 heldModel; float2 halfSize; float2 screenCentre; uint decode; uint hasDepth;
         uint2 grid; float eyeBack; float nearUnits; float unitsPerMeter; float depthScale; float maxBehind; float backplate;
         float tear; float trueDepth; float sharpen; float4 eyeRefine; float heldWithin;
     };
@@ -176,7 +178,7 @@ final class ImmersiveCompositor: @unchecked Sendable {
         return toScreen * min(behind_screen_raw(uv, u, depth, dilate) * u.depthScale, u.maxBehind) / u.eyeBack;
     }
     float3 screen_point(float2 uv, constant Uniforms &u) {
-        return float3((uv.x * 2 - 1) * u.halfSize.x, (1 - uv.y * 2) * u.halfSize.y, 0);
+        return float3((uv.x * 2 - 1) * u.halfSize.x + u.screenCentre.x, (1 - uv.y * 2) * u.halfSize.y + u.screenCentre.y, 0);
     }
     // Fades the push to nothing over the outer 4% so the picture's outline stays a clean rectangle. Applied after the
     // tear test, so the fade's own slope doesn't count as a depth edge.
@@ -257,7 +259,8 @@ final class ImmersiveCompositor: @unchecked Sendable {
             rBefore = pixel_radial(uv, u, depth);
             float3 fromOrigin = eye + d * (-ad + sqrt(max(ad * ad - aa + rBefore * rBefore, 0.0))) - origin;
             float3 on = fromOrigin * (u.eyeBack / max(-fromOrigin.z, 1e-6));
-            uv = saturate(float2((on.x / u.halfSize.x + 1) * 0.5, (1 - on.y / u.halfSize.y) * 0.5));
+            uv = saturate(float2(((on.x - u.screenCentre.x) / u.halfSize.x + 1) * 0.5,
+                                 (1 - (on.y - u.screenCentre.y) / u.halfSize.y) * 0.5));
         }
         // A ray that keeps jumping between a near and a far surface sees neither's own pixel: it looks past the
         // near surface's edge at something the game's camera did not see. Show the far one there.
@@ -334,6 +337,62 @@ final class ImmersiveCompositor: @unchecked Sendable {
     private var headStartYaw: Float?
     private var lastTracked = false
     private var headStartPosition = SIMD3<Float>(0, 0, 0)
+    /// LB_EYE_VIEWS=1 (with LB_IMMERSIVE_HEAD=1 and LB_STEREO_MULTIVIEW=1): the game renders each eye's picture
+    /// through that eye's own frustum and from its own place (skyrim_stereo_set_eyes), so each display pixel shows
+    /// its own game pixel when the head hasn't moved since. The frusta are clipped to a window W (tangents, the
+    /// same for both eyes): LB_EYE_WINDOW=<x>x<y>, for example 0.85x0.6; unset, the game's own frustum less
+    /// LB_EYE_MARGIN degrees (default 2) on every side, so the eyes never look past what the game drew. The game's
+    /// frustum (LB_FOV and LB_WINDOW's aspect) must cover W plus the margin.
+    private var eyeViewsSetting: Bool?
+    private var eyeViews: Bool {
+        if let eyeViewsSetting { return eyeViewsSetting }
+        guard checkedDevice else { return false }
+        let on = getenv("LB_EYE_VIEWS").map { String(cString: $0) == "1" } ?? false
+        eyeViewsSetting = on
+        if on { log("eye views on: the game renders each eye's own frustum") }
+        return on
+    }
+    private lazy var eyeWindow: SIMD2<Float>? = {
+        guard let raw = getenv("LB_EYE_WINDOW") else { return nil }
+        let parts = String(cString: raw).split(separator: "x").compactMap { Float($0) }
+        return parts.count == 2 && parts[0] > 0 && parts[1] > 0 ? SIMD2(parts[0], parts[1]) : nil
+    }()
+    private lazy var eyeMarginDegrees: Float = getenv("LB_EYE_MARGIN").flatMap { Float(String(cString: $0)) } ?? 2
+    /// What was last given to skyrim_stereo_set_eyes, so it is only called when the eyes or the window change.
+    private var givenEyes: [Float] = []
+
+    /// Gives the game the eyes of this drawable's first two views: their tangents clipped to the window and their
+    /// poses relative to the device, whose starting place the frame's rays start from (the game camera follows the
+    /// head), with the eye separation scaled about the point between them.
+    private func giveEyes(_ drawable: LayerRenderer.Drawable, camera c: [Float], unitsPerMetre: Float) {
+        guard drawable.views.count >= 2 else { return }
+        var window: (l: Float, r: Float, t: Float, b: Float)
+        if let eyeWindow {
+            window = (-eyeWindow.x, eyeWindow.x, eyeWindow.y, -eyeWindow.y)
+        } else {
+            // The game frustum's angles less the margin on each side.
+            let m = eyeMarginDegrees * .pi / 180
+            func inset(_ tangent: Float) -> Float { tan(atan(tangent) - m * (tangent < 0 ? -1 : 1)) }
+            window = (inset(c[12]), inset(c[13]), inset(c[14]), inset(c[15]))
+        }
+        let centre = (drawable.views[0].transform.columns.3 + drawable.views[1].transform.columns.3) / 2
+        var tangents: [Float] = [], poses: [Float] = []
+        for view in drawable.views.prefix(2) {
+            // visionOS gives each tangent as a positive extent from the view axis.
+            let t = view.tangents
+            tangents += [max(-abs(t[0]), window.l), min(abs(t[1]), window.r), min(abs(t[2]), window.t), max(-abs(t[3]), window.b)]
+            var pose = view.transform
+            pose.columns.3 = centre + (pose.columns.3 - centre) * eyeSeparationScale
+            for column in 0..<4 { for row in 0..<4 { poses.append(pose[column][row]) } }
+        }
+        let key = tangents + poses + [unitsPerMetre]
+        if key.count == givenEyes.count, zip(key, givenEyes).allSatisfy({ abs($0 - $1) < 1e-5 }) { return }
+        givenEyes = key
+        skyrim_stereo_set_eyes(tangents, poses, unitsPerMetre)
+        func f(_ v: Float) -> String { String(format: "%.3f", v) }
+        log("eyes: tangents L \(tangents[0..<4].map(f)) R \(tangents[4..<8].map(f)); raw L \([0, 1, 2, 3].map { f(drawable.views[0].tangents[$0]) }) R \([0, 1, 2, 3].map { f(drawable.views[1].tangents[$0]) }); eye x \(f(poses[12])) \(f(poses[28])) m, \(f(unitsPerMetre)) units/m")
+    }
+
     /// Distance of the plane the frame's grid is laid on before depth moves it (any value works in true depth).
     private static let viewPlane: Float = 2.0
 
@@ -738,6 +797,9 @@ final class ImmersiveCompositor: @unchecked Sendable {
                         let settings = readDepthSettings()
                         if settings.on, settings.units > 0 { metersPerUnit = headDepthScale / settings.units }
                     }
+                    if eyeViews, depthTexture != nil, metersPerUnit != nil {
+                        giveEyes(drawable, camera: c, unitsPerMetre: readDepthSettings().units / headDepthScale)
+                    }
                     if let poses = framePoses(camera: c, shownAt: seconds, metersPerUnit: metersPerUnit) {
                         model = poses.model
                         heldModel = poses.held
@@ -790,7 +852,25 @@ final class ImmersiveCompositor: @unchecked Sendable {
                     let eyeBack = tracked ? Self.viewPlane : Self.distance
                     var model = centreModel
                     var eyeHeldModel = heldModel
-                    if stereoEye, settings.units > 0 {
+                    var rectHalf = halfSize ?? SIMD2(Self.width / 2, Self.width / 2 / aspect)
+                    var rectCentre = SIMD2<Float>(0, 0)
+                    if stereoEye, tracked, game.eye_views != 0 {
+                        // The picture covers this eye's own frustum, seen from where the eye was relative to the
+                        // game camera: the rays start there (the plane's origin moved by the eye's pose).
+                        let tangents = withUnsafeBytes(of: game.eye_tangents) { Array($0.bindMemory(to: Float.self)) }
+                        let poses = withUnsafeBytes(of: game.eye_pose) { Array($0.bindMemory(to: Float.self)) }
+                        let t = Array(tangents[(index * 4)..<(index * 4 + 4)])
+                        rectHalf = SIMD2((t[1] - t[0]) / 2, (t[2] - t[3]) / 2) * Self.viewPlane
+                        rectCentre = SIMD2((t[1] + t[0]) / 2, (t[2] + t[3]) / 2) * Self.viewPlane
+                        var pose = matrix_identity_float4x4
+                        for column in 0..<4 { for row in 0..<4 { pose[column][row] = poses[index * 16 + column * 4 + row] } }
+                        var toOrigin = matrix_identity_float4x4, fromOrigin = matrix_identity_float4x4
+                        toOrigin.columns.3 = SIMD4(0, 0, eyeBack, 1)
+                        fromOrigin.columns.3 = SIMD4(0, 0, -eyeBack, 1)
+                        let eye = toOrigin * pose * fromOrigin
+                        model = centreModel * eye
+                        eyeHeldModel = heldModel.map { $0 * eye }
+                    } else if stereoEye, settings.units > 0 {
                         let side: Float = index == 0 ? -1 : 1
                         let metres = stereoEyeUnits / settings.units * (tracked ? headDepthScale : max(settings.scale, 1e-3))
                         var shift = matrix_identity_float4x4
@@ -800,7 +880,7 @@ final class ImmersiveCompositor: @unchecked Sendable {
                     }
                     var uniforms = QuadUniforms(viewProjection: drawable.computeProjection(convention: .rightUpBack, viewIndex: index) * viewMatrix,
                                                 model: model, heldModel: eyeHeldModel ?? model,
-                                                halfSize: halfSize ?? SIMD2(Self.width / 2, Self.width / 2 / aspect),
+                                                halfSize: rectHalf, screenCentre: rectCentre,
                                                 decode: game.needs_srgb_decode != 0 ? 1 : 0,
                                                 hasDepth: useDepth ? 1 : 0,
                                                 grid: SIMD2(Self.gridColumns, Self.gridRows),
