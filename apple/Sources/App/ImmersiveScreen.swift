@@ -313,6 +313,9 @@ final class ImmersiveCompositor: @unchecked Sendable {
     private var lastCommands: (any MTLCommandBuffer)?
     private var checkedDevice = false
     private var presented = 0, newFrames = 0, loggedAt = CACurrentMediaTime()
+    /// Eye views: the angle between the direction the left eye's picture was rendered looking and where that eye
+    /// looks when it is shown (degrees): what the compositor still has to correct (plans/eye-views.md 2.3).
+    private var residualSum: Double = 0, residualMax: Double = 0, residualCount = 0
     /// The compositor's own GPU time per frame (its command buffers' GPU start to end), for the log.
     private let gpuTime = GPUTimeTally()
     /// Grid size: one vertex every 4 game pixels.
@@ -881,6 +884,14 @@ final class ImmersiveCompositor: @unchecked Sendable {
                         let eye = toOrigin * pose * fromOrigin
                         model = centreModel * eye
                         eyeHeldModel = heldModel.map { $0 * eye }
+                        if index == 0 {
+                            let rendered = -simd_normalize(simd_make_float3(model.columns.2))
+                            let shown = -simd_normalize(simd_make_float3(originFromEye.columns.2))
+                            let degrees = Double(acos(max(-1, min(1, simd_dot(rendered, shown))))) * 180 / .pi
+                            residualSum += degrees
+                            residualMax = max(residualMax, degrees)
+                            residualCount += 1
+                        }
                     } else if stereoEye, settings.units > 0 {
                         let side: Float = index == 0 ? -1 : 1
                         let metres = stereoEyeUnits / settings.units * (tracked ? headDepthScale : max(settings.scale, 1e-3))
@@ -946,6 +957,11 @@ final class ImmersiveCompositor: @unchecked Sendable {
             let gpu = gpuTime.take()
             if gpu.count > 0 {
                 log(String(format: "compositor gpu %.2f ms per frame, p95 %.2f ms, max %.2f ms", gpu.total * 1000 / Double(gpu.count), gpu.p95 * 1000, gpu.max * 1000))
+            }
+            if residualCount > 0 {
+                log(String(format: "eye views: shown %.2f deg from where the picture was rendered looking (mean), max %.2f",
+                           residualSum / Double(residualCount), residualMax))
+                residualSum = 0; residualMax = 0; residualCount = 0
             }
             presented = 0
             newFrames = 0
