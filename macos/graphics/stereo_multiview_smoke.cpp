@@ -307,7 +307,7 @@ static int run(bool multiview) {
       { "layers_rt_texture_128",     texLevel,   2 },
       { "layers_back_buffer",        backbuffer, 1 },
       { "layers_render_target_64x128", narrow,   1 },
-      { "layers_depth_surface_256",  bigDepth,   1 },
+      { "layers_depth_surface_256",  bigDepth,   2 },  // larger than the back buffer: still the scene's
     };
     for (const LayerCase& c : layerCases) {
       const int layers = dxvk_stereo_surface_layers(c.s);
@@ -455,16 +455,16 @@ static int run(bool multiview) {
         "back buffer + two-layer depth: moved (%+.2f, %+.2f), expect (%+.2f, +0.00) +-0.25",
         bbShift.cx - bbRest.cx, bbShift.cy - bbRest.cy, -kShiftPx);
 
-    // 5b: two-layer target + one-layer depth: mono into layer 0; layer 1 keeps the clear.
+    // 5b: two-layer target + a larger (256x256) depth-stencil, as the game's scene uses a 1280x1024 one with its
+    // 1280x720 targets: the depth-stencil has two layers too, so the pass is multiview and each layer gets its eye.
     p.sceneFrame(target, bigDepth);
     {
-      const auto px0 = p.read(target, 0), px1 = p.read(target, 1);
-      const Blob t0 = measureRgb(px0, kRed);
-      const Blob c1 = measureRgb(px1, kClear);
-      r.expect(std::fabs(t0.cx - rest[0].cx + kShiftPx) <= 0.25 && std::abs(t0.count - rest[0].count) <=
-          rest[0].count / 50 && c1.count == kPixels, "mono_mixed_attachments",
-          "two-layer target + 256x256 one-layer depth: layer 0 triangle moved %+.2f (expect %+.2f), layer 1 %d of %d "
-          "px still cleared", t0.cx - rest[0].cx, -kShiftPx, c1.count, kPixels);
+      const Blob t0 = measureRgb(p.read(target, 0), kRed), t1 = measureRgb(p.read(target, 1), kRed);
+      r.expect(std::fabs(t0.cx - rest[0].cx + kShiftPx) <= 0.25 && std::fabs(t1.cx - rest[1].cx - kShiftPx) <= 0.25 &&
+          std::abs(t0.count - rest[0].count) <= rest[0].count / 50 && std::abs(t1.count - rest[1].count) <=
+          rest[1].count / 50, "larger_depth_multiview",
+          "two-layer target + 256x256 two-layer depth: layer 0 moved %+.2f, layer 1 %+.2f (expect %+.2f, %+.2f)",
+          t0.cx - rest[0].cx, t1.cx - rest[1].cx, -kShiftPx, kShiftPx);
     }
 
     // 6: D3D9 reads of a two-layer render-target texture see layer 0 (the left eye here): StretchRect into the
