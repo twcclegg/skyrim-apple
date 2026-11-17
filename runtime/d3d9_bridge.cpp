@@ -454,6 +454,15 @@ void d3d_trace(CPU *c, const char *name, int nargs) {
 // a screenshot after presenting it (finds which draw produces an artefact).
 int g_bisect, g_d3d_draws;
 static int g_last_class = -1;      // the class of the draw being made (d3d_passes_draw), for LB_SKIP_CLASS
+/* LB_DEPTH_COPY=1: the game redraws the whole scene into an R32F colour target only to have its depth as a texture
+ * (the "depth" pass class, a third of a frame's draws). Its values, P33 (1 - near / z), are exactly the hardware depth
+ * the main pass already wrote, so instead: at the depth pass's first draw, copy the main pass's depth-stencil into
+ * that target (DXVK, every stereo layer), and skip the pass's draws. The first-person depth draws stay. */
+static int g_depth_copy = -1;
+static IDirect3DSurface9 *g_main_ds;   // the main pass's depth-stencil this frame (held)
+static IDirect3DDevice9 *g_pass_device;
+static bool g_depth_copied;
+extern "C" long dxvk_copy_depth_to_float(void *device, void *depthStencil, void *floatTarget);
 static uint32_t g_skip_class_mask;  // LB_SKIP_CLASS=depth,shadow,...: skip every draw of those classes (timing only)
 static int g_bisect_from = -1, g_draw_no;
 
@@ -483,7 +492,9 @@ static bool skip_ranges_hit(void) {
 }
 static bool fp_skip_now(void);  // LB_FP_SKIP, below
 
+static bool depth_copy_draw(void);
 bool d3d_skip_draw(void) {
+    if (g_depth_copy == 1 && depth_copy_draw()) return true;
     if (g_skip_class_mask && g_last_class >= 0 && (g_skip_class_mask >> g_last_class & 1)) return true;
     if (!g_skip_ranges.empty() && skip_ranges_hit()) return true;
     if (fp_skip_now()) return true;
@@ -515,7 +526,7 @@ static void bisect_present(void) {
     if (!g_skip_ranges_read) skip_ranges_read();
     static const bool fp_skip = getenv("LB_FP_SKIP") || getenv("LB_STEREO_HYBRID");  // both skip draws
     g_bisect = (g_frame >= g_bisect_from && g_frame < g_bisect_from + 160) || !g_skip_ranges.empty() || fp_skip
-            || g_skip_class_mask;
+            || g_skip_class_mask || g_depth_copy == 1;
 }
 
 // LB_PASSES=1 logs, at each Present, the frame's draw calls and primitives by the kind of pass they belong to, so
@@ -813,6 +824,7 @@ static void gpu_init(IDirect3DDevice9 *d) {
 void d3d_passes_draw(uint32_t prims) {
     int k = pass_class(prims);
     g_last_class = k;
+    if (k == PASS_MAIN && g_depth_copy == 1 && !g_main_ds && g_pass_device) g_pass_device->GetDepthStencilSurface(&g_main_ds);
     if (g_passes_gpu) gpu_draw(k);
     PassFrame &f = g_pass_frame;
     f.cls[k].draws++;
@@ -836,6 +848,7 @@ void d3d_passes_draw(uint32_t prims) {
 }
 
 void d3d_passes_target(IDirect3DDevice9 *d) {
+    g_pass_device = d;
     IDirect3DSurface9 *rt = nullptr, *ds = nullptr, *bb = nullptr;
     D3DSURFACE_DESC desc = {};
     d->GetRenderTarget(0, &rt);
@@ -909,13 +922,15 @@ static void passes_init(IDirect3DDevice9 *d) {
         flame_init();
         const char *e = getenv("LB_PASSES"), *fp = getenv("LB_FP"), *eye = getenv("LB_STEREO_EYE_UNITS");
         g_passes_log = e ? atoi(e) : 0;
+        g_depth_copy = getenv("LB_DEPTH_COPY") && atoi(getenv("LB_DEPTH_COPY")) ? 1 : 0;
+        if (g_depth_copy) LOG("LB_DEPTH_COPY: the R32F depth pass is a copy of the main pass's depth");
         if (const char *sc = getenv("LB_SKIP_CLASS")) {  // timing experiments: the picture is wrong by design
             for (int c = 0; c < PASS_COUNT; c++)
                 if (strstr(sc, k_pass_names[c])) g_skip_class_mask |= 1u << c;
             LOG("LB_SKIP_CLASS=%s: skipping pass classes mask %x", sc, g_skip_class_mask);
         }
         const bool fp_wanted = (fp && atoi(fp)) || getenv("LB_FP_SKIP") || (eye && atof(eye) != 0) || g_fp_flame
-                            || g_skip_class_mask;
+                            || g_skip_class_mask || g_depth_copy == 1;
         g_d3d_passes = g_passes_log || fp_wanted;
         // without an LB_D3DTRACE range, LB_PASSES=2 looks at the first frame
         g_passdbg = g_passes_log == 2 && !getenv("LB_D3DTRACE");
@@ -930,7 +945,24 @@ static void passes_init(IDirect3DDevice9 *d) {
 
 // At Present: the frame's line, then a new frame. LB_PASSES=2 follows the LB_D3DTRACE frames (g_d3d_trace is
 // already set for the next one).
+// LB_DEPTH_COPY at a depth-pass draw: copy once per frame, then skip. False (draw it) if the copy can't be made.
+static bool depth_copy_draw(void) {
+    if (g_last_class != PASS_DEPTH) return false;
+    if (g_depth_copied) return true;
+    IDirect3DSurface9 *rt = nullptr;
+    if (!g_pass_device || !g_main_ds || FAILED(g_pass_device->GetRenderTarget(0, &rt)) || !rt) return false;
+    const long hr = dxvk_copy_depth_to_float(g_pass_device, g_main_ds, rt);
+    rt->Release();
+    static int logged;
+    if (hr != 0 && logged++ < 3) LOG("LB_DEPTH_COPY: copy failed (hr %08lx); the pass is drawn", (unsigned long)hr);
+    if (hr != 0) return false;
+    g_depth_copied = true;
+    return true;
+}
+
 static void passes_present(void) {
+    g_depth_copied = false;
+    if (g_main_ds) { g_main_ds->Release(); g_main_ds = nullptr; }
     if (!g_d3d_passes) return;
     g_pass_frame.fp_late = g_pass_frame.fp_proj = false;
     fp_update();
