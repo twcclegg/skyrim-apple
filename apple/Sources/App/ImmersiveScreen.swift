@@ -316,6 +316,9 @@ final class ImmersiveCompositor: @unchecked Sendable {
     private static let gridColumns: UInt32 = 321, gridRows: UInt32 = 181
     private var depthSettings: (scale: Float, maxBehind: Float, near: Float, units: Float, tear: Float, on: Bool)?
     private var loggedDepth = false
+    private var loggedStereo = false
+    /// LB_STEREO_EYE_UNITS: half the game's eye separation in game units (the game's left and right cameras).
+    private lazy var stereoEyeUnits: Float = getenv("LB_STEREO_EYE_UNITS").flatMap { Float(String(cString: $0)) }.map { abs($0) } ?? 2.24
     /// Head tracking (LB_IMMERSIVE_HEAD=1, docs/HEAD_TRACKING.md): the head steers the game camera and each frame
     /// is drawn where its camera pointed, at true depth. The head's starting heading and position.
     /// Read once the game is running: launch-env.json is applied when the game starts, after this layer opens.
@@ -676,6 +679,16 @@ final class ImmersiveCompositor: @unchecked Sendable {
         if hasImage, let pointer = game.depth_texture {
             depthTexture = Unmanaged<AnyObject>.fromOpaque(pointer).takeUnretainedValue() as? any MTLTexture
         }
+        // Stereo frames (LB_STEREO_PRESENT): the right eye's own picture and depth, rendered by the game.
+        var textureEye2: (any MTLTexture)?
+        var depthTextureEye2: (any MTLTexture)?
+        if hasImage, let pointer = game.texture_eye2 {
+            textureEye2 = Unmanaged<AnyObject>.fromOpaque(pointer).takeUnretainedValue() as? any MTLTexture
+            if let depthPointer = game.depth_texture_eye2 {
+                depthTextureEye2 = Unmanaged<AnyObject>.fromOpaque(depthPointer).takeUnretainedValue() as? any MTLTexture
+            }
+            if !loggedStereo { loggedStereo = true; log("stereo frames: each eye draws its own picture (eye units \(stereoEyeUnits))") }
+        }
         if depthTexture != nil, !loggedDepth {
             loggedDepth = true
             log("game depth \(depthTexture!.width)x\(depthTexture!.height) arriving")
@@ -691,8 +704,11 @@ final class ImmersiveCompositor: @unchecked Sendable {
         if let texture {
             let imageSettings = readImageSettings()
             sharpen = imageSettings.sharpen
-            image = upscale(texture, isNew: game.is_new != 0, encoded: game.needs_srgb_decode != 0,
-                            factor: imageSettings.upscale, commands: commands) ?? texture
+            // The MetalFX upscaler holds one picture; stereo frames are drawn as they are.
+            if textureEye2 == nil {
+                image = upscale(texture, isNew: game.is_new != 0, encoded: game.needs_srgb_decode != 0,
+                                factor: imageSettings.upscale, commands: commands) ?? texture
+            }
         }
 
         var publishedHead = false
@@ -736,6 +752,7 @@ final class ImmersiveCompositor: @unchecked Sendable {
             }
             // The point between the eyes, in the device's space: the eye separation is scaled about it.
             let eyesCentre = drawable.views.reduce(SIMD4<Float>(0, 0, 0, 0)) { $0 + $1.transform.columns.3 } / Float(max(drawable.views.count, 1))
+            let centreDepthTexture = depthTexture
             for (index, view) in drawable.views.enumerated() {
                 let pass = MTLRenderPassDescriptor()
                 pass.colorAttachments[0].texture = drawable.colorTextures[view.textureMap.textureIndex]
@@ -750,7 +767,14 @@ final class ImmersiveCompositor: @unchecked Sendable {
                 if !rateMaps.isEmpty { pass.rasterizationRateMap = rateMaps[min(index, rateMaps.count - 1)] }
                 guard let encoder = commands.makeRenderCommandEncoder(descriptor: pass) else { continue }
                 encoder.setViewport(view.textureMap.viewport)
-                if let texture, let image, let model, let pipeline, let depth {
+                if let monoTexture = texture, let monoImage = image, let centreModel = model, let pipeline, let depth {
+                    // Stereo: view 1 draws the right eye's picture and depth; each eye's mesh starts its rays from
+                    // where the game's camera for that eye was, half the eye separation to its side, so the depth
+                    // already in each picture is not added a second time.
+                    let stereoEye = textureEye2 != nil && index <= 1
+                    let texture = stereoEye && index == 1 ? textureEye2! : monoTexture
+                    let image = stereoEye && index == 1 ? textureEye2! : monoImage
+                    let depthTexture = stereoEye && index == 1 ? (depthTextureEye2 ?? centreDepthTexture) : centreDepthTexture
                     var eyeFromDevice = view.transform
                     eyeFromDevice.columns.3 = eyesCentre + (eyeFromDevice.columns.3 - eyesCentre) * eyeSeparationScale
                     let originFromEye = head * eyeFromDevice
@@ -764,8 +788,18 @@ final class ImmersiveCompositor: @unchecked Sendable {
                     // movement. From a ray origin closer than the viewer (1.8 m) it bent the screen into a box.
                     let tracked = halfSize != nil
                     let eyeBack = tracked ? Self.viewPlane : Self.distance
+                    var model = centreModel
+                    var eyeHeldModel = heldModel
+                    if stereoEye, settings.units > 0 {
+                        let side: Float = index == 0 ? -1 : 1
+                        let metres = stereoEyeUnits / settings.units * (tracked ? headDepthScale : max(settings.scale, 1e-3))
+                        var shift = matrix_identity_float4x4
+                        shift.columns.3 = SIMD4<Float>(side * metres, 0, 0, 1)
+                        model = centreModel * shift
+                        eyeHeldModel = heldModel.map { $0 * shift }
+                    }
                     var uniforms = QuadUniforms(viewProjection: drawable.computeProjection(convention: .rightUpBack, viewIndex: index) * viewMatrix,
-                                                model: model, heldModel: heldModel ?? model,
+                                                model: model, heldModel: eyeHeldModel ?? model,
                                                 halfSize: halfSize ?? SIMD2(Self.width / 2, Self.width / 2 / aspect),
                                                 decode: game.needs_srgb_decode != 0 ? 1 : 0,
                                                 hasDepth: useDepth ? 1 : 0,
