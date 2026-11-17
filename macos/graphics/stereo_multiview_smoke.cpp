@@ -512,6 +512,44 @@ static int run(bool multiview) {
   }
   dxvk_stereo_set_clip_offset(0.0f, 0.0f, 0.0f, 0.0f);
 
+  {
+    // Occlusion queries around the quad (w == 1, so it covers the same pixels in both views). Inside a multiview
+    // pass each query uses one pool slot per view; DXVK reserves them in pairs and reports the views' average,
+    // so the count equals the quad's area in either mode. 64 queries in one pass also exercise neighbouring slots;
+    // a result that never becomes available would mean a slot the GPU never wrote.
+    constexpr int kQueries = 64;
+    const DWORD area = DWORD((kQuadMaxX - kQuadMinX + 1) * (kQuadMaxY - kQuadMinY + 1));
+    std::vector<IDirect3DQuery9*> queries(kQueries, nullptr);
+    for (auto& q : queries) check(device->CreateQuery(D3DQUERYTYPE_OCCLUSION, &q), "CreateQuery(OCCLUSION)");
+    p.bind(target, nullptr);
+    check(device->SetRenderState(D3DRS_ZENABLE, D3DZB_FALSE), "ZENABLE");
+    check(device->Clear(0, nullptr, D3DCLEAR_TARGET, 0xFF000000u | kClear, 1.0f, 0), "Clear");
+    check(device->BeginScene(), "BeginScene");
+    for (auto* q : queries) {
+      check(q->Issue(D3DISSUE_BEGIN), "Issue(BEGIN)");
+      p.quad(kQuadX0, kQuadY0, kQuadX1, kQuadY1, 0.5f, 0xFF000000u | kGreen);
+      check(q->Issue(D3DISSUE_END), "Issue(END)");
+    }
+    check(device->EndScene(), "EndScene");
+    int wrong = 0, pending = 0;
+    DWORD first = 0;
+    for (int i = 0; i < kQueries; i++) {
+      DWORD count = 0;
+      HRESULT hr = S_FALSE;
+      for (int tries = 0; tries < 2000 && hr == S_FALSE; tries++) {
+        hr = queries[i]->GetData(&count, sizeof count, D3DGETDATA_FLUSH);
+        if (hr == S_FALSE) SDL_Delay(1);
+      }
+      if (i == 0) first = count;
+      if (hr != S_OK) pending++;
+      else if (count != area) wrong++;
+      queries[i]->Release();
+    }
+    r.expect(pending == 0 && wrong == 0, "occlusion_query_count",
+        "%d occlusion queries: first %lu samples (expect %lu), %d wrong, %d never available", kQueries,
+        (unsigned long)first, (unsigned long)area, wrong, pending);
+  }
+
   const bool pass = r.failed == 0;
   std::printf("{\"probe\":\"d3d9_stereo_multiview\",\"adapter\":\"%s\",\"multiview\":%s,\"checks\":%d,\"failed\":%d,"
       "\"failed_checks\":[%s],\"pass\":%s}\n", adapter.Description, multiview ? "true" : "false", r.checks, r.failed,
