@@ -467,8 +467,28 @@ static void ini_set(IniFile *f, const char *sec, const char *key, const char *va
 void skyrim_seed_prefs(int w, int h) {
     const char *prefs = "C:\\Users\\Player\\Documents\\My Games\\Skyrim\\SkyrimPrefs.ini";
     char host[1024];
-    /* An existing file is kept (the player's settings), unless LB_PRESET asks for a preset. */
-    if (rt_host_path(prefs, host, sizeof host) && !(getenv("LB_PRESET") && *getenv("LB_PRESET"))) return;
+    /* An existing file is kept (the player's settings), unless LB_PRESET asks for a preset. An explicit LB_WINDOW
+     * still sets the render size in it: the game renders at iSize W x iSize H whatever the window is, so without
+     * this the size of the first run stuck (the headset kept 1280x720 with LB_WINDOW=1920x1080). */
+    if (rt_host_path(prefs, host, sizeof host) && !(getenv("LB_PRESET") && *getenv("LB_PRESET"))) {
+        const char *win = getenv("LB_WINDOW");
+        int ww = 0, wh = 0;
+        if (win && sscanf(win, "%dx%d", &ww, &wh) == 2 && ww >= 320 && wh >= 200) {
+            w = ww;
+            h = wh;
+            pthread_mutex_lock(&g_ini_lock);
+            IniFile *f = ini_get(prefs);
+            char v[16];
+            snprintf(v, sizeof v, "%d", w);
+            ini_set(f, "Display", "iSize W", v);
+            snprintf(v, sizeof v, "%d", h);
+            ini_set(f, "Display", "iSize H", v);
+            ini_save(f);
+            pthread_mutex_unlock(&g_ini_lock);
+            LOG("prefs: render size %dx%d (LB_WINDOW) in %s", w, h, host);
+        }
+        return;
+    }
     pthread_mutex_lock(&g_ini_lock);
     IniFile *f = ini_get(prefs);
     char low[1024];
