@@ -1336,6 +1336,8 @@ IDirect3DSurface9 *d3d_scene_depth_target(void);
 void d3d_scene_depth_reset(void);
 #if defined(__APPLE__)
 extern "C" void dxvk_present_tap_set_depth(void *surface);  // DXVK present tap (dxvk_present_tap.h)
+extern "C" long dxvk_stereo_get_render_target_data_layer(void *, void *, void *, unsigned);  // dxvk_stereo.h
+extern "C" int dxvk_stereo_surface_layers(void *);
 #endif
 
 #if defined(__APPLE__)
@@ -1381,6 +1383,22 @@ static void shot_depth(IDirect3DDevice9 *d, const char *tag) {
         }
         copy->UnlockRect();
         LOG("LB_SHOT frame %d depth %ux%u -> %s", g_frame, desc.Width, desc.Height, out ? path : "(open failed)");
+#if defined(__APPLE__)
+        // Single-pass stereo (LB_STEREO_MULTIVIEW): the second eye's depth, from layer 1, beside it.
+        if (dxvk_stereo_surface_layers(depth) == 2 && SUCCEEDED((HRESULT)dxvk_stereo_get_render_target_data_layer(d, depth, copy, 1))
+         && SUCCEEDED(copy->LockRect(&locked, nullptr, D3DLOCK_READONLY))) {
+            snprintf(path, sizeof path, "%s/depth-%s-layer1.f32", g_save_dir, tag);
+            FILE *out1 = fopen(path, "wb");
+            if (out1) {
+                uint32_t size[2] = {desc.Width, desc.Height};
+                fwrite(size, 4, 2, out1);
+                for (uint32_t y = 0; y < desc.Height; y++) fwrite((const uint8_t *)locked.pBits + (size_t)y * locked.Pitch, 4, desc.Width, out1);
+                fclose(out1);
+            }
+            copy->UnlockRect();
+            LOG("LB_SHOT frame %d depth layer 1 -> %s", g_frame, out1 ? path : "(open failed)");
+        }
+#endif
     } else {
         LOG("LB_SHOT frame %d depth failed: hr %08x", g_frame, (unsigned)hr);
     }
@@ -1703,12 +1721,22 @@ struct StereoState {
     bool cam_applied_valid = false;
 };
 static StereoState g_stereo;
+static bool stereo_live_multiview(void);
 
 static void stereo_init(void) {
     StereoState &st = g_stereo;
     st.init = true;
     const char *d = getenv("LB_STEREO_EYE_UNITS"), *f = getenv("LB_STEREO_FRAMES");
-    if (!d || !f || !*f || atof(d) == 0) return;
+    if (!d || atof(d) == 0) return;
+    if (!f || !*f) {
+        // No capture frames: live single-pass stereo (LB_STEREO_MULTIVIEW=1) shifts every frame's eyes.
+        if (stereo_live_multiview()) {
+            st.d = (float)fabs(atof(d));
+            st.on = true;
+            LOG("stereo: live single-pass stereo, d %.3f units", st.d);
+        }
+        return;
+    }
     st.d = (float)fabs(atof(d));
     const char *passes = getenv("LB_STEREO_PASSES"), *hybrid = getenv("LB_STEREO_HYBRID"),
                *hold = getenv("LB_STEREO_HOLD");
@@ -1804,6 +1832,12 @@ static void stereo_fp_changed(int kind) {
 }
 static bool stereo_skip_fp(void) { return g_stereo.skip_fp; }
 
+static bool stereo_live_multiview(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("LB_STEREO_MULTIVIEW"); on = e && !strcmp(e, "1"); }
+    return on == 1;
+}
+
 // After Present: set the eye, and the clock, for the next frame.
 static void stereo_after_present(void) {
     StereoState &st = g_stereo;
@@ -1820,6 +1854,11 @@ static void stereo_after_present(void) {
         st.cam_applied = cam;
     } else if (eye == 'L' || eye == 'R') {
         LOG("stereo capture: frame %d eye %c: no world camera, rendering the centre eye", g_frame + 1, eye);
+    } else if (!eye && stereo_live_multiview() && game_camera_read(&cam)) {
+        // Live single-pass stereo (LB_STEREO_MULTIVIEW=1, no capture frame): view 0 (layer 0) the left eye, view 1
+        // mirrored to the right (dxvk_stereo.h), every frame.
+        const float l = cam.frustum[0], r = cam.frustum[1];
+        if (r > l) k = 2.0f / (r - l) * -st.d;
     }
     if (eye) st.cam_applied_valid = valid || (eye == 'C' && game_camera_read(&st.cam_applied));
     st.k_applied = k;
