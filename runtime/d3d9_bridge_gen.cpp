@@ -527,6 +527,7 @@ static void B_IDirect3DDevice9_DrawPrimitive(CPU *c) {
     g_d3d_draws++;
     if (g_d3d_fp) d3d_fp_draw();
     if (g_d3d_passes) d3d_passes_draw(ARG(3));
+    if (g_fp_flame) d3d_fp_flame_draw(self, 0, ARG(1), ARG(2), ARG(3), 0, 0, 0);
     if (g_bisect && d3d_skip_draw()) { RET(0, 4); return; }
     auto r = bridge_call(self, &IDirect3DDevice9::DrawPrimitive, ARG(1), ARG(2), ARG(3));
     RET((uint32_t)r, 4);
@@ -538,6 +539,7 @@ static void B_IDirect3DDevice9_DrawIndexedPrimitive(CPU *c) {
     g_d3d_draws++;
     if (g_d3d_fp) d3d_fp_draw();
     if (g_d3d_passes) d3d_passes_draw(ARG(6));
+    if (g_fp_flame) d3d_fp_flame_draw(self, 1, ARG(1), ARG(2), ARG(3), ARG(4), ARG(5), ARG(6));
     if (g_bisect && d3d_skip_draw()) { RET(0, 7); return; }
     auto r = bridge_call(self, &IDirect3DDevice9::DrawIndexedPrimitive, ARG(1), (INT)ARG(2), ARG(3), ARG(4), ARG(5), ARG(6));
     RET((uint32_t)r, 7);

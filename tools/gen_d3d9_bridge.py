@@ -166,6 +166,10 @@ def gen():
                 o.append("    g_d3d_draws++;")
                 o.append("    if (g_d3d_fp) d3d_fp_draw();")
                 o.append("    if (g_d3d_passes) d3d_passes_draw(ARG(%d));" % DRAW_PRIMS[name])
+                if name == "DrawIndexedPrimitive":
+                    o.append("    if (g_fp_flame) d3d_fp_flame_draw(self, 1, ARG(1), ARG(2), ARG(3), ARG(4), ARG(5), ARG(6));")
+                elif name == "DrawPrimitive":
+                    o.append("    if (g_fp_flame) d3d_fp_flame_draw(self, 0, ARG(1), ARG(2), ARG(3), 0, 0, 0);")
                 o.append("    if (g_bisect && d3d_skip_draw()) { RET(0, %d); return; }" % (len(args) + 1))
             call = []
             post = []

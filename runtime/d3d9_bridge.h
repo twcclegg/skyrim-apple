@@ -57,6 +57,11 @@ extern "C" void skyrim_first_person_listen(void (*fn)(int kind));
 /* First-person depth (d3d9_bridge.cpp): the first-person meshes' depth is written in the world's encoding. The
  * hooks are called only while g_d3d_fp is set, which it is unless LB_FP_DEPTH_SCALE=0. */
 extern int g_d3d_fp;
+/* LB_FP_FLAME_DEPTH (live hybrid tier A, d3d9_bridge.cpp): before each first-person effect draw (blended, into the
+ * scene colour target) the same draw into the scene depth target, stamping the hand's distance where it is bright. */
+extern int g_fp_flame;
+void d3d_fp_flame_draw(IDirect3DDevice9 *d, int indexed, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t a4,
+                       uint32_t a5, uint32_t a6);
 void d3d_fp_draw(void);                     // every Draw*Primitive*, before the draw
 void d3d_fp_target(IDirect3DDevice9 *d);    // after the render target 0 or the depth-stencil surface changed
 void d3d_fp_clear(uint32_t flags);          // before a Clear, with its D3DCLEAR_* flags

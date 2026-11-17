@@ -756,13 +756,15 @@ void d3d_passes_projection(const float *m) {
 }
 
 // After CreateDevice: reads the switches once and learns the targets the device starts with.
+static void flame_init(void);
 static void passes_init(IDirect3DDevice9 *d) {
     static bool read;
     if (!read) {
         read = true;
+        flame_init();
         const char *e = getenv("LB_PASSES"), *fp = getenv("LB_FP"), *eye = getenv("LB_STEREO_EYE_UNITS");
         g_passes_log = e ? atoi(e) : 0;
-        const bool fp_wanted = (fp && atoi(fp)) || getenv("LB_FP_SKIP") || (eye && atof(eye) != 0);
+        const bool fp_wanted = (fp && atoi(fp)) || getenv("LB_FP_SKIP") || (eye && atof(eye) != 0) || g_fp_flame;
         g_d3d_passes = g_passes_log || fp_wanted;
         // without an LB_D3DTRACE range, LB_PASSES=2 looks at the first frame
         g_passdbg = g_passes_log == 2 && !getenv("LB_D3DTRACE");
@@ -1134,6 +1136,165 @@ static void fp_depth_scale_restore(void) {
     g_fp_depth_bound_original = g_fp_depth_bound_patched = nullptr;
 }
 
+/* LB_FP_FLAME_DEPTH=1 or =<units> (off by default): live first-person hybrid, tier A (plans: live-hybrid.md). The
+ * hand's effects (Flames: a few billboards blended into the scene colour target in the late first-person pass) write
+ * no depth, so the immersive screen's depth reprojection puts them on whatever is behind them, usually the ground.
+ * Before each such draw, the same draw is made into the scene's R32F depth target (d3d_scene_depth_target) with a
+ * rewritten copy of its pixel shader (flame_patch): colour = the depth of a point <units> in front of the camera in
+ * the world's encoding (default 34, the measured distance of the hands), alpha = the original's alpha times its
+ * brightest channel, alpha test at 0.25, no blending, depth test as the game set it (so the sword in front still
+ * hides the flame) and no depth write. The later first-person depth draws then write the hands over it as before.
+ * All state touched is put back before the game's own draw. */
+IDirect3DSurface9 *d3d_scene_depth_target(void);  // hud_screen.cpp
+int g_fp_flame;
+static float g_flame_units;
+struct FlamePatched { IDirect3DPixelShader9 *original, *patched; float depth; };
+static std::vector<FlamePatched> g_flame_cache;
+static int g_flame_draws, g_flame_logged_frame = -1;
+
+static void flame_init(void) {
+    static bool read;
+    if (read) return;
+    read = true;
+    const char *e = getenv("LB_FP_FLAME_DEPTH");
+    if (!e || !*e || !strcmp(e, "0")) return;
+    g_flame_units = atof(e) > 1.0 ? (float)atof(e) : 34.0f;
+    g_fp_flame = 1;
+    LOG("first-person flame depth stamp on: %g units", g_flame_units);
+}
+
+static void flame_forget(void) {
+    for (FlamePatched &p : g_flame_cache) {
+        if (p.original) p.original->Release();
+        if (p.patched) p.patched->Release();
+    }
+    g_flame_cache.clear();
+}
+
+// A copy of ps_2_0+ bytecode whose colour output 0 is (depth, depth, depth, alpha * max(r, g, b)) of the original's
+// output. Empty if not rewritable (as fp_depth_patch).
+static std::vector<uint32_t> flame_patch(const uint32_t *in, size_t count, float depth) {
+    std::vector<uint32_t> none;
+    if (count < 2 || (in[0] >> 16) != 0xFFFF || ((in[0] >> 8) & 0xFF) < 2) return none;
+    auto reg_type = [](uint32_t t) { return ((t >> 28) & 7) | ((t >> 8) & 0x18); };
+    enum { D3DSPR_TEMP_ = 0, D3DSPR_CONST_ = 2, D3DSPR_COLOROUT_ = 8 };
+    const uint32_t op_dcl = 31, op_def = 81, op_defi = 48, op_defb = 47, op_ret = 28, op_label = 30;
+    int max_temp = -1, max_const = -1;
+    size_t end = 0, first_code = 0;
+    std::vector<size_t> oc0_dst;
+    for (size_t i = 1; i < count;) {
+        const uint32_t tok = in[i], op = tok & 0xFFFF;
+        if (tok == 0x0000FFFF) { end = i; break; }
+        if (op == 0xFFFE) { i += 1 + ((tok >> 16) & 0x7FFF); continue; }
+        if (!first_code) first_code = i;
+        const size_t len = (tok >> 24) & 0xF;
+        if (i + 1 + len > count) return none;
+        const uint32_t *arg = in + i + 1;
+        if (op == op_ret || op == op_label) return none;
+        if (op == op_def || op == op_defi || op == op_defb) {
+            if (len && reg_type(arg[0]) == D3DSPR_CONST_ && op == op_def) max_const = std::max(max_const, (int)(arg[0] & 0x7FF));
+        } else if (op != op_dcl) {
+            for (size_t j = 0; j < len; j++) {
+                const uint32_t t = arg[j], type = reg_type(t), num = t & 0x7FF;
+                if (type == D3DSPR_TEMP_) max_temp = std::max(max_temp, (int)num);
+                if (type == D3DSPR_CONST_) {
+                    max_const = std::max(max_const, (int)num);
+                    if (t & (1u << 13)) return none;
+                }
+                if (j == 0 && type == D3DSPR_COLOROUT_ && num == 0) oc0_dst.push_back(i + 1);
+            }
+        }
+        i += 1 + len;
+    }
+    if (!end || oc0_dst.empty() || !first_code) return none;
+    const uint32_t temp = (uint32_t)(max_temp + 1), temp2 = temp + 1, konst = (uint32_t)(max_const + 1);
+    if (temp2 >= 12 || konst >= 32) return none;
+    std::vector<uint32_t> out(in, in + end);
+    for (size_t at : oc0_dst) out[at] = (out[at] & ~(0x7u << 28) & ~(0x3u << 11) & ~0x7FFu) | temp;  // -> rT
+    const uint32_t param = 0x80000000u, oc0 = param | (1u << 11), rt = param | temp, ru = param | temp2,
+                   c = param | (2u << 28) | konst;
+    uint32_t fd, zero = 0;
+    memcpy(&fd, &depth, 4);
+    const uint32_t def[] = {81u | (5u << 24), c | (0xFu << 16), fd, zero, zero, zero};
+    out.insert(out.begin() + first_code, def, def + 6);
+    const uint32_t tail[] = {
+        11u | (3u << 24), ru | (1u << 16), rt | (0x00u << 16), rt | (0x55u << 16),  // max rU.x, rT.x, rT.y
+        11u | (3u << 24), ru | (1u << 16), ru | (0x00u << 16), rt | (0xAAu << 16),  // max rU.x, rU.x, rT.z
+        5u | (3u << 24), oc0 | (8u << 16), ru | (0x00u << 16), rt | (0xFFu << 16),   // mul oC0.w, rU.x, rT.w
+        1u | (2u << 24), oc0 | (7u << 16), c | (0x00u << 16),                       // mov oC0.xyz, cK.x
+    };
+    out.insert(out.end(), tail, tail + sizeof tail / sizeof tail[0]);
+    out.push_back(0x0000FFFF);
+    return out;
+}
+
+void d3d_fp_flame_draw(IDirect3DDevice9 *d, int indexed, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t a4,
+                       uint32_t a5, uint32_t a6) {
+    if (!d || fp_kind() != FP_COLOUR) return;
+    IDirect3DSurface9 *depth_rt = d3d_scene_depth_target();
+    const float world = fpd_world_near(), p33w = g_world_p33;
+    if (!depth_rt || world <= 0 || p33w <= 0 || g_flame_units <= world) return;
+    DWORD blend = 0;
+    d->GetRenderState(D3DRS_ALPHABLENDENABLE, &blend);
+    if (!blend) return;  // the hands and the sword: opaque, their depth comes from the first-person depth draws
+    const float depth = p33w * (1.0f - world / g_flame_units);
+    IDirect3DPixelShader9 *ps = nullptr;
+    if (FAILED(d->GetPixelShader(&ps)) || !ps) return;
+    ps->Release();
+    FlamePatched *hit = nullptr;
+    for (FlamePatched &p : g_flame_cache)
+        if (p.original == ps && p.depth == depth) { hit = &p; break; }
+    if (!hit) {
+        FlamePatched p = {ps, nullptr, depth};
+        ps->AddRef();
+        UINT size = 0;
+        std::vector<uint32_t> code;
+        if (SUCCEEDED(ps->GetFunction(nullptr, &size)) && size >= 8) {
+            code.resize(size / 4);
+            if (FAILED(ps->GetFunction(code.data(), &size))) code.clear();
+        }
+        const std::vector<uint32_t> patched = code.empty() ? code : flame_patch(code.data(), code.size(), depth);
+        if (patched.empty() || FAILED(d->CreatePixelShader((const DWORD *)patched.data(), &p.patched))) p.patched = nullptr;
+        LOG("first-person flame depth: pixel shader %p (%u bytes) %s, depth %.6g (%g units)", (void *)ps, size,
+            p.patched ? "rewritten" : "NOT rewritten, no stamp", depth, g_flame_units);
+        if (g_flame_cache.size() > 256) flame_forget();
+        g_flame_cache.push_back(p);
+        hit = &g_flame_cache.back();
+    }
+    if (!hit->patched) return;
+    IDirect3DSurface9 *rt0 = nullptr;
+    if (FAILED(d->GetRenderTarget(0, &rt0)) || !rt0) return;
+    D3DVIEWPORT9 vp;
+    d->GetViewport(&vp);
+    static const D3DRENDERSTATETYPE k_states[] = {D3DRS_ALPHABLENDENABLE, D3DRS_ALPHATESTENABLE, D3DRS_ALPHAREF,
+                                                  D3DRS_ALPHAFUNC, D3DRS_ZWRITEENABLE, D3DRS_COLORWRITEENABLE,
+                                                  D3DRS_SRGBWRITEENABLE};
+    DWORD saved[sizeof k_states / sizeof k_states[0]];
+    for (size_t i = 0; i < sizeof k_states / sizeof k_states[0]; i++) d->GetRenderState(k_states[i], &saved[i]);
+    d->SetRenderTarget(0, depth_rt);
+    d->SetViewport(&vp);
+    d->SetPixelShader(hit->patched);
+    d->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+    d->SetRenderState(D3DRS_ALPHATESTENABLE, TRUE);
+    d->SetRenderState(D3DRS_ALPHAREF, 64);
+    d->SetRenderState(D3DRS_ALPHAFUNC, D3DCMP_GREATER);
+    d->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
+    d->SetRenderState(D3DRS_COLORWRITEENABLE, D3DCOLORWRITEENABLE_RED);
+    d->SetRenderState(D3DRS_SRGBWRITEENABLE, FALSE);
+    if (indexed) d->DrawIndexedPrimitive((D3DPRIMITIVETYPE)a1, (INT)a2, a3, a4, a5, a6);
+    else d->DrawPrimitive((D3DPRIMITIVETYPE)a1, a2, a3);
+    d->SetRenderTarget(0, rt0);
+    rt0->Release();
+    d->SetViewport(&vp);
+    d->SetPixelShader(ps);
+    for (size_t i = 0; i < sizeof k_states / sizeof k_states[0]; i++) d->SetRenderState(k_states[i], saved[i]);
+    g_flame_draws++;
+    if (g_flame_logged_frame < 0 || g_frame - g_flame_logged_frame >= 600) {
+        g_flame_logged_frame = g_frame;
+        LOG("first-person flame depth: %d stamps so far (frame %d)", g_flame_draws, g_frame);
+    }
+}
+
 // After CreateDevice: reads the switch once and learns the targets the device starts with.
 static void fp_init(IDirect3DDevice9 *d) {
     static bool read;
@@ -1152,6 +1313,7 @@ static void fp_init(IDirect3DDevice9 *d) {
             g_fp_depth_scale_off.empty() ? "" : " (off on the LB_FP_DEPTH_SCALE=off@ frames)");
     }
     fp_depth_scale_forget();  // a new device: shaders made for the old one are gone
+    flame_forget();
     if (!g_d3d_fp) return;
     d3d_fp_target(d);
 }
