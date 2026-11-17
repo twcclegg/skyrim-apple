@@ -369,7 +369,6 @@ bool hud_screen_in_pass(void) { return in_pass(); }
 // Riverwood frame's 2,013 draws), which unlike the D24S8 depth buffer can be read back and sampled. The last
 // one bound is kept here, not referenced: use it within the frame it was bound in.
 static IDirect3DSurface9 *g_scene_depth;
-bool hud_screen_in_pass(void) { return in_pass(); }
 IDirect3DSurface9 *d3d_scene_depth_target(void) { return g_scene_depth; }
 // Called after each Present: a frame that never binds the depth target (menus, loading) reports none.
 void d3d_scene_depth_reset(void) { g_scene_depth = nullptr; }
