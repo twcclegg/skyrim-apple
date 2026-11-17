@@ -467,6 +467,25 @@ static int run(bool multiview) {
           t0.cx - rest[0].cx, t1.cx - rest[1].cx, -kShiftPx, kShiftPx);
     }
 
+    // 5c: per-view clip matrices (dxvk_stereo_set_view_clip_matrices), offsets zero: view 0 x += 0.125 w,
+    // view 1 x -= 0.125 w, i.e. +8 / -8 px for the triangle; the w == 1 quad stays.
+    {
+      dxvk_stereo_set_clip_offset(0.0f, 0.0f, 0.0f, 0.0f);
+      float m0[16] = { 1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1 }, m1[16] = { 1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1 };
+      m0[12] = 0.125f;   // column 3 (w's), row 0 (x)
+      m1[12] = -0.125f;
+      dxvk_stereo_set_view_clip_matrices(m0, m1);
+      p.sceneFrame(target, nullptr);
+      const auto px0 = p.read(target, 0), px1 = p.read(target, 1);
+      const Blob t0 = measureRgb(px0, kRed), t1 = measureRgb(px1, kRed);
+      const Blob q0 = measureRgb(px0, kGreen);
+      r.expect(std::fabs(t0.cx - rest[0].cx - kShiftPx) <= 0.3 && std::fabs(t1.cx - rest[1].cx + kShiftPx) <= 0.3 && quadOk(q0),
+          "view_clip_matrices", "x += +-0.125 w per view: layer 0 moved %+.2f, layer 1 %+.2f (expect %+.2f, %+.2f); quad %s",
+          t0.cx - rest[0].cx, t1.cx - rest[1].cx, kShiftPx, -kShiftPx, quadOk(q0) ? "unmoved" : "MOVED");
+      const float id[16] = { 1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1 };
+      dxvk_stereo_set_view_clip_matrices(id, id);
+    }
+
     // 6: D3D9 reads of a two-layer render-target texture see layer 0 (the left eye here): StretchRect into the
     // back buffer, and sampling it with a fixed-function full-screen quad (point filter, pre-transformed).
     dxvk_stereo_set_clip_shift(kK);
