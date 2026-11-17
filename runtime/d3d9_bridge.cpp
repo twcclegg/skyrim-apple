@@ -465,8 +465,8 @@ static bool g_depth_copied;
 extern "C" long dxvk_copy_depth_to_float(void *device, void *depthStencil, void *floatTarget);
 extern "C" void dxvk_stereo_set_view_ui_offsets(const float view0[4], const float view1[4]);
 /* Live stereo: the interface (pass class ui: menus, HUD) at LB_STEREO_HUD_DEPTH metres (default 2) instead of at
- * infinity. g_ui_k is view 0's clip offset for a point at that depth, set each frame by stereo_after_present. */
-static float g_ui_k;
+ * infinity. g_ui_k is each view's clip offset for a point at that depth, set each frame by stereo_after_present. */
+static float g_ui_k[2];
 static bool g_ui_shift_on;
 static uint32_t g_skip_class_mask;  // LB_SKIP_CLASS=depth,shadow,...: skip every draw of those classes (timing only)
 static int g_bisect_from = -1, g_draw_no;
@@ -829,9 +829,9 @@ static void gpu_init(IDirect3DDevice9 *d) {
 void d3d_passes_draw(uint32_t prims) {
     int k = pass_class(prims);
     g_last_class = k;
-    if (g_ui_k != 0 && (k == PASS_UI) != g_ui_shift_on) {
+    if ((g_ui_k[0] != 0 || g_ui_k[1] != 0) && (k == PASS_UI) != g_ui_shift_on) {
         g_ui_shift_on = k == PASS_UI;
-        const float on0[4] = {g_ui_shift_on ? g_ui_k : 0.0f, 0, 0, 0}, on1[4] = {g_ui_shift_on ? -g_ui_k : 0.0f, 0, 0, 0};
+        const float on0[4] = {g_ui_shift_on ? g_ui_k[0] : 0.0f, 0, 0, 0}, on1[4] = {g_ui_shift_on ? g_ui_k[1] : 0.0f, 0, 0, 0};
         dxvk_stereo_set_view_ui_offsets(on0, on1);
     }
     if (k == PASS_MAIN && g_depth_copy == 1 && !g_main_ds && g_pass_device) g_pass_device->GetDepthStencilSurface(&g_main_ds);
@@ -1930,6 +1930,18 @@ struct StereoEyes {
 };
 static StereoEyes g_stereo_eyes;
 static std::mutex g_stereo_eyes_lock;
+/* The eyes the frame being drawn was rendered with (set with its matrices after the previous Present), and those of
+ * the frame being presented, which the immersive compositor reads through skyrim_frame_eyes from inside Present. */
+static StereoEyes g_eyes_drawing, g_eyes_presented;
+/* The eye frusta (l r t b) and eye poses (column-major, metres, head space) this Present's frame was rendered with;
+ * 0 when it was not rendered into eye views. Called from the present tap, inside Present. */
+extern "C" int skyrim_frame_eyes(float tangents[8], float eye_pose[32]) {
+    std::lock_guard<std::mutex> hold(g_stereo_eyes_lock);
+    if (!g_eyes_presented.set) return 0;
+    memcpy(tangents, g_eyes_presented.tangents, sizeof g_eyes_presented.tangents);
+    memcpy(eye_pose, g_eyes_presented.eye_from_head, sizeof g_eyes_presented.eye_from_head);
+    return 1;
+}
 extern "C" void skyrim_stereo_set_eyes(const float tangents[8], const float eye_from_head[32], float units_per_metre) {
     std::lock_guard<std::mutex> hold(g_stereo_eyes_lock);
     memcpy(g_stereo_eyes.tangents, tangents, sizeof g_stereo_eyes.tangents);
@@ -2182,9 +2194,33 @@ static bool stereo_live_multiview(void) {
 }
 
 // After Present: set the eye, and the clock, for the next frame.
+/* LB_STEREO_TEST_EYES (Mac, no headset): feed skyrim_stereo_set_eyes as the compositor would. "game": the game's own
+ * frustum for both eyes and +-LB_STEREO_EYE_UNITS sideways at 70 units per metre (must render exactly what the offset
+ * path does); "l,r,t,b,separation_m": the left eye's tangents, the right eye's mirrored (-r, -l, t, b), the eyes
+ * separation_m apart. */
+static void stereo_test_eyes(const GameCamera &cam, float d_units) {
+    static int mode = -1;
+    static float v[5];
+    if (mode < 0) {
+        const char *e = getenv("LB_STEREO_TEST_EYES");
+        mode = !e ? 0 : !strcmp(e, "game") ? 1 : sscanf(e, "%f,%f,%f,%f,%f", &v[0], &v[1], &v[2], &v[3], &v[4]) == 5 ? 2 : 0;
+    }
+    if (!mode || g_stereo_eyes.set) return;
+    float t[2][4], pose[2][16] = {{1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1}, {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1}};
+    float half_m = mode == 1 ? d_units / 70.0f : v[4] / 2;
+    const float *f = mode == 1 ? cam.frustum : v;
+    t[0][0] = f[0]; t[0][1] = f[1]; t[0][2] = f[2]; t[0][3] = f[3];
+    t[1][0] = mode == 1 ? f[0] : -f[1]; t[1][1] = mode == 1 ? f[1] : -f[0]; t[1][2] = f[2]; t[1][3] = f[3];
+    pose[0][12] = -half_m;
+    pose[1][12] = half_m;
+    skyrim_stereo_set_eyes(&t[0][0], &pose[0][0], 70.0f);
+    LOG("stereo test eyes: L %.3f %.3f %.3f %.3f R %.3f %.3f %.3f %.3f, eyes %.4f m apart", t[0][0], t[0][1], t[0][2],
+        t[0][3], t[1][0], t[1][1], t[1][2], t[1][3], 2 * half_m);
+}
 static void stereo_after_present(void) {
     StereoState &st = g_stereo;
     if (!st.on) return;
+    { std::lock_guard<std::mutex> hold(g_stereo_eyes_lock); g_eyes_drawing = StereoEyes(); }
     int base = 0, index = 0;
     const StereoSlot *slot = stereo_slot(g_frame + 1, &base, &index);
     const char eye = slot ? slot->eye : 0;
@@ -2202,15 +2238,27 @@ static void stereo_after_present(void) {
         // mirrored to the right (dxvk_stereo.h), every frame.
         const float l = cam.frustum[0], r = cam.frustum[1];
         float m[2][16];
-        if (r > l) {
-            static float hud_units = -1;
-            if (hud_units < 0) {
-                const char *h = getenv("LB_STEREO_HUD_DEPTH");
-                hud_units = (h && atof(h) > 0 ? (float)atof(h) : 2.0f) * 70.0f;  // metres at 70 units per metre
-            }
-            g_ui_k = 2.0f / (r - l) * -st.d / hud_units;  // a point hud_units away: clip offset k / w, w = depth
+        static float hud_units = -1;
+        if (hud_units < 0) {
+            const char *h = getenv("LB_STEREO_HUD_DEPTH");
+            hud_units = (h && atof(h) > 0 ? (float)atof(h) : 2.0f) * 70.0f;  // metres at 70 units per metre
         }
+        if (r > l) {
+            g_ui_k[0] = 2.0f / (r - l) * -st.d / hud_units;  // a point hud_units away: clip offset k / w, w = depth
+            g_ui_k[1] = -g_ui_k[0];
+        }
+        stereo_test_eyes(cam, st.d);
+        StereoEyes eyes;
+        { std::lock_guard<std::mutex> hold(g_stereo_eyes_lock); eyes = g_stereo_eyes; }
+        if (eyes.set)
+            for (int e = 0; e < 2; e++) {
+                // The eye x metres to the side (in the game camera's frame) sees a point D metres away x/D to its
+                // left: clip x drops by P00 x / D, and DXVK subtracts the offset. (Units per metre cancel.)
+                const float *tg = eyes.tangents[e];
+                if (tg[1] > tg[0]) g_ui_k[e] = 2.0f / (tg[1] - tg[0]) * eyes.eye_from_head[e][12] / (hud_units / 70.0f);
+            }
         if (stereo_matrix_mode() && stereo_eye_matrices(cam, st.d, m)) {
+            { std::lock_guard<std::mutex> hold(g_stereo_eyes_lock); g_eyes_drawing = eyes; }
             memcpy(g_live_m_world, m, sizeof m);
             g_live_m_valid = true;
             g_live_m_fp_valid = g_fp_near > 0 && stereo_eye_matrices(cam, st.d, g_live_m_fp, g_fp_near);
@@ -2443,6 +2491,7 @@ void B_IDirect3DDevice9_Present(CPU *c) {
     /* With a menu up the world camera isn't what's on screen (the journal, for one, renders through another
      * camera), so the frame carries none and the compositor shows it on its fixed screen. */
     g_frame_camera_valid = !menu_open() && game_camera_read(&g_frame_camera);
+    { std::lock_guard<std::mutex> hold(g_stereo_eyes_lock); g_eyes_presented = g_frame_camera_valid ? g_eyes_drawing : StereoEyes(); }
     // Where the camera was when, so the compositor can keep the player's movement going between frames.
     motion_camera(motion_now(), g_frame_camera_valid ? g_frame_camera.pos : nullptr);
     game_fov_apply();

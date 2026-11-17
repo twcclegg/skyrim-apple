@@ -46,6 +46,12 @@ typedef struct skyrim_immersive_frame {
      * left); NULL when the frame is mono. Same lifetime as texture. */
     void *texture_eye2;
     void *depth_texture_eye2;
+    /* 1 when the two pictures were rendered through the eyes skyrim_stereo_set_eyes gave (rather than the game's
+     * frustum moved sideways): each eye's frustum tangents (left, right, top, bottom at unit distance; left and
+     * bottom negative) and its pose in the game camera's frame (column-major, metres, x right, y up, z back). */
+    int eye_views;
+    float eye_tangents[2][4];
+    float eye_pose[2][16];
 } skyrim_immersive_frame;
 void skyrim_immersive_start(void);
 void skyrim_immersive_stop(void);
@@ -57,6 +63,10 @@ void skyrim_display_tick(void);
 /* runtime/platform_sdl.c head steering: the head's yaw (clockwise) and pitch (up) in radians relative to its
  * starting direction, from the compositor thread; on = 0 stops steering. */
 void skyrim_head_set(float yaw, float pitch, int on);
+/* runtime/d3d9_bridge.cpp, live stereo (LB_STEREO_MULTIVIEW=1): render each eye's picture through that eye's own
+ * frustum (tangents: left, right, top, bottom at unit distance per eye, left and bottom negative) from its pose
+ * relative to the head (column-major, metres, visionOS axes), with units_per_metre game units to a metre. */
+void skyrim_stereo_set_eyes(const float tangents[8], const float eye_from_head[32], float units_per_metre);
 /* The game heading (radians, clockwise from north) that head yaw 0 maps to; *valid = 0 until steering anchors. */
 float skyrim_head_offset(int *valid);
 /* runtime/motion_path.h (LB_IMMERSIVE_MOTION=1): for a frame whose game camera was at (east, north, up), how far

@@ -35,8 +35,12 @@ typedef struct skyrim_immersive_frame {
     int has_camera;
     void *texture_eye2;        /* stereo (LB_STEREO_PRESENT): the right eye's picture and depth; NULL when mono */
     void *depth_texture_eye2;
+    int eye_views;             /* 1: each layer was rendered through that eye's own frustum and pose (below) */
+    float eye_tangents[2][4];  /* l r t b at unit distance, per eye */
+    float eye_pose[2][16];     /* the eye in the game camera's frame: column-major, metres, x right y up z back */
 } skyrim_immersive_frame;
 int skyrim_frame_camera(float out[18]);  /* runtime/d3d9_bridge.cpp */
+int skyrim_frame_eyes(float tangents[8], float eye_pose[32]);
 }
 
 namespace {
@@ -50,6 +54,8 @@ struct Entry {
     uint32_t slot = 0, width = 0, height = 0, format = 0, layers = 1, depth_layers = 0;
     float camera[18] = {};
     bool has_camera = false;
+    float eye_tangents[8] = {}, eye_pose[32] = {};
+    bool eye_views = false;
     bool valid = false;
     uint64_t submitted_ns = 0;  /* monotonic, stamped in on_frame; see gpu_observe */
     uint64_t ready_ns = 0;      /* monotonic, when acquire first saw the frame ready; 0 until then */
@@ -94,6 +100,7 @@ Entry entry_of(const dxvk_present_tap_frame *frame) {
     entry.layers = frame->layers ? frame->layers : 1;
     entry.depth_layers = frame->depth_layers;
     entry.has_camera = skyrim_frame_camera(entry.camera) != 0;  /* called inside this frame's Present */
+    entry.eye_views = entry.has_camera && entry.layers >= 2 && skyrim_frame_eyes(entry.eye_tangents, entry.eye_pose) != 0;
     entry.valid = true;
     return entry;
 }
@@ -359,5 +366,10 @@ extern "C" int skyrim_immersive_acquire(skyrim_immersive_frame *out) {
     }
     memcpy(out->camera, g_shown.camera, sizeof out->camera);
     out->has_camera = g_shown.has_camera ? 1 : 0;
+    if (g_shown.eye_views && out->texture_eye2) {
+        out->eye_views = 1;
+        memcpy(out->eye_tangents, g_shown.eye_tangents, sizeof out->eye_tangents);
+        memcpy(out->eye_pose, g_shown.eye_pose, sizeof out->eye_pose);
+    }
     return 1;
 }
