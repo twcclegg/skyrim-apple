@@ -52,6 +52,7 @@ FT = re.compile(r"^ft (\d+) ([\d.]+) ([\d.]+)(?: ([\d.]+))?(?: (\d+))?$")
 GPU_BUSY = re.compile(r"dxvk: gpu busy ([\d.]+)%, ([\d.]+) ms per frame over (\d+) frames")
 PASS = re.compile(r"^pass (\d+)((?: [\w.-]+=[\d.]+(?:/[\d.]+){0,2})+)\s*$")
 PASS_FIELD = re.compile(r"([\w.-]+)=([\d.]+(?:/[\d.]+){0,2})")
+PASSGPU = re.compile(r"^passgpu (\d+)((?: [\w.-]+=[\d.]+)+)\s*$")  # LB_PASSES_GPU: GPU ms per class, a few frames late
 SHOT = re.compile(r"^LB_SHOT frame (\d+) \d+x\d+ -> (.+)$")
 SHOT_ANY = re.compile(r"^LB_SHOT frame \d+ ")  # any screenshot line: the next frame time logged includes its stall
 CONTAINER = re.compile(r"/Containers/Data/Application/[0-9A-F-]+/(.+)$")
@@ -326,11 +327,25 @@ def parse_gpu_busy(text):
 def parse_passes(text):
     """`pass <frame> key=draws/prims[/gpu ms] ... rt=<n>` lines as {frame: {key: [numbers]}} (a repeated frame keeps
     the last line, so the same line in both the game log and the console counts once)."""
-    out = {}
+    out, gpu = {}, {}
     for line in text.splitlines():
         m = PASS.match(line)
         if m:
             out[int(m[1])] = {k: [float(x) for x in v.split("/")] for k, v in PASS_FIELD.findall(m[2])}
+        m = PASSGPU.match(line)
+        if m:
+            gpu[int(m[1])] = {k: float(v) for k, v in PASS_FIELD.findall(m[2])}
+    # `passgpu <frame> class=<ms> ... total=<ms> marks=<n> zero=<n>` (LB_PASSES_GPU) is printed a few frames after
+    # its frame's pass line: each class's ms becomes the third number of that frame's draws/prims, the other keys
+    # become single-number keys "gpu.<key>".
+    for frame, row in gpu.items():
+        if frame not in out:
+            continue
+        for key, ms in row.items():
+            if key in out[frame] and len(out[frame][key]) == 2:
+                out[frame][key].append(ms)
+            elif key not in out[frame]:
+                out[frame]["gpu." + key] = [ms]
     return out
 
 
