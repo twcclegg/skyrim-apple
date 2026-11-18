@@ -13,7 +13,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(CMAKE_BUILD_RPATH_USE_ORIGIN ON)
 get_filename_component(SKYRIM_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/.." ABSOLUTE)
 option(LB_STRICT_ORDER "Preserve x86 guest memory ordering on ARM64" ON)
-option(LB_CONST_MEM "Generated code treats the guest base pointer as a constant" OFF)
+option(LB_CONST_MEM "Generated code treats the guest base pointer as a constant" ON)
 set(SKYRIM_GEN_FLAGS "" CACHE STRING "Extra compiler flags for the generated code (performance experiments)")
 option(LB_PINNED_REGS "Keep the guest registers in fixed host registers in lifted code (arm64; needs generated code from the same lifter)" OFF)
 option(SKYRIM_BUILD_GAME "Link the game using privately generated Windows code" OFF)
@@ -27,7 +27,10 @@ if(SKYRIM_BUNDLED_SDL)
   set(SDL_STATIC OFF CACHE BOOL "Do not duplicate SDL compilation" FORCE)
   set(SDL_TEST OFF CACHE BOOL "No SDL test library" FORCE)
   set(SDL_TESTS OFF CACHE BOOL "No unrelated SDL tests" FORCE)
-  add_subdirectory("${SKYRIM_ROOT}/android/app/jni/SDL2" "${CMAKE_CURRENT_BINARY_DIR}/sdl")
+  if(NOT EXISTS "${SKYRIM_ROOT}/third_party/SDL2/CMakeLists.txt")
+    message(FATAL_ERROR "SDL2 is missing: run python3 tools/fetch_sdl.py (macos/bootstrap.sh does)")
+  endif()
+  add_subdirectory("${SKYRIM_ROOT}/third_party/SDL2" "${CMAKE_CURRENT_BINARY_DIR}/sdl")
 else()
   find_package(SDL2 CONFIG REQUIRED)
 endif()
@@ -45,6 +48,11 @@ add_subdirectory(graphics)
 
 file(GLOB RT_C CONFIGURE_DEPENDS "${SKYRIM_ROOT}/runtime/*.c")
 list(REMOVE_ITEM RT_C "${SKYRIM_ROOT}/runtime/main.c")
+# Native replacements of game functions (runtime/skyrim_native*.c) fall back to the lifted bodies
+# (f_XXXXXX_guest), which only exist in the generated game code, so they link with the game, not the runtime
+# the test executables share.
+file(GLOB RT_NATIVE_C CONFIGURE_DEPENDS "${SKYRIM_ROOT}/runtime/skyrim_native*.c")
+list(REMOVE_ITEM RT_C ${RT_NATIVE_C})
 file(GLOB RT_CPP CONFIGURE_DEPENDS "${SKYRIM_ROOT}/runtime/*.cpp")
 add_library(skyrim_runtime OBJECT ${RT_C} ${RT_CPP})
 target_include_directories(skyrim_runtime PUBLIC "${SKYRIM_ROOT}/runtime")
@@ -111,6 +119,16 @@ add_executable(audio_device_recovery tests/audio_device_recovery.c tests/fixture
 target_link_libraries(audio_device_recovery PRIVATE skyrim_runtime)
 add_test(NAME audio_device_recovery COMMAND audio_device_recovery)
 set_tests_properties(audio_device_recovery PROPERTIES TIMEOUT 30 ENVIRONMENT "SDL_AUDIODRIVER=dummy")
+# XAudio2 output layout: stereo by default, 5.1 with LB_AUDIO_CHANNELS=6.
+add_executable(audio_surround tests/audio_surround.c tests/fixture_modules.c
+  $<TARGET_OBJECTS:skyrim_entry>)
+target_link_libraries(audio_surround PRIVATE skyrim_runtime)
+add_test(NAME audio_layout_stereo COMMAND audio_surround stereo)
+set_tests_properties(audio_layout_stereo PROPERTIES TIMEOUT 30
+  ENVIRONMENT "SDL_AUDIODRIVER=dummy;LB_AUDIO_METER=1")
+add_test(NAME audio_layout_surround COMMAND audio_surround surround)
+set_tests_properties(audio_layout_surround PROPERTIES TIMEOUT 30
+  ENVIRONMENT "SDL_AUDIODRIVER=dummy;LB_AUDIO_METER=1;LB_AUDIO_CHANNELS=6")
 if(SKYRIM_FFMPEG_AUDIO)
   add_executable(audio_voice_probe audio/voice_probe.c tests/fixture_modules.c
     $<TARGET_OBJECTS:skyrim_entry>)
@@ -130,6 +148,31 @@ endif()
 if(TARGET base_vertex_fold_smoke)
   add_test(NAME base_vertex_fold_smoke COMMAND base_vertex_fold_smoke --compare)
   set_tests_properties(base_vertex_fold_smoke PROPERTIES TIMEOUT 120)
+endif()
+if(TARGET stereo_shift_smoke)
+  # DXVK reads both variables once per process, hence two invocations. The executable also sets them from
+  # its flag (and unsets LB_STEREO_PASSES for --passes=default), so a stray shell value cannot leak in.
+  add_test(NAME stereo_shift_smoke COMMAND stereo_shift_smoke --passes=default)
+  set_tests_properties(stereo_shift_smoke PROPERTIES TIMEOUT 60 ENVIRONMENT "LB_STEREO_EYE_UNITS=1")
+  add_test(NAME stereo_shift_smoke_passes_all COMMAND stereo_shift_smoke --passes=all)
+  set_tests_properties(stereo_shift_smoke_passes_all PROPERTIES TIMEOUT 60
+    ENVIRONMENT "LB_STEREO_EYE_UNITS=1;LB_STEREO_PASSES=all")
+endif()
+if(TARGET stereo_multiview_smoke)
+  # LB_STEREO_MULTIVIEW is read once per process: one invocation with it, one without. The executable sets or
+  # unsets it (and LB_STEREO_EYE_UNITS=1) from its flag, so the ENVIRONMENT lines only document the intent.
+  add_test(NAME stereo_multiview_smoke COMMAND stereo_multiview_smoke --multiview=on)
+  set_tests_properties(stereo_multiview_smoke PROPERTIES TIMEOUT 60
+    ENVIRONMENT "LB_STEREO_EYE_UNITS=1;LB_STEREO_MULTIVIEW=1")
+  add_test(NAME stereo_multiview_smoke_off COMMAND stereo_multiview_smoke --multiview=off)
+  set_tests_properties(stereo_multiview_smoke_off PROPERTIES TIMEOUT 60 ENVIRONMENT "LB_STEREO_EYE_UNITS=1")
+endif()
+if(TARGET stereo_shift_smoke)
+  # The existing offset test with multiview on: the back buffer is one layer, so every pass there is mono and
+  # must behave exactly as without multiview (view 0's offset, two-layer automatic depth buffer).
+  add_test(NAME stereo_shift_smoke_multiview_mono COMMAND stereo_shift_smoke --passes=default)
+  set_tests_properties(stereo_shift_smoke_multiview_mono PROPERTIES TIMEOUT 60
+    ENVIRONMENT "LB_STEREO_EYE_UNITS=1;LB_STEREO_MULTIVIEW=1")
 endif()
 
 set(SKYRIM_PYTHON "${CMAKE_CURRENT_SOURCE_DIR}/.venv/bin/python" CACHE FILEPATH
@@ -211,8 +254,12 @@ if(SKYRIM_BUILD_GAME)
     BYPRODUCTS "${CMAKE_CURRENT_BINARY_DIR}/skyrim_macos.build-start.json" VERBATIM)
   add_dependencies(skyrim_generated verify_game_inputs)
   add_dependencies(skyrim_runtime verify_game_inputs)
+  add_library(skyrim_natives OBJECT ${RT_NATIVE_C})
+  target_link_libraries(skyrim_natives PRIVATE skyrim_runtime)
+  target_compile_options(skyrim_natives PRIVATE -O2 -fno-strict-aliasing -fwrapv -fsigned-char
+    $<$<COMPILE_LANGUAGE:C>:-Werror=implicit-function-declaration>)
   add_executable(skyrim_macos "${SKYRIM_ROOT}/runtime/main.c"
-    $<TARGET_OBJECTS:skyrim_generated>)
+    $<TARGET_OBJECTS:skyrim_generated> $<TARGET_OBJECTS:skyrim_natives>)
   target_link_libraries(skyrim_macos PRIVATE skyrim_runtime)
   add_dependencies(skyrim_macos verify_game_inputs)
   set_property(TARGET skyrim_macos APPEND PROPERTY LINK_DEPENDS

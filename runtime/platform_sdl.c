@@ -63,6 +63,9 @@ static void capture_mouse(void) {
 }
 #endif
 
+/* Mouse id of the motion events edge_turn synthesizes (SDL_TOUCH_MOUSEID is (Uint32)-1). */
+#define LB_EDGE_TURN_MOUSEID ((Uint32)-2)
+
 #if defined(LB_IOS_DEVICE) && TARGET_OS_VISION
 /* A spatial click on the immersive layer (an indirect pinch, which is also how a trackpad click can arrive):
  * a left button, unless GCMouse pressed a button within 0.25 s (the same click arriving both ways). A press that
@@ -107,6 +110,7 @@ static void edge_turn(void) {
     SDL_zero(e);
     e.type = SDL_MOUSEMOTION;
     e.motion.windowID = SDL_GetWindowID(g_window);
+    e.motion.which = LB_EDGE_TURN_MOUSEID;  /* synthetic: head steering must not read it as the player's mouse */
     e.motion.xrel = dx;
     SDL_PushEvent(&e);
 }
@@ -124,6 +128,7 @@ static void edge_turn(void) {
  * Main thread only, except skyrim_head_set. */
 #include <math.h>
 #include <stdatomic.h>
+#include "motion_path.h"
 int skyrim_frame_camera(float out[18]);  /* runtime/d3d9_bridge.cpp */
 int skyrim_menu_open(void);
 static _Atomic float g_head_yaw, g_head_pitch;
@@ -138,9 +143,25 @@ static _Atomic float g_head_offset;  /* game heading minus head yaw: where the h
 static atomic_int g_head_anchored;
 /* For the compositor: the game heading (radians) that the head's yaw 0 maps to, or 0 with *valid = 0. */
 float skyrim_head_offset(int *valid) { *valid = atomic_load(&g_head_anchored); return atomic_load(&g_head_offset); }
+/* LB_HEAD_TEST's head, as head_steer last computed it (the Mac has no compositor to publish one). */
+static _Atomic float g_head_test_yaw, g_head_test_pitch;
+static atomic_int g_head_test_on;
+/* Where the head points now, in the game's terms: heading (radians, clockwise from north, as the game camera's)
+ * and pitch (up). From the compositor's latest pose (published every display refresh), or LB_HEAD_TEST's.
+ * Returns 0 while steering isn't anchored (menus, real mouse look) or no head is known. Any thread. */
+int skyrim_head_now(float *heading, float *pitch) {
+    if (!atomic_load(&g_head_anchored)) return 0;
+    float yaw, p;
+    if (atomic_load(&g_head_on)) { yaw = atomic_load(&g_head_yaw); p = atomic_load(&g_head_pitch); }
+    else if (atomic_load(&g_head_test_on)) { yaw = atomic_load(&g_head_test_yaw); p = atomic_load(&g_head_test_pitch); }
+    else return 0;
+    *heading = yaw + atomic_load(&g_head_offset);
+    *pitch = fmaxf(-1.1f, fminf(1.1f, p));
+    return 1;
+}
 static void head_note_event(const SDL_Event *e) {
     if (e->type == SDL_MOUSEMOTION && e->motion.which != SDL_TOUCH_MOUSEID
-        && (e->motion.xrel || e->motion.yrel))
+        && e->motion.which != LB_EDGE_TURN_MOUSEID && (e->motion.xrel || e->motion.yrel))
         g_head_external = 15;
 }
 static float head_wrap(float a) { return a - 6.2831853f * floorf((a + 3.1415927f) / 6.2831853f); }
@@ -165,10 +186,22 @@ static void head_steer(void) {
     else if (test == 2) { float t = frame / 60.0f; head_yaw = 0.6f * sinf(t * 0.8f); head_pitch = 0.25f * sinf(t * 0.5f); }
     else if (atomic_load(&g_head_on)) { head_yaw = atomic_load(&g_head_yaw); head_pitch = atomic_load(&g_head_pitch); }
     else { if (anchored) { void input_head_stick(float, float); input_head_stick(0, 0); } anchored = 0; atomic_store(&g_head_anchored, 0); return; }
+    if (test) {  /* for skyrim_head_now */
+        atomic_store(&g_head_test_yaw, head_yaw);
+        atomic_store(&g_head_test_pitch, head_pitch);
+        atomic_store(&g_head_test_on, 1);
+    }
     float cam[18];
-    if (!g_window || !skyrim_frame_camera(cam)) return;
+    if (!g_window) return;
     void input_head_stick(float x, float y);
-    if (skyrim_menu_open()) { anchored = 0; atomic_store(&g_head_anchored, 0); input_head_stick(0, 0); return; }  /* menus get no synthetic mouse; re-anchor after */
+    /* Menus, loading screens and any frame without the world camera: let go of the stick (a held deflection would
+     * scroll the menu) and re-anchor once the world is back. A menu frame carries no camera either. */
+    if (skyrim_menu_open() || !skyrim_frame_camera(cam)) {
+        anchored = 0;
+        atomic_store(&g_head_anchored, 0);
+        input_head_stick(0, 0);
+        return;
+    }
     /* Columns of the camera rotation: forward (cam[0], cam[3], cam[6]); Skyrim heading is clockwise from +Y. */
     float game_yaw = atan2f(cam[0], cam[3]);
     float game_pitch = asinf(fmaxf(-1.0f, fminf(1.0f, cam[6])));
@@ -261,7 +294,9 @@ static void head_steer(void) {
 #if defined(LB_IOS_DEVICE) || defined(LB_MAC_MAIN_PUMP)
 #define LB_PACE_LOG 1
 static double g_present_began, g_present_sum, g_present_max, g_present_last, g_slept_last;
+static int g_draws_last;
 void platform_present_slept(double ms) { g_slept_last = ms; }
+void platform_present_draws(int draws) { g_draws_last = draws; }
 static double pace_now_ms(void) { return (double)SDL_GetPerformanceCounter() * 1000.0 / (double)SDL_GetPerformanceFrequency(); }
 void platform_present_begin(void) { g_present_began = pace_now_ms(); }
 void platform_present_end(void) {
@@ -270,8 +305,9 @@ void platform_present_end(void) {
     g_present_sum += took;
     if (took > g_present_max) g_present_max = took;
 }
-/* Benchmark runs (tools/bench): LB_FRAMETIMES=1 logs every frame as "ft <frame> <frame ms> <Present ms> <work ms>",
- * where work is the frame time without the 60 fps pacing sleep and without Present (the game's own CPU time);
+/* Benchmark runs (tools/bench): LB_FRAMETIMES=1 logs every frame as
+ * "ft <frame> <frame ms> <Present ms> <work ms> <draw calls>", where work is the frame time without the 60 fps
+ * pacing sleep and without Present (the game's own CPU time);
  * LB_EXIT_FRAME=N ends the game cleanly once frame N is presented. */
 #ifdef LB_IOS_DEVICE
 void platform_native_request_quit(void);
@@ -290,7 +326,7 @@ static void bench_frame(double took) {
     }
     if (frametimes) {
         double work = took - g_present_last - g_slept_last;
-        LOG("ft %d %.2f %.2f %.2f", g_frames, took, g_present_last, work > 0 ? work : 0);
+        LOG("ft %d %.2f %.2f %.2f %d", g_frames, took, g_present_last, work > 0 ? work : 0, g_draws_last);
     }
     g_slept_last = 0;
     if (exit_frame > 0 && g_frames == exit_frame) {
@@ -301,6 +337,8 @@ static void bench_frame(double took) {
 static void pace_frame(void) {
     static double last, sum, worst;
     static int n, over33, over50;
+    extern void hitch_frame(void);  /* runtime/hitch.c: LB_HITCH_MS samples the stacks of long frames */
+    hitch_frame();
     double now = pace_now_ms();
     if (last > 0) {
         double took = now - last;
@@ -325,6 +363,7 @@ static void pace_frame(void) {
 void platform_present_begin(void) {}
 void platform_present_end(void) {}
 void platform_present_slept(double ms) { (void)ms; }
+void platform_present_draws(int draws) { (void)draws; }
 #endif
 
 #ifdef LB_IOS_DEVICE
@@ -718,7 +757,12 @@ void platform_present_hook(void) {
     }
     script_events();
 #if defined(__APPLE__)
-    if (pthread_main_np()) head_steer();
+    if (pthread_main_np()) {
+        head_steer();
+        /* The offset that goes with the camera just presented, for the compositor to follow between frames while
+         * the right stick turns the view (runtime/motion_path.h). */
+        motion_offset(motion_camera_time(), atomic_load(&g_head_offset), atomic_load(&g_head_anchored));
+    }
 #endif
 #ifdef LB_MAC_MAIN_PUMP
     if (pthread_main_np()) capture_mouse();

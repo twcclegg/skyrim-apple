@@ -10,6 +10,8 @@ A scenario (scenarios/*.json) is frame-timed scripted input for the runtime's LB
 the main menu (`coc` into a cell gives the default character in the same place every run, without anyone's save),
 keys held for a route, screenshots (LB_SHOT) to check the run went where intended, and named phases whose frame
 times are summarized separately. The runtime logs each frame (LB_FRAMETIMES=1) and quits at LB_EXIT_FRAME.
+Taking a screenshot stalls its frame for 50-300 ms (a GPU readback and two files written), so those frames are left
+out of the statistics and listed in the summary's meta as screenshot_frames.
 
 The app must already be installed with the game files in place; this tool never installs anything. On a device the
 headset has to be worn and awake, because visionOS suspends apps when it isn't. Results go to bench-results/
@@ -46,8 +48,13 @@ def _bundle_id():
 
 BUNDLE = _bundle_id()
 FRAME_MS = 1000.0 / 60.0
-FT = re.compile(r"^ft (\d+) ([\d.]+) ([\d.]+)(?: ([\d.]+))?$")
+FT = re.compile(r"^ft (\d+) ([\d.]+) ([\d.]+)(?: ([\d.]+))?(?: (\d+))?$")
+GPU_BUSY = re.compile(r"dxvk: gpu busy ([\d.]+)%, ([\d.]+) ms per frame over (\d+) frames")
+PASS = re.compile(r"^pass (\d+)((?: [\w.-]+=[\d.]+(?:/[\d.]+){0,2})+)\s*$")
+PASS_FIELD = re.compile(r"([\w.-]+)=([\d.]+(?:/[\d.]+){0,2})")
+PASSGPU = re.compile(r"^passgpu (\d+)((?: [\w.-]+=[\d.]+)+)\s*$")  # LB_PASSES_GPU: GPU ms per class, a few frames late
 SHOT = re.compile(r"^LB_SHOT frame (\d+) \d+x\d+ -> (.+)$")
+SHOT_ANY = re.compile(r"^LB_SHOT frame \d+ ")  # any screenshot line: the next frame time logged includes its stall
 CONTAINER = re.compile(r"/Containers/Data/Application/[0-9A-F-]+/(.+)$")
 NOTABLE = ("native: thermal", "bench:", "immersive:", "pointer:", "fatal", "device lost", "rt_unimpl", "quit requested")
 
@@ -91,6 +98,20 @@ def key_script(scenario):
             frame += scenario.get("command_gap", 30)
         if scenario.get("console_close", True):  # `coc` closes the console itself; a second ` would reopen it
             entries.append(f"{frame}:`:2")
+    # "console_later": [{"at": frame, "command": text}] - the console reopened after the first command's load (a
+    # `bat` of commands that can't share the first console, e.g. the weather), then closed again.
+    for later in scenario.get("console_later", []):
+        if later["at"] < frame:
+            fail(f"console_later at {later['at']} overlaps the console before it (busy until {frame})")
+        frame = later["at"]
+        entries.append(f"{frame}:`:2")
+        more, frame = typed(later["command"], frame + 20)
+        entries += more
+        entries.append(f"{frame}:Return:2")
+        entries.append(f"{frame + 30}:`:2")
+        frame += 32
+        if frame > scenario.get("exit_frame", frame):
+            fail(f"console_later {later['command']!r} ends at frame {frame}, after the exit frame")
     for held in scenario.get("keys", []):
         entries.append(f"{held['start']}:{held['key']}:{held['frames']}")
     if len(entries) > 256:
@@ -262,10 +283,11 @@ def percentile(values, p):
 
 
 def stats(frames):
-    """frames: list of (frame, ms, present_ms, work_ms or None)."""
+    """frames: list of (frame, ms, present_ms, work_ms or None, draw calls or None)."""
     times = [f[1] for f in frames if f[1] > 0]
     presents = [f[2] for f in frames]
     work = [f[3] for f in frames if f[1] > 0 and f[3] is not None]
+    draws = [f[4] for f in frames if f[1] > 0 and f[4] is not None]
     if not times:
         return {"frames": 0}
     total = sum(times)
@@ -286,24 +308,117 @@ def stats(frames):
         **({"work_mean_ms": round(sum(work) / len(work), 3), "work_median_ms": round(statistics.median(work), 3),
             "work_p95_ms": round(percentile(work, 95), 2), "work_p99_ms": round(percentile(work, 99), 2)}
            if work else {}),
+        **({"draws_mean": round(sum(draws) / len(draws), 1), "draws_p95": round(percentile(draws, 95))}
+           if draws else {}),
     }
 
 
-def parse_log(text, scenario=None):
-    frames, shots, notes = [], {}, []
+def paging_counters():
+    """macOS swap-ins, swap-outs and page-outs since boot, in MB; None where vm_stat isn't available."""
+    try:
+        out = subprocess.run(["vm_stat"], capture_output=True, text=True, timeout=10).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    page = re.search(r"page size of (\d+) bytes", out)
+    counts = {k: re.search(rf"^{k}:\s+(\d+)", out, re.M) for k in ("Swapins", "Swapouts", "Pageouts")}
+    if not page or not all(counts.values()):
+        return None
+    return {k.lower(): int(m[1]) * int(page[1]) / 2**20 for k, m in counts.items()}
+
+
+def parse_gpu_busy(text):
+    """Frame-weighted GPU busy figures from `dxvk: gpu busy` lines, or None when there are none. The lines carry no
+    frame numbers, so they can't be tied to phases: the result covers the whole run."""
+    windows = [(float(m[1]), float(m[2]), int(m[3])) for m in map(GPU_BUSY.search, text.splitlines()) if m]
+    total = sum(w[2] for w in windows)
+    if not total:
+        return None
+    return {"windows": len(windows), "frames": total,
+            "gpu_busy_ms": round(sum(ms * n for _, ms, n in windows) / total, 3),
+            "gpu_busy_pct": round(sum(pct * n for pct, _, n in windows) / total, 2)}
+
+
+def parse_passes(text):
+    """`pass <frame> key=draws/prims[/gpu ms] ... rt=<n>` lines as {frame: {key: [numbers]}} (a repeated frame keeps
+    the last line, so the same line in both the game log and the console counts once)."""
+    out, gpu = {}, {}
+    for line in text.splitlines():
+        m = PASS.match(line)
+        if m:
+            out[int(m[1])] = {k: [float(x) for x in v.split("/")] for k, v in PASS_FIELD.findall(m[2])}
+        m = PASSGPU.match(line)
+        if m:
+            gpu[int(m[1])] = {k: float(v) for k, v in PASS_FIELD.findall(m[2])}
+    # `passgpu <frame> class=<ms> ... total=<ms> marks=<n> zero=<n>` (LB_PASSES_GPU) is printed a few frames after
+    # its frame's pass line: each class's ms becomes the third number of that frame's draws/prims, the other keys
+    # become single-number keys "gpu.<key>".
+    for frame, row in gpu.items():
+        if frame not in out:
+            continue
+        for key, ms in row.items():
+            if key in out[frame] and len(out[frame][key]) == 2:
+                out[frame][key].append(ms)
+            elif key not in out[frame]:
+                out[frame]["gpu." + key] = [ms]
+    return out
+
+
+def pass_stats(rows):
+    """rows: list of {key: [numbers]}; per key the mean draws and prims, the mean gpu ms when present, or `value` for
+    a single-number key such as rt."""
+    keys = []
+    for row in rows:
+        keys += [k for k in row if k not in keys]
+    out = {}
+    for key in keys:
+        vals = [row[key] for row in rows if key in row]
+        names = ("draws", "prims", "gpu_ms") if len(vals[0]) > 1 else ("value",)
+        entry = {"frames": len(vals)}
+        for i, name in enumerate(names):
+            col = [v[i] for v in vals if len(v) > i]
+            if col:
+                entry[name + "_mean"] = round(sum(col) / len(col), 3)
+        out[key] = entry
+    return out
+
+
+def parse_log(text, scenario=None, console=""):
+    frames, shots, notes, stalled, pending = [], {}, [], {}, False
     for line in text.splitlines():
         m = FT.match(line)
         if m:
-            frames.append((int(m[1]), float(m[2]), float(m[3]), float(m[4]) if m[4] else None))
+            frames.append((int(m[1]), float(m[2]), float(m[3]), float(m[4]) if m[4] else None,
+                           int(m[5]) if m[5] else None))
+            if pending:
+                stalled[int(m[1])] = float(m[2])
+                pending = False
             continue
+        if SHOT_ANY.match(line):
+            pending = True
         m = SHOT.match(line)
         if m:
             shots[int(m[1])] = m[2]
         if line.startswith(NOTABLE) or any(n in line for n in NOTABLE[3:]):
             notes.append(line)
-    summary = {"overall": stats(frames)}
+    timed = [f for f in frames if f[0] not in stalled]
+    summary = {"overall": stats(timed)}
     for name, (start, end) in (scenario or {}).get("phases", {}).items():
-        summary[name] = stats([f for f in frames if start <= f[0] < end])
+        summary[name] = stats([f for f in timed if start <= f[0] < end])
+    # Optional extras: pass lines (LB_PASSES=1) come from the game log or the console, gpu busy lines (stderr) from
+    # the console, falling back to the log. Both are absent from older builds; nothing here may fail without them.
+    passes = parse_passes(console + "\n" + text)
+    if passes:
+        timed_frames = {f[0] for f in timed}
+        for name, s in summary.items():
+            span = (0, float("inf")) if name == "overall" else tuple(scenario["phases"][name])
+            rows = [row for frame, row in passes.items() if span[0] <= frame < span[1] and
+                    (frame in timed_frames or not timed_frames)]
+            if rows and s.get("frames"):
+                s["passes"] = pass_stats(rows)
+    gpu = parse_gpu_busy(console) or parse_gpu_busy(text)
+    if gpu:
+        summary["gpu"] = gpu
+    summary["meta"] = {"screenshot_frames": stalled}
     exited = any("exit frame" in n and "reached" in n for n in notes)
     return frames, shots, notes, summary, exited
 
@@ -321,7 +436,7 @@ def target_of(args):
 def execute(scenario, args):
     target = target_of(args)
     target.preflight()
-    env = {"LB_FRAMETIMES": "1", "LB_EXIT_FRAME": str(scenario["exit_frame"]), "LB_LOG": "1"}
+    env = {"LB_FRAMETIMES": "1", "LB_EXIT_FRAME": str(scenario["exit_frame"]), "LB_LOG": "1", "LB_POWER_LOG_S": "2"}
     keys = key_script(scenario)
     if keys:
         env["LB_KEYS"] = keys
@@ -344,7 +459,11 @@ def execute(scenario, args):
     timeout = scenario["exit_frame"] / 20 + 240  # a third of real time, plus loading
     started = datetime.now(timezone.utc)
     print(f"bench: running {scenario['name']} to frame {scenario['exit_frame']} (timeout {timeout:.0f} s)")
+    paging = paging_counters() if isinstance(target, Mac) else None
     console = target.launch(env, timeout)
+    if paging:
+        after = paging_counters()
+        paging = {k: round(after[k] - v) for k, v in paging.items()} if after else None
     logs = sorted(set(target.list_files("Documents/SkyrimLogs")) - before)
     if not logs:
         fail(f"the run wrote no new log. Console:\n{console[-2000:]}")
@@ -356,7 +475,7 @@ def execute(scenario, args):
         fail("couldn't copy the log off the device")
     (out / "console.txt").write_text(console)
     (out / "env.json").write_text(json.dumps(env, indent=2, sort_keys=True))
-    frames, shots, notes, summary, exited = parse_log(log_path.read_text(errors="replace"), scenario)
+    frames, shots, notes, summary, exited = parse_log(log_path.read_text(errors="replace"), scenario, console)
     for frame, path in shots.items():
         m = CONTAINER.search(path)
         if m:
@@ -364,16 +483,22 @@ def execute(scenario, args):
         elif isinstance(target, Mac):
             target.pull(path, out / f"shot-{frame:05d}.bmp")
     with open(out / "frametimes.csv", "w") as csv:
-        csv.write("frame,frame_ms,present_ms,work_ms\n")
-        for frame, ms, present, work in frames:
-            csv.write(f"{frame},{ms},{present},{'' if work is None else work}\n")
-    summary["meta"] = {"scenario": scenario["name"], "label": label, "started_utc": started.isoformat(),
-                       "exited_cleanly": exited, "notes": notes[-40:], "log": logs[-1]}
+        csv.write("frame,frame_ms,present_ms,work_ms,draws\n")
+        for frame, ms, present, work, draws in frames:
+            csv.write(f"{frame},{ms},{present},{'' if work is None else work},{'' if draws is None else draws}\n")
+    if paging:
+        summary["meta"]["paging_mb"] = paging
+    summary["meta"] = {**summary["meta"], "scenario": scenario["name"], "label": label, "started_utc": started.isoformat(),
+                       "exited_cleanly": exited, "notes": notes[-40:], "log": logs[-1],
+                       "phases": scenario.get("phases", {})}
     (out / "summary.json").write_text(json.dumps(summary, indent=2))
     print_summary(summary)
     print(f"bench: results in {out}")
     if not exited:
         print("bench: WARNING the run didn't reach its exit frame; don't compare it", file=sys.stderr)
+    if paging and paging["swapins"] + paging["swapouts"] > 1024:
+        print(f"bench: WARNING the Mac swapped {paging['swapins']} MB in and {paging['swapouts']} MB out during the "
+              "run; memory pressure slows everything, so check this run before comparing it", file=sys.stderr)
     if args.baseline:
         compare(Path(args.baseline), out)
     return out
@@ -382,11 +507,33 @@ def execute(scenario, args):
 def print_summary(summary):
     print(f"{'phase':<12}{'frames':>8}{'fps':>8}{'mean':>8}{'p95':>8}{'p99':>8}{'max':>9}{'>33ms':>7}{'>250':>6}")
     for name, s in summary.items():
-        if name == "meta" or not s.get("frames"):
+        if name in ("meta", "gpu") or not s.get("frames"):
             continue
         print(f"{name:<12}{s['frames']:>8}{s['fps']:>8.1f}{s['mean_ms']:>8.1f}{s['p95_ms']:>8.1f}{s['p99_ms']:>8.1f}"
               f"{s['max_ms']:>9.1f}{s['over_33ms']:>7}{s['over_250ms']:>6}"
-              + (f"   work {s['work_mean_ms']:.2f} / p95 {s['work_p95_ms']:.1f}" if "work_mean_ms" in s else ""))
+              + (f"   work {s['work_mean_ms']:.2f} / p95 {s['work_p95_ms']:.1f}" if "work_mean_ms" in s else "")
+              + (f"   draws {s['draws_mean']:.0f}" if "draws_mean" in s else ""))
+    gpu = summary.get("gpu")
+    if gpu:
+        print(f"gpu busy {gpu['gpu_busy_pct']:.1f}%, {gpu['gpu_busy_ms']:.2f} ms per frame over {gpu['frames']} frames "
+              "(whole run)")
+
+
+def print_pass_table(phase, old, new):
+    """Per-pass-class draws, prims and gpu ms (where both runs have it) of two runs side by side, with ratios."""
+    print(f"  passes, {phase} (baseline -> candidate, x = candidate / baseline)")
+    print(f"    {'class':<8}{'draws':>20}{'prims':>26}{'gpu ms':>22}")
+    for key in [k for k in new if k in old]:
+        if "draws_mean" not in new[key] or "draws_mean" not in old[key]:
+            continue
+        cells = []
+        for field, fmt in (("draws_mean", "{:.0f}"), ("prims_mean", "{:.0f}"), ("gpu_ms_mean", "{:.2f}")):
+            if field in old[key] and field in new[key]:
+                o, n = old[key][field], new[key][field]
+                cells.append(f"{fmt.format(o)}->{fmt.format(n)} {n / o:.2f}x" if o else f"{fmt.format(o)}->{fmt.format(n)}")
+            else:
+                cells.append("-")
+        print(f"    {key:<8}{cells[0]:>20}{cells[1]:>26}{cells[2]:>22}")
 
 
 def compare(baseline, candidate, threshold=0.05):
@@ -395,17 +542,28 @@ def compare(baseline, candidate, threshold=0.05):
     worse = False
     print(f"bench: {candidate.name} vs {baseline.name} (negative = faster)")
     for phase in b:
-        if phase == "meta" or phase not in a or not a[phase].get("frames") or not b[phase].get("frames"):
+        if phase in ("meta", "gpu") or phase not in a or not a[phase].get("frames") or not b[phase].get("frames"):
             continue
+        spans = [run.get("meta", {}).get("phases", {}).get(phase) for run in (a, b)]
+        if None not in spans and spans[0] != spans[1]:  # older results don't record their phase frames
+            print(f"bench: WARNING phase {phase} covers frames {spans[0]} in the baseline, {spans[1]} here",
+                  file=sys.stderr)
         cells = []
-        for key in ("mean_ms", "p95_ms", "p99_ms", "work_mean_ms", "work_p95_ms"):
+        for key in ("mean_ms", "p95_ms", "p99_ms", "work_mean_ms", "work_p95_ms", "draws_mean"):
             if key not in a[phase] or key not in b[phase]:
                 continue
             old, new = a[phase][key], b[phase][key]
             change = (new - old) / old if old else 0
             worse |= key == "mean_ms" and change > threshold
-            cells.append(f"{key[:-3]} {old:.1f}->{new:.1f} ({change:+.1%})")
+            cells.append(f"{key.removesuffix('_ms')} {old:.1f}->{new:.1f} ({change:+.1%})")
         print(f"  {phase:<10} " + "  ".join(cells))
+    if a.get("gpu") and b.get("gpu"):
+        old, new = a["gpu"]["gpu_busy_ms"], b["gpu"]["gpu_busy_ms"]
+        print(f"  gpu busy   {old:.2f}->{new:.2f} ms/frame ({(new - old) / old if old else 0:+.1%}), "
+              f"{a['gpu']['gpu_busy_pct']:.1f}%->{b['gpu']['gpu_busy_pct']:.1f}%  (whole run)")
+    for phase in b:
+        if phase not in ("meta", "gpu") and phase in a and a[phase].get("passes") and b[phase].get("passes"):
+            print_pass_table(phase, a[phase]["passes"], b[phase]["passes"])
     for run in (a, b):
         if not run.get("meta", {}).get("exited_cleanly"):
             print(f"bench: WARNING {run.get('meta', {}).get('label')} didn't exit cleanly", file=sys.stderr)

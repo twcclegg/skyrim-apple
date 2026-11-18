@@ -75,6 +75,7 @@ for imp in getattr(pe, "DIRECTORY_ENTRY_IMPORT", []):
         iat[e.address] = imp.dll.decode() + "!" + name
 
 jump_tables = {}
+jt_base = {}  # insn_addr -> first byte of its table (below the displacement for tables indexed from their end)
 NORETURN = {"_CxxThrowException", "abort", "exit", "_exit", "_amsg_exit", "ExitProcess", "_invoke_watson"}
 
 
@@ -225,12 +226,13 @@ def explore_function(start):
                         if n is None and c.operands[0].type == x86.X86_OP_REG and \
                                 c.operands[1].type == x86.X86_OP_IMM and c.reg_name(c.operands[0].reg) == reg:
                             n = c.operands[1].imm
-                    elif not via_jb:
+                    else:
+                        # (when the jb has left the 8-instruction history, prev holds only this block's own)
                         n = find_table_bound(prev, reg)
                     tbl = op.mem.disp & 0xFFFFFFFF
                     targets = []
                     k = 0
-                    if n is not None and negated_index(hist, reg):
+                    if n is not None and 0 < n <= 1024 and negated_index(hist, reg):
                         # `cmp reg, N` / `neg reg` (memmove's backward copy): the index is -(N-1)..0, so
                         # the table ends at the displacement instead of starting there
                         tbl -= 4 * (n - 1)
@@ -251,6 +253,7 @@ def explore_function(start):
                             targets.append(u32(tbl - 4 * k))
                         tbl -= 4 * k
                     jump_tables[i.address] = targets
+                    jt_base[i.address] = tbl
                     jt_ranges.append((tbl, tbl + 4 * k))
                     for t in targets:
                         if t not in leaders:
@@ -389,8 +392,7 @@ def main():
     # fixed point; jump-table data inside .text is excluded.
     table_bytes = set()
     for k, v in jump_tables.items():
-        i = decode(k)
-        tbl = i.operands[0].mem.disp & 0xFFFFFFFF
+        tbl = jt_base[k]
         table_bytes.update(range(tbl, tbl + 4 * len(v)))
     def coverage():
         cov = bytearray(TEXT_HI - TEXT_LO)
@@ -454,7 +456,7 @@ def main():
                         for y in range(x, x + decode(x).size):
                             cov[y - TEXT_LO] = 1
                 for k, v in jump_tables.items():
-                    tbl = decode(k).operands[0].mem.disp & 0xFFFFFFFF
+                    tbl = jt_base[k]
                     for y in range(tbl, tbl + 4 * len(v)):
                         if in_text(y):
                             table_bytes.add(y)

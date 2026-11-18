@@ -1,8 +1,9 @@
 # Native Apple Vision Pro port: plan and prior art
 
-Status: **in development, Simulator only, no device result yet.** This page records the research behind the port
-and the order of work. The accepted runtime is still the iPad build (README.md); nothing here
-claims Vision Pro gameplay until a phase's device check passes on a headset.
+Status: **windowed play works on an M2 Vision Pro** (visionOS 27.3): about 60 fps at 1280×720, with audio,
+keyboard and saves. Mouse look stops once the trackpad pointer leaves the window, because a Shared
+Space window doesn't keep pointer lock. This page records the research behind the port and the order of work;
+current status and milestones are in [VISION_PRO_PLAN.md](VISION_PRO_PLAN.md).
 
 ## Direction
 
@@ -29,7 +30,8 @@ follow "start in a window, then expand into immersive play" with one running gam
   backend depends on `UIScreen`, which visionOS lacks). The overlay adds
   `ipad/visionos/sdl/SDL_uikit_xros.{h,m}`: a single display whose size and scale come from the
   app's window scene, and no-op status bar and orientation calls. Only the overlay copy in the
-  ignored build tree changes; the vendored source and the iOS overlay do not.
+  ignored build tree changes; the fetched SDL release (`third_party/SDL2`, from
+  `tools/fetch_sdl.py`) and the iOS overlay do not.
 - `ipad/prepare_moltenvk.py --sdk xros`: the same MoltenVK v1.4.2 release's `MoltenVK-all.tar`
   carries a static `xros-arm64` slice (pinned to the GitHub asset digest).
 - `ipad/build_ffmpeg.py --sdk xros`: the same FFmpeg 7.1.2 WMA decoders, `arm64-apple-xros26.5`.

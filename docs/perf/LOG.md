@@ -297,6 +297,33 @@ tear handling, and flat menus).
 - **Thomas's verdict:** "Much better." His screenshots show clean edges on a rock and the sword at the
   reduced depth, and a flat main menu.
 
+## 2026-11-15 — first-person depth in the world's encoding (M5, Riverwood, 1280×720 low; twcclegg/skyrim-apple#23)
+
+The R32F scene-depth target that the immersive screen reprojects holds d = P33 (1 − near/z) through whichever
+projection drew the pixel. The world uses near 15; the late first-person pass (arms, weapon, spell hand) writes its
+depth through its own camera with near 5, so hands and weapons were reprojected about three times too far away.
+`runtime/d3d9_bridge.cpp` now detects those draws (a Clear of depth only on a back-buffer-sized target after the
+main pass, confirmed by a projection whose near plane is not the world's) and, for the draws into the R32F target
+only, binds a bytecode copy of the game's pixel shader whose output is `A d + B` (here 3.00008 d − 2.00009, from
+the projections the game sets). Vertex shader, z-buffer, depth test and compositor unchanged. On by default;
+`LB_FP_DEPTH_SCALE=0` turns it off, `=off@F,...` off on frames F only.
+
+Measured with a scripted scene (`coc riverwood`, `bat fpflame`: iron sword and Flames readied; `bat stereofreeze`:
+`sgtm 0.02`, HUD off), two runs with the fix on, one with `LB_FP_DEPTH_SCALE=0`, one with `off@2900`:
+
+- **Depth on the first-person pixels** (101,140 px: (1 − d) on/off ratio 2.5–3.5 between frames 2901 and 2900 of the
+  `off@2900` run, eroded by 2 px): decoded with near 15, median distance 99.1–99.6 units without the fix and
+  33.0–33.9 with it. The ratio is 2.998 within one run (frames 2901/2900) and 3.0006 / 2.9996 between the second
+  fix-on run and the fix-off run (frames 2900 / 3000). Disparity for a 64 mm eye separation (`stereo_proto.py`'s
+  formula, 80.7° across): 34.0 px → 101.4–102.2 px.
+- **World depth** (pixels 4 px clear of the hands): within one run, frames 2900 (off) and 2901 (on) are
+  bit-identical on 87.0%, frames 2899 and 2901 (both on) on 86.9%. Across runs, fix-on against fix-on 71.8–73.4%,
+  fix-on against fix-off 71.6–85.1%: the same as run-to-run noise.
+- **Picture:** within one run, off-frame 2900 against its fix-on neighbours differs by 1.20 and 1.31 /255 mean per
+  channel, the two fix-on neighbours by 2.05. Across runs, the two fix-on runs differ by 11.2–11.8 (they caught
+  different moments), fix-on against fix-off by 2.5–12.2.
+- **Cost:** `work` per frame in the held phase (1,900 frames, 3 runs each, alternating): 6.11 / 6.30 / 6.17 ms with
+  the fix, 6.18 / 6.22 / 6.17 ms without it. No difference measured.
 ## 2026-11-10 (evening) — heavy combat scenario (`boss-fight-mac`) and its first profile
 
 - **Scenario:** `tools/bench/scenarios/boss-fight-mac.json`, run with `--env LB_VPAD=0`. `coc whiterunorigin`,
@@ -542,3 +569,93 @@ the other, and pinned together with PGO.
   measured on the game; Skyrim's x87 code spills floats to `[esp+N]` constantly, so this is the part most
   likely to show up there.
 
+## 2026-11-14 — the first-person draws (M5, Riverwood, low preset, 1280×720; twcclegg/skyrim-apple#23 chunk 1.1)
+
+Traced with `LB_D3DTRACE` (now with draw numbers, viewports, the world camera at each Clear, and several frame
+ranges) in three states: empty hands (`riverwood-walk-mac`), and an iron sword with Flames readied (scripted with
+`tools/stereo_capture.py` and a private config, world slowed with `sgtm 0.02`). Checked by skipping draws
+(`LB_FP_SKIP`, below) and comparing `LB_SHOT` pictures of neighbouring frames.
+
+- **What marks them:** the first-person camera's projection. The game sets `D3DTS_PROJECTION` before each pass
+  even with shaders; the first-person one has near plane 5 (`_43 = -5.00007`), the world's 15. The world
+  NiCamera's frustum is unchanged meanwhile (near 15), so reading it does not help. Same field of view here (65).
+- **Three places per frame, the same meshes each time** (sword and Flames: 10 + 5 + 14 = 29 draws; empty hands:
+  10 + 5 + 10 = 25, nothing visible on screen):
+  - *mask:* in the 960×540 pass (the `refl` class), depth only, then red only. Skipping them changes only the
+    shading on the hands and sword, so this pass is most likely the screen-space sun-shadow mask, not a reflection.
+  - *prepass:* first in the main pass, colour writes off: the hands' depth, so the world is not drawn behind them.
+    Skipping it changes nothing visible (the late pass covers the area).
+  - *late pass:* after the world's effects and the sun's first occlusion query, before tone mapping:
+    `Clear(ZBUFFER)` on the 16-bit float scene target (the world's colour stays), the projection with near 5,
+    the lit meshes (5) and **the flame (3 additive draws) inside the same run**, with Flames also one draw into a
+    cleared back-buffer-sized A8R8G8B8 target; then `Clear(ZBUFFER)` on the R32F depth target, whose colour (the
+    world's depth) is **not** cleared, and the 5 opaque meshes again, writing their depth over the world's. Then
+    the scene target with the world's projection (the sun's second query) and the post chain.
+- **Skipping everything first-person** removes the hands, sword and flame and the glow above the hand; nothing else
+  changes beyond frame-to-frame foliage noise. Skipping only the late pass leaves flat silhouettes in the clear
+  colour (the prepass kept the world out). The flame's light on the ground is world shading and stays.
+- **Third person:** no Clear of depth only and no near-5 projection: 0 first-person draws. **Tab menu in first
+  person:** the game keeps drawing all 29. **Loading screen:** it has a Clear of depth only before its model, but
+  with the world's near plane; not counted.
+- **Detector** (`d3d_first_person()`, `skyrim_first_person_pass()` with the kind, `skyrim_first_person_listen()`):
+  on from such a Clear until a projection with another near plane or a target that is not back-buffer-sized, which
+  learns the near plane; elsewhere on whenever the projection set last has that near plane. `LB_PASSES` counts all
+  of them as `fp` (they were `main`, `refl` and `fx`), and `LB_PASSES=2` logs an `fpdbg` line per frame. Class
+  totals still equal the `ft` draw count (checked on 1,847-, 1,852-, 1,947- and 2,075-draw frames).
+- **The 57 missing effect draws in alternate-eye mode are the weather, not stereo.** On this branch, plain mono
+  runs gave 146 (`fp` now 10 of them) or 203 effect draws per frame depending on the run, and so did
+  `LB_STEREO_EYE_UNITS=2.24` alone; the 203 runs have an overcast, cloudy sky in their screenshots, the 146 runs
+  (including the alternate-eye one) a clear one. Which draws they are is not pinned down: the cloudy run's 180-draw
+  effects run is mostly one alpha-blended shader without depth writes (142 draws); no clear-sky trace was taken.
+
+## 2026-11-14 — first-person-only stereo and the offline hybrid (M5, 1280×720; twcclegg/skyrim-apple#23 chunk 1.2)
+
+What a hybrid would look like (true per-eye hands, weapon and spell effect over the reprojected world), built
+offline before any compositor work.
+
+- **`LB_STEREO_PASSES=firstperson`:** in stereo triplets the eye offset is on only while the first-person flag
+  is (every kind: mask, prepass, late colour, the fire's target, depth), zero for the rest of the frame. The
+  bridge switches it as the flag changes; DXVK reads the value per draw. DXVK sees the same variable but treats
+  anything other than `size` or `all` with its default rule, so there is no clash. The mask is shifted too: it is
+  sampled at the hands' screen position when the late pass lights them. Riverwood: L and C differ in 10 pixels
+  of a 250-pixel-wide strip with no first person in it, against about 179,000 overall.
+- **`LB_STEREO_HYBRID=1`** (`tools/stereo_capture.py --hybrid`): six frames per base, all at one game moment
+  (the clock is held at 1 µs per frame, as `LB_VR180` does): full-stereo L, R and C, first-person-only FL and FR,
+  and W (the centre with every first-person draw skipped), with depth for C, FL, FR and W. The hold works:
+  |W − C| outside the hands is 0.11 (Riverwood) and 0.04 (Whiterun) on a 0–255 scale. |FL − L| inside the hands
+  is 0.05–0.19, so the first-person-only shift draws the same hands as full stereo.
+- **The layer** (`tools/stereo_hybrid.swift`): opaque wherever FL's R32F depth differs from W's (the late
+  pass's depth draws), otherwise max(0, FL − W) as additive (the flame and its heat haze). The hybrid is the layer
+  over the immersive shaders' reprojection of W; (c2) puts it over the reprojection of C, with the centre's hands
+  left in.
+- **Numbers** (`tools/stereo_compare.py --hybrid`, mean |x − true| per eye, 0–255; disparity x_L − x_R in pixels;
+  3 groups each, which agree to within a few tenths):
+
+  | | reprojection (b) | hybrid (c) | hybrid over C (c2) |
+  |---|---|---|---|
+  | Riverwood, spell hand and flame crop, L / R | 17.4–17.7 / 15.7–16.3 | 4.6–4.8 / 3.2–3.3 | 7.4–7.5 / 7.4–7.9 |
+  | Riverwood, sword crop | 7.5–7.7 / 8.5–8.6 | 0.53 / 1.9 | 2.6 / 4.3 |
+  | Whiterun, sword crop | 5.7 / 6.2 | 0.94 / 1.9 | 2.3 / 3.7 |
+
+  | disparity, px | true (a) | reprojection (b) | hybrid (c) |
+  |---|---|---|---|
+  | flame, centroid of the additive layer | 84–86 | 11–12 | = (a) |
+  | flame, block matching on the pictures | 89–95 | 9.4 | 89–94 |
+  | spell hand (Riverwood) | 98 | 32 | = (a) |
+  | sword (Riverwood / Whiterun) | 101 / 97 | 33 / 32 | = (a) |
+
+- **Reprojection places the first-person meshes 3× too far.** The R32F target stores 1 − near / z, and the
+  compositor decodes it with the world's near plane (15), but the hands' depth was written through the
+  first-person projection (near 5), so z comes out 3× too large: 98 px becomes 32 (hand at about 0.5 m shown at
+  about 1.5 m). The flame writes no depth at all and gets the disparity of the ground behind it (about 10 px).
+- **What it looks like.** (b): the flame and hand sit almost flat on the ground behind them, the sword's
+  texture is stretched sideways along its edges, and the hand's edge drags the ground with it. (c): hands,
+  sword and flame are indistinguishable from (a). What is left is the reprojected world's own error (foliage
+  edges, disocclusions at the frame edge) plus a faint seam around the flame where the heat haze moves world
+  pixels. Additive differencing under-adds glow over bright pixels. (c2): a second, ghost copy of the sword and
+  hand beside the true one, so the mono hands must be kept out of the world image.
+- **What the offline hybrid gets for free that a compositor would not:** the layer is cut from tone-mapped
+  frames of one exposure, so tone mapping, eye adaptation and bloom match. Shadows on the hands come from the
+  game's own sun-shadow mask. The flame's light on the world is in W (it is a light, not a first-person draw).
+  The real layer (chunk 1.3) is drawn before tone mapping into its own target and has none of this unless the post
+  chain runs for it. Its alpha also has to come from the pass itself, not from a depth difference.
