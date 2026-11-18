@@ -96,6 +96,8 @@ static void stub_call(CPU *c) {
 }
 void rt_call(CPU *c, uint32_t t) { g_seen = mix(g_seen, &t, 4); stub_call(c); }
 void rt_call_ic(CPU *c, uint32_t t, const FnEntry **cache) { (void)cache; rt_call(c, t); }
+/* The import cache's lookup (lift.py's indirect call sites): no entry, so every call site falls back to rt_call. */
+const FnEntry *rt_ic_lookup(uint32_t t, const FnEntry **cache) { (void)t; (void)cache; return 0; }
 void rt_unimpl(CPU *c, uint32_t a, const char *w) { (void)c; (void)a; g_why = w; siglongjmp(g_jb, 1); }
 void rt_int3(CPU *c, uint32_t a) { (void)c; (void)a; g_why = "int3"; siglongjmp(g_jb, 1); }
 void rt_cpuid(CPU *c, uint32_t *a, uint32_t *b, uint32_t *cc, uint32_t *d) { (void)c; *a = *b = *cc = *d = 0; }
