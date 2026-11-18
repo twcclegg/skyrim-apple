@@ -1,0 +1,2 @@
+# Group 6 native replacements (runtime/skyrim_native_g6.c)
+0xCC4AC0  # gather of 48-byte records by uint16 index (calling-convention test, g6_abi.py)

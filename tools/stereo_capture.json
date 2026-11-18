@@ -1,0 +1,64 @@
+{
+  "description": "True-stereo capture sessions for tools/stereo_capture.py, one game launch per location, from the main menu with the default character (no save). Frame numbers follow the Mac bench scenarios on the M1 (main menu by 300, Whiterun loaded by about 1500, Riverwood by about 2100); check each location's centre shots and adjust. Console input is typed with tools/bench/bench.py's typer: one command per console opening, since keys typed within about 1.5 s of a Return are dropped (observed), so multi-command steps go through `bat` files placed in the game folder. The weapon is drawn (R) before `sgtm 0.02` slows the world to 2 %, so the draw animation finishes first. `tm` hides the HUD, which would otherwise sit at the same place in both true eyes. Crops are normalized [x, y, w, h] rectangles of the frame (top-left origin), for tools/stereo_compare.py.",
+  "eye_units": 2.24,
+  "units_per_metre": 70,
+  "env": {
+    "LB_VPAD": "0"
+  },
+  "game_files": {
+    "stereoequip.txt": [
+      "tgm",
+      "player.additem 00012EB7 1",
+      "player.equipitem 00012EB7"
+    ],
+    "stereoflame.txt": [
+      "tgm",
+      "player.additem 00012EB7 1",
+      "player.equipitem 00012EB7",
+      "player.addspell 00012FCD",
+      "player.equipspell 00012FCD left",
+      "player.setangle z 90",
+      "player.setangle x 12"
+    ],
+    "stereofreeze.txt": [
+      "sgtm 0.02",
+      "tm"
+    ]
+  },
+  "locations": [
+    {
+      "name": "whiterun",
+      "description": "Whiterun's Plains District (city street, townspeople, stone and wood up close): iron sword (00012EB7) drawn in first person.",
+      "timeline": [
+        {"at": 600, "console": "coc whiterunorigin", "close": false},
+        {"at": 1900, "console": "bat stereoequip"},
+        {"at": 2150, "key": "R", "frames": 4},
+        {"at": 2350, "console": "bat stereofreeze"}
+      ],
+      "triplets": [2650, 2750, 2850],
+      "exit_frame": 2950,
+      "crops": {
+        "hands": [0.45, 0.45, 0.55, 0.55],
+        "centre": [0.3, 0.25, 0.4, 0.4]
+      }
+    },
+    {
+      "name": "riverwood",
+      "description": "Riverwood: turned east towards the river (setangle z 90, pitched down 12 degrees) with grass and trees, the iron sword in the right hand and Flames (00012FCD) readied in the left for a fire effect. The heading is a guess: check the centre shot and change setangle in stereoflame.txt.",
+      "timeline": [
+        {"at": 600, "console": "coc riverwood", "close": false},
+        {"at": 2400, "console": "bat stereoflame"},
+        {"at": 2650, "key": "R", "frames": 4},
+        {"at": 2850, "console": "bat stereofreeze"}
+      ],
+      "triplets": [3150, 3250, 3350],
+      "exit_frame": 3450,
+      "crops": {
+        "hands": [0.45, 0.45, 0.55, 0.55],
+        "flame": [0.0, 0.45, 0.45, 0.55],
+        "water": [0.2, 0.35, 0.6, 0.3],
+        "foliage": [0.0, 0.2, 0.5, 0.35]
+      }
+    }
+  ]
+}

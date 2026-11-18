@@ -39,11 +39,15 @@ add_library(Vulkan::Vulkan STATIC IMPORTED GLOBAL)
 set_target_properties(Vulkan::Vulkan PROPERTIES IMPORTED_LOCATION "${SKYRIM_MOLTENVK_LIBRARY}"
   INTERFACE_INCLUDE_DIRECTORIES "${SKYRIM_MOLTENVK_ROOT}/include"
   INTERFACE_LINK_LIBRARIES "-framework Metal;-framework QuartzCore;-framework Foundation;-framework IOSurface;-framework CoreGraphics;-framework UIKit")
-add_subdirectory("${SKYRIM_ROOT}/android/app/jni/dxvk" dxvk)
+set(DXVK_VULKAN_INCLUDE_DIR "${SKYRIM_MOLTENVK_ROOT}/include")
+add_subdirectory("${SKYRIM_ROOT}/third_party/dxvk" dxvk)
 set_target_properties(dxvk_d3d9 PROPERTIES INSTALL_NAME_DIR "@rpath" BUILD_WITH_INSTALL_NAME_DIR TRUE)
 
 file(GLOB RT_C CONFIGURE_DEPENDS "${SKYRIM_ROOT}/runtime/*.c")
 list(REMOVE_ITEM RT_C "${SKYRIM_ROOT}/runtime/main.c")
+# Native replacements fall back to lifted bodies that only the generated game code defines: game target only.
+file(GLOB RT_NATIVE_C CONFIGURE_DEPENDS "${SKYRIM_ROOT}/runtime/skyrim_native*.c")
+list(REMOVE_ITEM RT_C ${RT_NATIVE_C})
 file(GLOB RT_CPP CONFIGURE_DEPENDS "${SKYRIM_ROOT}/runtime/*.cpp")
 add_library(skyrim_sim_runtime OBJECT ${RT_C} ${RT_CPP})
 target_include_directories(skyrim_sim_runtime PUBLIC "${SKYRIM_ROOT}/runtime")
@@ -143,8 +147,11 @@ if(SKYRIM_SIM_BUILD_GAME)
   add_custom_target(verify_simulator_game_inputs
     COMMAND "${SKYRIM_PYTHON}" "${SKYRIM_ROOT}/macos/inputs.py" verify-generated "${SKYRIM_GEN_DIR}" VERBATIM)
   add_dependencies(simulator_game_generated verify_simulator_game_inputs)
+  add_library(simulator_game_natives OBJECT ${RT_NATIVE_C})
+  target_link_libraries(simulator_game_natives PRIVATE skyrim_sim_runtime)
+  target_compile_options(simulator_game_natives PRIVATE -O2 -fno-strict-aliasing -fwrapv -fsigned-char)
   add_executable(SkyrimJitless MACOSX_BUNDLE $<TARGET_OBJECTS:simulator_game_frontend>
-    $<TARGET_OBJECTS:skyrim_sim_entry> $<TARGET_OBJECTS:simulator_game_generated>)
+    $<TARGET_OBJECTS:skyrim_sim_entry> $<TARGET_OBJECTS:simulator_game_generated> $<TARGET_OBJECTS:simulator_game_natives>)
   target_link_libraries(SkyrimJitless PRIVATE skyrim_sim_runtime SDL2main "-framework UIKit" "-framework Foundation" objc)
   set_target_properties(SkyrimJitless PROPERTIES MACOSX_BUNDLE_INFO_PLIST "${CMAKE_CURRENT_SOURCE_DIR}/GameInfo.plist"
     MACOSX_BUNDLE_GUI_IDENTIFIER "dev.zschwendi.skyrim.jitless" BUILD_RPATH "@executable_path/Frameworks")

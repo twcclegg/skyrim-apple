@@ -65,6 +65,13 @@ ST_ = {1: "int8_t", 2: "int16_t", 4: "int32_t", 8: "int64_t"}
 BITS = {1: 8, 2: 16, 4: 32}
 SPILL = "SPILL();"
 RELOAD = "RELOAD();"
+# Where control goes to code that reads the registers from the CPU struct (the runtime, an import, a host
+# replacement) rather than to another lifted function. The same as SPILL/RELOAD in the default build; with
+# pinned registers (LB_PINNED in runtime/lift_prelude.h) SPILL/RELOAD are empty and only these touch memory.
+# RELOAD/RELOAD_RT must be the statement right after the call it belongs to, with no branch between: with
+# pinned registers it is what tells the compiler that the call changed them.
+SPILL_RT = "SPILL_RT();"
+RELOAD_RT = "RELOAD_RT();"
 
 
 CMP_PRED = {"eq": "a_ == b_", "lt": "a_ < b_", "le": "a_ <= b_", "unord": "a_ != a_ || b_ != b_",
@@ -92,6 +99,35 @@ TSO = os.environ.get("LIFT_TSO", "1") == "1"
 # anything else can see the CPU state: the end of the block, a call, a return, or a helper that takes `c`.
 # c->st[] and c->top therefore hold exactly what the plain model would hold at each of those points.
 X87CACHE = os.environ.get("LIFT_X87CACHE", "1") == "1"
+
+# The busiest Windows imports, emitted inline at call sites that name them directly (`call [iat]`, or a call to a
+# `jmp [iat]` stub) instead of going through the import dispatcher: a return-address push, a register spill and
+# reload, an uncached lookup and watchdog bookkeeping for what is often one atomic instruction. The bodies live in
+# runtime/import_inline.h, shared with the shims every other caller (a call through a register) still reaches.
+# All are stdcall: the arguments are at esp on entry and the callee pops them. LIFT_INLINE_IMPORTS=0 turns it off.
+INLINE_IMPORTS = os.environ.get("LIFT_INLINE_IMPORTS", "1") == "1"
+INLINE_IMPORT_BODIES = {  # KERNEL32 name: (argument count, statements; a0_.. are the arguments)
+    "InterlockedIncrement": (1, "eax = imp_InterlockedIncrement(a0_);"),
+    "InterlockedDecrement": (1, "eax = imp_InterlockedDecrement(a0_);"),
+    "InterlockedExchange": (2, "eax = imp_InterlockedExchange(a0_, a1_);"),
+    "InterlockedExchangeAdd": (2, "eax = imp_InterlockedExchangeAdd(a0_, a1_);"),
+    "InterlockedCompareExchange": (3, "eax = imp_InterlockedCompareExchange(a0_, a1_, a2_);"),
+    "TlsGetValue": (1, "eax = imp_TlsGetValue(c, a0_);"),
+    "GetCurrentThreadId": (0, "eax = imp_GetCurrentThreadId(c);"),
+    "GetLastError": (0, "eax = imp_GetLastError(c);"),
+    "SetLastError": (1, "imp_SetLastError(c, a0_); eax = 0;"),
+}
+
+
+def inline_import(name):
+    """The inline replacement for a call to import `name` ("KERNEL32.dll!TlsGetValue"), or None."""
+    dll, _, fn = name.partition("!")
+    spec = INLINE_IMPORT_BODIES.get(fn) if INLINE_IMPORTS and dll.lower().startswith("kernel32") else None
+    if not spec:
+        return None
+    n, body = spec
+    args = "".join("uint32_t a%d_ = M32(esp + %d); " % (k, 4 * k) for k in range(n))
+    return "{ /* %s */ %s%s esp += %d; }" % (fn, args, body, 4 * n)
 X87_LINE = re.compile(r"\bST\(|\bfpush\(|\bfpop\(|\bfstatus\(c\)|\bfxam\(c\)|\bfprem\(c|\bfpu_env\(c|c->top\b")
 X87_SYNC = re.compile(r"\bfxam\(c\)|\bfprem\(c|\bfpu_env\(c|c->top\b")
 X87_TOK = re.compile(r"fpush\(c, |fpop\(c\);|ST\((\d)\)( = (?!=))?|fcompare\(c, |fstatus\(c\)|c->c[0-3] = |;")
@@ -250,9 +286,21 @@ HOST_OVERRIDES_MARVEL = {
 HOST_OVERRIDES_SKYRIM = {
     "exe": {0x472580},  # plane/sphere side test, hot in culling -> runtime/skyrim_native.c
 }
+# More native replacements, one file per group: tools/native_overrides/<group>.txt lists hex addresses (one per line,
+# '#' comments) whose natives live in runtime/skyrim_native_<group>.c.
+_NATIVE_LISTS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "native_overrides")
+for _name in sorted(os.listdir(_NATIVE_LISTS)) if os.path.isdir(_NATIVE_LISTS) else ():
+    if _name.endswith(".txt"):
+        with open(os.path.join(_NATIVE_LISTS, _name)) as _f:
+            HOST_OVERRIDES_SKYRIM["exe"] |= {int(_l.split("#")[0], 16) for _l in _f if _l.split("#")[0].strip()}
 # LIFT_GAME=marvel|skyrim selects the overrides (runtime built with -DGAME_MARVEL / -DGAME_SKYRIM).
 HOST_OVERRIDES = {"marvel": HOST_OVERRIDES_MARVEL, "skyrim": HOST_OVERRIDES_SKYRIM}.get(
     os.environ.get("LIFT_GAME"), HOST_OVERRIDES_BATMAN)
+# LIFT_HOST_OVERRIDES=<hex address>,... adds host replacements in the module being lifted (for tests).
+if os.environ.get("LIFT_HOST_OVERRIDES"):
+    HOST_OVERRIDES = dict(HOST_OVERRIDES)
+    HOST_OVERRIDES[MOD] = set(HOST_OVERRIDES.get(MOD, ())) | {
+        int(a, 16) for a in os.environ["LIFT_HOST_OVERRIDES"].split(",") if a}
 
 
 class Lifter:
@@ -357,15 +405,19 @@ class Lifter:
             return "goto L_%X;" % t
         if t in self.all_funcs:
             self.calls.add(t)
+            if t in HOST_OVERRIDES.get(MOD, ()):
+                return "{ %s f_%X(c); %s return; }" % (SPILL_RT, t, RELOAD_RT)
             return "{ %s f_%X(c); return; }" % (SPILL, t)
-        return "{ %s rt_call(c, 0x%Xu); return; }" % (SPILL, t)
+        return "{ %s rt_call(c, 0x%Xu); %s return; }" % (SPILL_RT, t, RELOAD_RT)
 
     def call_direct(self, t, ret):
-        pre = "esp -= 4; M32(esp) = 0x%Xu; %s " % (ret, SPILL)
+        push = "esp -= 4; M32(esp) = 0x%Xu; " % ret
         if t in self.all_funcs:
             self.calls.add(t)
-            return pre + "f_%X(c); %s" % (t, RELOAD)
-        return pre + "rt_call(c, 0x%Xu); %s" % (t, RELOAD)
+            if t in HOST_OVERRIDES.get(MOD, ()):
+                return push + "%s f_%X(c); %s" % (SPILL_RT, t, RELOAD_RT)
+            return push + "%s f_%X(c); %s" % (SPILL, t, RELOAD)
+        return push + "%s rt_call(c, 0x%Xu); %s" % (SPILL_RT, t, RELOAD_RT)
 
     def indirect_jump(self, i, target_expr):
         self.need_dispatch = True
@@ -643,13 +695,14 @@ class Lifter:
               "f.sf = (v_ >> 7) & 1; c->df = (v_ >> 10) & 1; f.of = (v_ >> 11) & 1; "
               "c->eflags_hi = v_ & 0x00200000u; }")
         elif mn == "cpuid":
-            e("rt_cpuid(c, &eax, &ebx, &ecx, &edx);")
+            e("{ uint32_t a_ = eax, b_ = ebx, c_ = ecx, d_ = edx; rt_cpuid(c, &a_, &b_, &c_, &d_); "
+              "eax = a_; ebx = b_; ecx = c_; edx = d_; }")
         elif mn == "rdtsc":
             e("{ uint64_t t_ = rt_rdtsc(); eax = (uint32_t)t_; edx = (uint32_t)(t_ >> 32); }")
         elif mn == "int3":
-            e("%s rt_int3(c, 0x%Xu);" % (SPILL, i.address))
+            e("%s rt_int3(c, 0x%Xu);" % (SPILL_RT, i.address))
         elif mn == "int":
-            e("%s rt_unimpl(c, 0x%Xu, \"int\");" % (SPILL, i.address))
+            e("%s rt_unimpl(c, 0x%Xu, \"int\");" % (SPILL_RT, i.address))
         elif mn.split()[-1] in ("movsb", "movsw", "movsd", "stosb", "stosw", "stosd", "lodsb", "lodsd",
                                 "cmpsb", "cmpsd", "cmpsw", "scasb", "scasd", "scasw", "lodsw") and \
                 not (mn.endswith("movsd") and ops and ops[0].type == x86.X86_OP_REG):
@@ -1208,16 +1261,20 @@ class Lifter:
             x = self.xmm(i, ops[0])
             e("{ Xmm s_ = %s; for (int k_ = 0; k_ < 4; k_++) %s.f[k_] = (float)s_.i[k_]; }" % (src128(ops[1]), x))
         else:
-            e("%s rt_unimpl(c, 0x%Xu, \"%s\");" % (SPILL, i.address, mn))
+            e("%s rt_unimpl(c, 0x%Xu, \"%s\");" % (SPILL_RT, i.address, mn))
         return o
 
     # ---------------- function ----------------
     def emit(self):
         o = self.out
-        # A function replaced by host code keeps its guest body as f_X_guest.
-        o.append("void f_%X%s(CPU *c) {" % (self.f, "_guest" if self.f in HOST_OVERRIDES.get(MOD, ()) else ""))
-        o.append("    uint32_t eax = c->r[0], ecx = c->r[1], edx = c->r[2], ebx = c->r[3], "
-                 "esp = c->r[4], ebp = c->r[5], esi = c->r[6], edi = c->r[7];")
+        # A function replaced by host code keeps its guest body, which the replacement may call as
+        # f_X_guest. GUEST_BODY names the lifted body; GUEST_BODY_FOR_HOST (after it) makes f_X_guest
+        # callable from host code when lifted code has its own register convention.
+        if self.f in HOST_OVERRIDES.get(MOD, ()):
+            o.append("void GUEST_BODY(f_%X)(CPU *c) {" % self.f)
+        else:
+            o.append("void f_%X(CPU *c) {" % self.f)
+        o.append("    GUEST_REGS;")
         o.append("    Flags f = {0};")
         o.append("    uint32_t jt_ = 0;")
         o.append("    (void)f; (void)jt_;")
@@ -1275,11 +1332,17 @@ class Lifter:
         if self.need_dispatch:
             cases = " ".join("case 0x%Xu: goto L_%X;" % (b, b) for b in sorted(self.block_starts))
             o.append("L_dispatch:")
-            o.append("    switch (jt_) { %s default: %s rt_call(c, jt_); return; }" % (cases, SPILL))
+            o.append("    switch (jt_) { %s default: %s rt_call(c, jt_); %s return; }" % (cases, SPILL_RT, RELOAD_RT))
         o.append("}")
         if xc and xc.used:
-            o[:] = [l.replace(SPILL, "SPILLF();").replace(RELOAD, "RELOADF();") for l in o]
+            o[:] = [l.replace(SPILL, "SPILLF();").replace(RELOAD, "RELOADF();")
+                     .replace(SPILL_RT, "SPILLF_RT();").replace(RELOAD_RT, "RELOADF_RT();") for l in o]
             o.insert(5, X87_LOCALS)
+        if self.f in HOST_OVERRIDES.get(MOD, ()):
+            # the table's entry for a host replacement: callable like a lifted function
+            o.append("")
+            o.append("GUEST_BODY_FOR_HOST(f_%X)" % self.f)
+            o.append("void f_%X_entry(CPU *c) { HOST_ENTRY(f_%X); }" % (self.f, self.f))
         return o
 
     def is_term(self, i):
@@ -1296,7 +1359,11 @@ class Lifter:
                     import_via(tgt).endswith("!_setjmp3"):
                 # setjmp must run in this C frame so a later longjmp can return here
                 return ["{ esp -= 4; M32(esp) = 0x%Xu; %s if (setjmp(*rt_setjmp_slot(c, M32(esp + 4)))) { %s } "
-                        "else { rt_setjmp3(c); %s } }" % (nxt, SPILL, RELOAD, RELOAD)]
+                        "else { rt_setjmp3(c); %s } }" % (nxt, SPILL_RT, RELOAD_RT, RELOAD_RT)]
+            if direct or (op.type == x86.X86_OP_MEM and not op.mem.base and not op.mem.index):
+                inline = inline_import(import_via(tgt))
+                if inline:
+                    return [inline]
             if direct:
                 return [self.call_direct(op.imm & 0xFFFFFFFF, nxt)]
             t = self.get(i, op, 4)
@@ -1304,8 +1371,11 @@ class Lifter:
             # immutable, so one pointer is a consistent (addr, fn) pair)
             return ["{ uint32_t t_ = %s; esp -= 4; M32(esp) = 0x%Xu; %s { static const FnEntry *ic_; "
                     "const FnEntry *e_ = __atomic_load_n(&ic_, __ATOMIC_RELAXED); "
-                    "if (e_ && e_->addr == t_) e_->fn(c); else rt_call_ic(c, t_, &ic_); } %s }" % (
-                t, nxt, SPILL, RELOAD)]
+                    "if (!(e_ && e_->addr == t_)) e_ = rt_ic_lookup(t_, &ic_); "
+                    "if (e_ && t_ < GUEST_THUNK_BASE) { e_->fn(c); %s } "
+                    "else if (e_) { %s e_->fn(c); %s } "  # a cached import shim: registers through the struct
+                    "else { %s rt_call(c, t_); %s } } }" % (
+                t, nxt, SPILL, RELOAD, SPILL_RT, RELOAD_RT, SPILL_RT, RELOAD_RT)]
         if x86.X86_GRP_RET in i.groups:
             n = op.imm if op else 0
             return ["esp += %d; %s return;" % (4 + n, SPILL)]
@@ -1316,7 +1386,7 @@ class Lifter:
                 return [self.indirect_jump(i, self.get(i, op, 4))]
             if op.type == x86.X86_OP_MEM and not op.mem.base and not op.mem.index and \
                     (op.mem.disp & 0xFFFFFFFF) in iat:
-                return ["{ %s rt_call(c, M32(0x%Xu)); return; }" % (SPILL, op.mem.disp & 0xFFFFFFFF)]
+                return ["{ %s rt_call(c, M32(0x%Xu)); %s return; }" % (SPILL_RT, op.mem.disp & 0xFFFFFFFF, RELOAD_RT)]
             return [self.indirect_jump(i, self.get(i, op, 4))]
         if mn == "loop":
             return ["if (--ecx) %s" % self.goto(op.imm), self.goto(nxt)]
@@ -1367,7 +1437,8 @@ def main():
 
     names = sorted(good)
     write_if_changed(os.path.join(OUT, "funcs_%s.h" % MOD),
-                     '#pragma once\n#include "x86.h"\n' + "".join("void f_%X(CPU *c);\n" % fa for fa in names))
+                     '#pragma once\n#include "x86.h"\n' + "".join("void f_%X(CPU *c);\n" % fa for fa in names) +
+                     "".join("void f_%X_entry(CPU *c);\n" % fa for fa in names if fa in HOST_OVERRIDES.get(MOD, ())))
     # Bucket by address so that local changes only touch a few files.
     lo, hi = names[0], names[-1] + 1
     buckets = [[] for _ in range(FILES)]
@@ -1379,7 +1450,8 @@ def main():
         text += "".join("\n".join(good[fa][0]) + "\n\n" for fa in chunk)
         write_if_changed(os.path.join(OUT, "%s_%02d.c" % (MOD, k)), text)
     text = '#include "funcs_%s.h"\n#include "rt_table.h"\nconst FnEntry g_fn_table_%s[] = {\n' % (MOD, MOD)
-    text += "".join("    {0x%Xu, f_%X},\n" % (fa, fa) for fa in names)
+    over = HOST_OVERRIDES.get(MOD, ())
+    text += "".join("    {0x%Xu, f_%X%s},\n" % (fa, fa, "_entry" if fa in over else "") for fa in names)
     text += "};\nconst unsigned g_fn_count_%s = %d;\n" % (MOD, len(names))
     write_if_changed(os.path.join(OUT, "%s_table.c" % MOD), text)
     json.dump({hex(k): v for k, v in failed.items()}, open(os.path.join(OUT, "%s_rejected.json" % MOD), "w"), indent=0)

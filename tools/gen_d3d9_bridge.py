@@ -129,6 +129,9 @@ IFACES = {
 # Methods whose return type is not HRESULT/DWORD-like and need a cast.
 VOID_RET = {"PreLoad", "GenerateMipSubLevels"}
 
+# The argument holding the primitive count of each draw call, for LB_PASSES (d3d_passes_draw).
+DRAW_PRIMS = {"DrawPrimitive": 3, "DrawIndexedPrimitive": 6, "DrawPrimitiveUP": 2, "DrawIndexedPrimitiveUP": 4}
+
 
 def gen():
     o = []
@@ -149,9 +152,24 @@ def gen():
             spec = spec[1:] if void_ret else spec
             args = spec.split() if spec else []
             o.append("static void %s(CPU *c) {" % fn)
+            if iface == "IDirect3DDevice9" and name == "BeginScene":
+                # Offline VR180 captures turn the world camera here: after the game's update, before it culls.
+                o.append("    { extern void vr180_scene_hook(void); vr180_scene_hook(); }")
             o.append("    %s *self = (%s *)com_host(ARG(0));" % (iface, iface))
             o.append("    if (g_d3d_trace) d3d_trace(c, \"%s::%s\", %d);" % (iface, name, len(args)))
+            if iface == "IDirect3DDevice9" and name == "SetTransform":
+                # first-person depth: the projection's near plane (d3d_fp_projection)
+                o.append("    if (g_d3d_fp && ARG(1) == D3DTS_PROJECTION && ARG(2)) d3d_fp_projection((const float *)GPTR(ARG(2)));")
+                # LB_PASSES / first-person detection: the projection's near plane (d3d_passes_projection)
+                o.append("    if (g_d3d_passes && ARG(1) == D3DTS_PROJECTION && ARG(2)) d3d_passes_projection((const float *)GPTR(ARG(2)));")
             if name.startswith("Draw") and not name.endswith("Patch"):
+                o.append("    g_d3d_draws++;")
+                o.append("    if (g_d3d_fp) d3d_fp_draw();")
+                o.append("    if (g_d3d_passes) d3d_passes_draw(ARG(%d));" % DRAW_PRIMS[name])
+                if name == "DrawIndexedPrimitive":
+                    o.append("    if (g_fp_flame) d3d_fp_flame_draw(self, 1, ARG(1), ARG(2), ARG(3), ARG(4), ARG(5), ARG(6));")
+                elif name == "DrawPrimitive":
+                    o.append("    if (g_fp_flame) d3d_fp_flame_draw(self, 0, ARG(1), ARG(2), ARG(3), 0, 0, 0);")
                 o.append("    if (g_bisect && d3d_skip_draw()) { RET(0, %d); return; }" % (len(args) + 1))
             call = []
             post = []

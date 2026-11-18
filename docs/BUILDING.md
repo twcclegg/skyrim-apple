@@ -8,7 +8,7 @@ Use an Apple Silicon Mac, Xcode with the iOS SDK, Python 3.12 or later, CMake 3.
 
 ```sh
 brew install python cmake ninja xcodegen cabextract
-git clone https://github.com/zschwendi/skyrim-apple.git
+git clone --recurse-submodules https://github.com/twcclegg/skyrim-apple.git
 cd skyrim-apple
 python3 -m venv macos/.venv
 macos/.venv/bin/python -m pip install -r macos/requirements.txt
