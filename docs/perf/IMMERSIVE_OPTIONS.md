@@ -126,3 +126,25 @@ Two lines report GPU cost on the headset. Neither had ever been read from a head
 
 Read them together: if the game latency is far above the compositor's GPU time, the game's frame is the slow part,
 on the GPU or on DXVK's command thread; the line alone does not say which.
+
+## Live stereo switches (headset session stereo-1)
+
+Live single-pass stereo is what option B above became: DXVK renders each scene draw into two image layers with
+Vulkan multiview, one per eye. These are the switches that turn it on and the lines they log. All are read
+once, at launch, from the environment or `Documents/SkyrimNative/launch-env.json`. Nothing changes while they are unset.
+
+| Switch | Read by | What it does |
+|---|---|---|
+| `LB_STEREO_EYE_UNITS=d` | runtime, DXVK | Half the eye separation in game units (2.24 is 32 mm at 70 units per metre, also the compositor's default). **Live stereo needs it**: without it the runtime never sets eye offsets or eye matrices, so both layers get the same picture and `LB_EYE_VIEWS`/`LB_EYE_LATE` do nothing. Logs `stereo: live single-pass stereo, d <d> units`. |
+| `LB_STEREO_MULTIVIEW=1` | DXVK, runtime | Single-pass stereo. Render targets of the back buffer's size, and depth-stencils at least that size, get a second layer, and passes whose attachments all have two layers draw with view mask 0b11. Each frame the runtime gives view 0 the left eye and view 1 the right eye. Also turns `LB_DEPTH_COPY` on. |
+| `LB_STEREO_PRESENT=1` | DXVK | With `LB_STEREO_MULTIVIEW=1`: the back buffer gets two layers too, so the final composite and the interface render both eyes, and the present tap hands both pictures and depths to the compositor (`texture_eye2`). Without it the compositor gets only layer 0 (the left eye) and makes the right eye from it, as in mono. Logs `immersive: stereo frames: each eye draws its own picture (eye units <d>)` at the first stereo frame. |
+| `LB_EYE_VIEWS=1` | compositor, runtime | With `LB_IMMERSIVE_HEAD=1` and `LB_STEREO_MULTIVIEW=1`: each eye is rendered through the headset's own eye frustum and from that eye's own position (`skyrim_stereo_set_eyes`). The frusta are clipped to the game's own frustum less `LB_EYE_MARGIN` degrees per side (default 2), or to `LB_EYE_WINDOW=<x>x<y>` (tangents). Logs `immersive: eye views on: …` once, and `immersive: eyes: tangents L … R …; raw L … R …; eye x … m, … units/m` each time the eyes change. The `raw` values are the headset's real tangents; the first pair is after clipping. Menus and lost tracking go back to the game's frustum (`immersive: eyes dropped: …`). |
+| `LB_EYE_LATE=1` | runtime | With `LB_EYE_VIEWS=1`: at each frame's first main-scene draw, the eyes are turned from the game camera toward where the head points now. The turn is at most `LB_EYE_LATE_MAX` degrees each in heading and pitch (default 2, the compositor's margin), and the far plane is pushed out to match. Logs `eye views: late eyes, up to 2.0 degrees toward the head` once, then every 300 frames `eye views: late eyes: head <h>/<p> deg from the camera, applied <h>/<p>`. The compositor reports what is left to correct every 5 s: `immersive: eye views: shown <mean> deg from where the picture was rendered looking (mean), max <max>`. |
+| `LB_STEREO_HUD_DEPTH=m` | runtime | Live stereo: interface draws (pass class ui: HUD and menus) at m metres, default 2, instead of at infinity. |
+| `LB_DEPTH_COPY=0/1` | runtime | The game draws the whole scene a second time into an R32F colour target only to have its depth. Instead, at that pass's first draw the main pass's depth-stencil is copied into the target (every layer) and the pass's draws are skipped. First-person depth draws still run. Default: on with `LB_STEREO_MULTIVIEW=1`, off otherwise. Logs `LB_DEPTH_COPY: the R32F depth pass is a copy of the main pass's depth`. |
+| `LB_PIPE_LOG=1` | DXVK | One stderr line per graphics pipeline compiled: `pipe compiled at draw: <ms> ms` (a draw waited for it on DXVK's command thread) or `pipe compiled ahead: <ms> ms` (a state-cache worker compiled it in advance). The lines land among the frame-time lines of their frame, so long frames can be matched to compiles. |
+
+Related: `LB_MAX_FPS` (visionOS default 45: every second 90 Hz refresh; logged as `present pacing: at most 45 fps
+(LB_MAX_FPS)`), and `LB_WINDOW` (render size, also written into `SkyrimPrefs.ini`: `prefs: render size WxH (LB_WINDOW)
+in <path>`). `LB_FOV` sets the game's field of view at its 4:3 reference. The vertical field stays the same at any
+aspect, and the horizontal grows with the window's width.
