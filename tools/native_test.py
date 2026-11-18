@@ -24,8 +24,8 @@ bugs. Away from an arm64 machine, cross-compile and run under an emulator, for e
 
 Options:
   --order default|strict|both   Memory-ordering build to test (default: both). "strict" builds guest and native
-                    with -DLB_STRICT_ORDER (as the iPad / visionOS build does), so the natives' load-acquire /
-                    store-release paths are the ones compared. "both" runs the two passes one after the other;
+                    with -DLB_STRICT_ORDER (as the macOS, iPad, simulator and visionOS builds do), so the natives'
+                    load-acquire / store-release paths are the ones compared. "both" runs the two passes one after the other;
                     when the target is not arm64 it says so and leaves the strict pass out.
   --only A[,A...]   Run only these functions (everything is still built).
   --jobs N          Processes at a time (default: one per CPU).
@@ -140,15 +140,23 @@ def call_tree(root, funcs):
     return seen
 
 
+# The lifter's own exits out of lifted code: rt_call with a literal address (a jump or call to an address that has
+# no lifted function) or with the jump-table default's jt_. A lifted function's ordinary calls are f_<addr>(c), and
+# calls through memory (imports, vtables) rt_call(c, M32(...)); neither matches.
+EXIT = re.compile(r"\brt_call\(c, (jt_|0x[0-9A-Fa-f]+u)\)")
+
+
 def tree_source(addrs, funcs):
-    """The lifted functions addrs (whole call trees) as static lt_<addr>; calls out of them go to the stub."""
+    """The lifted functions addrs (whole call trees) as static lt_<addr>; calls out of them go to the stub, and the
+    lifter's exits out of lifted code to nt_exit, which marks the run as having left (see compare)."""
     out = ["static uint32_t rnd(void); static double rnd_double(void);"]
     out += ["static void lt_%X(CPU *c);" % g for g in sorted(addrs)]
     for g in sorted(addrs):
         lines = lifted(g, funcs)
         out.append(HEAD.sub("static void lt_%X(" % g, lines[0]))
+        body = EXIT.sub(r"nt_exit(c, \1)", "\n".join(lines[1:]))
         out.append(t.CALL.sub(lambda m: "lt_%s(c)" % m[1] if int(m[1], 16) in addrs else "rt_call(c, 0x%su)" % m[1],
-                              "\n".join(lines[1:])))
+                              body))
     return "\n".join(out) + "\n\n"
 
 
@@ -259,17 +267,18 @@ def compare(fa, guest, native):
         (abase, _, aext), (bbase, _, bext) = a.partition(" | "), b.partition(" | ")
         if abase != bbase:
             # In an ABI test the native side makes no stubbed calls unless it hands the run to the guest (or
-            # calls guest code as the guest does). A guest that calls a stub where the native one doesn't has
-            # left its lifted tree (a jump-table target the lifter never found): the game would stop there with
-            # "no recompiled code", so the replacement is the correct one.
-            if fa in ABI and bbase.endswith(empty) and not abase.endswith(empty):
+            # calls guest code as the guest does). A guest that left its lifted tree through one of the lifter's
+            # exits (a jump-table target the lifter never found; "left 1") where the native one makes no stubbed
+            # call: the game would stop there with "no recompiled code", so the replacement is the correct one.
+            # Without "left 1" the native has skipped a call the guest makes, which is a difference.
+            if fa in ABI and bbase.endswith(empty) and not abase.endswith(empty) and " left 1" in a:
                 res["left"] += 1
             else:
                 note("state", run, True, a, b)
             continue
         aext, bext = aext.split(), bext.split()
         for field, x, y in zip(aext[0::2], aext[1::2], bext[1::2]):
-            if x != y:
+            if x != y and field != "left":  # where each side left lifted code is not itself a result
                 note(field, run, field in strict, a, b)
     return res
 
