@@ -569,6 +569,8 @@ static const char *const k_pass_names[PASS_COUNT] = {"shadow", "refl", "main", "
                                                      "mask",   "fx",   "post", "ui",    "other"};
 struct PassTotals { int draws; uint32_t prims; };  // per class and frame (a GPU time per class would go here too)
 struct PassTarget { void *rt; uint32_t w, h, fmt; bool ds, bb; };  // what draws go to now (rt: identity only)
+static PassTarget g_pass_biggest, g_pass_biggest_now;  // the largest non-back-buffer target drawn to: last frame, this one
+static int g_pass_draws_last[16];  // draws per pass class last frame (for the late-eyes report)
 struct PassFrame {
     PassTotals cls[PASS_COUNT];
     int rt_changes;
@@ -847,6 +849,10 @@ static void gpu_init(IDirect3DDevice9 *d) {
 }
 
 void d3d_passes_draw(uint32_t prims) {
+    {
+        const PassTarget &t = g_pass_target;
+        if (!t.bb && (uint64_t)t.w * t.h > (uint64_t)g_pass_biggest_now.w * g_pass_biggest_now.h) g_pass_biggest_now = t;
+    }
     int k = pass_class(prims);
     g_last_class = k;
     if ((g_ui_k[0][0] != 0 || g_ui_k[1][0] != 0 || g_ui_k[0][1] != 0 || g_ui_k[1][1] != 0) && (k == PASS_UI) != g_ui_shift_on) {
@@ -1006,6 +1012,9 @@ static bool depth_copy_draw(void) {
 }
 
 static void passes_present(void) {
+    g_pass_biggest = g_pass_biggest_now;
+    g_pass_biggest_now = PassTarget();
+    for (int c = 0; c < PASS_COUNT && c < 16; c++) g_pass_draws_last[c] = (int)g_pass_frame.cls[c].draws;
     g_depth_copied = false;
     if (g_ui_shift_on) {
         static const float zero[4] = {0, 0, 0, 0};
@@ -2313,10 +2322,20 @@ static bool stereo_live_multiview(void) {
  * compositor places each eye's picture by the reported pose, so the picture comes out where the head looks and
  * only the remaining difference is corrected there. g_late_done: once per frame. */
 static bool g_late_done;
+/* Why late eyes did or didn't apply to a frame, counted per 300 frames and logged while LB_EYE_LATE=1 is requested
+ * but inactive (stereo_late_report). LATE_NOT_CALLED: no draw of the frame was classed as the main pass, so
+ * stereo_late_eyes never ran; the frame's largest render target is logged with it, to show what the scene used. */
+enum { LATE_APPLIED, LATE_NOT_CALLED, LATE_NO_MATRICES, LATE_NO_EYES, LATE_MENU, LATE_NO_CAMERA, LATE_NO_HEAD,
+       LATE_STEEP, LATE_NO_FRUSTUM, LATE_COUNT };
+static const char *const k_late_why[LATE_COUNT] = {"applied", "no main-pass draw", "no live eye matrices",
+    "no eyes from the compositor", "menu open", "no world camera", "no head pose (steering not anchored)",
+    "camera pitch too steep", "no valid frustum"};
+static int g_late_why = LATE_NOT_CALLED;
 extern "C" int skyrim_head_now(float *heading, float *pitch);  // platform_sdl.c
 static void stereo_late_eyes(void) {
     if (g_late_done) return;
     g_late_done = true;
+    g_late_why = LATE_NO_MATRICES;
     static float max_rad = -1;
     if (max_rad < 0) {
         const char *e = getenv("LB_EYE_LATE");
@@ -2329,7 +2348,11 @@ static void stereo_late_eyes(void) {
     { std::lock_guard<std::mutex> hold(g_stereo_eyes_lock); eyes = g_eyes_drawing; }
     float heading, pitch;
     GameCamera cam;
-    if (!eyes.set || menu_open() || !game_camera_read(&cam) || !skyrim_head_now(&heading, &pitch)) return;
+    if (!eyes.set) { g_late_why = LATE_NO_EYES; return; }
+    if (menu_open()) { g_late_why = LATE_MENU; return; }
+    if (!game_camera_read(&cam)) { g_late_why = LATE_NO_CAMERA; return; }
+    if (!skyrim_head_now(&heading, &pitch)) { g_late_why = LATE_NO_HEAD; return; }
+    g_late_why = LATE_STEEP;
     // Forward is the rotation's first column; heading clockwise from north (+y), as head steering measures it.
     const float game_yaw = atan2f(cam.rot[0], cam.rot[3]), game_pitch = asinf(fmaxf(-1.0f, fminf(1.0f, cam.rot[6])));
     if (fabsf(game_pitch) > 1.2f) return;  // nearly straight up or down: the heading is meaningless
@@ -2365,7 +2388,8 @@ static void stereo_late_eyes(void) {
     const float turn = hypotf(dyaw_c, dp_c);
     const float far_scale = (cosf(turn) + corner * sinf(turn)) * 1.01f;
     float m[2][16];
-    if (!stereo_eye_matrices(cam, g_stereo.d, eyes, m, 0, far_scale)) return;
+    if (!stereo_eye_matrices(cam, g_stereo.d, eyes, m, 0, far_scale)) { g_late_why = LATE_NO_FRUSTUM; return; }
+    g_late_why = LATE_APPLIED;
     memcpy(g_live_m_world, m, sizeof m);
     g_live_m_fp_valid = g_fp_near > 0 && stereo_eye_matrices(cam, g_stereo.d, eyes, g_live_m_fp, g_fp_near, far_scale);
     const bool fp = fp_kind() != FP_NONE && g_live_m_fp_valid;
@@ -2400,9 +2424,36 @@ static void stereo_test_eyes(const GameCamera &cam, float d_units) {
     LOG("stereo test eyes: L %.3f %.3f %.3f %.3f R %.3f %.3f %.3f %.3f, eyes %.4f m apart", t[0][0], t[0][1], t[0][2],
         t[0][3], t[1][0], t[1][1], t[1][2], t[1][3], 2 * half_m);
 }
+/* LB_EYE_LATE=1 requested: once per frame (after Present, for the frame just shown) count why late eyes did or
+ * didn't apply, and every 300 frames in which they were inactive at least once, say why. */
+static void stereo_late_report(void) {
+    static int requested = -1, frames, counts[LATE_COUNT];
+    if (requested < 0) { const char *e = getenv("LB_EYE_LATE"); requested = e && !strcmp(e, "1"); }
+    if (!requested) return;
+    counts[g_late_why]++;
+    g_late_why = LATE_NOT_CALLED;
+    if (++frames < 300) return;
+    if (counts[LATE_APPLIED] < frames) {
+        char why[512];
+        int n = 0;
+        for (int i = 1; i < LATE_COUNT && n < (int)sizeof why - 64; i++)
+            if (counts[i]) n += snprintf(why + n, sizeof why - n, "%s%s %d", n ? ", " : "", k_late_why[i], counts[i]);
+        const PassTarget &b = g_pass_biggest;
+        char cls[256];
+        int m = 0;
+        for (int c = 0; c < PASS_COUNT && c < 16 && m < (int)sizeof cls - 32; c++)
+            if (g_pass_draws_last[c]) m += snprintf(cls + m, sizeof cls - m, " %s=%d", k_pass_names[c], g_pass_draws_last[c]);
+        LOG("eye views: late eyes requested but inactive in %d of %d frames: %s (largest render target last frame "
+            "%ux%u fmt %u ds %d; back buffer %ux%u; draws last frame:%s)", frames - counts[LATE_APPLIED], frames, why,
+            b.w, b.h, b.fmt, b.ds ? 1 : 0, g_bb_w, g_bb_h, m ? cls : " none");
+    }
+    frames = 0;
+    memset(counts, 0, sizeof counts);
+}
 static void stereo_after_present(void) {
     StereoState &st = g_stereo;
     if (!st.on) return;
+    stereo_late_report();
     { std::lock_guard<std::mutex> hold(g_stereo_eyes_lock); g_eyes_drawing = StereoEyes(); }
     g_late_done = false;
     bool matrices_set = false;
