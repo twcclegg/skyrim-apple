@@ -1,0 +1,54 @@
+# Game-free checks on GitHub's hosted Apple Silicon runners. Nothing here needs, or may touch, game files
+# or generated code; see docs/CI.md.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  game-free:
+    name: Runtime and tooling (game-free)
+    runs-on: macos-26
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain
+        run: |
+          # cabextract: macos/directx/fetch.py takes two DLLs from Microsoft's DirectX redistributable with it.
+          for tool in ninja cabextract; do brew list $tool >/dev/null 2>&1 || brew install $tool; done
+          xcodebuild -version
+          cmake --version | head -1
+
+      - name: Cache pinned dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            macos/deps
+            macos/build/directx
+          key: deps-${{ runner.os }}-${{ hashFiles('macos/graphics/fetch_dependencies.py', 'macos/audio/build_ffmpeg.py', 'macos/audio/fetch_samples.py', 'macos/directx/fetch.py', 'macos/requirements.txt') }}
+
+      - name: Bootstrap
+        run: macos/bootstrap.sh
+
+      - name: Build runtime and tests
+        run: macos/build.sh
+
+      - name: CTest
+        # Two tests need things a hosted VM doesn't have, and pass on real Macs (and on the private runner):
+        # base_vertex_fold_smoke draws on the GPU (here "Apple Paravirtual device"), and darwin_runtime's
+        # profiler check gets no CPU samples in the VM.
+        run: ctest --test-dir macos/build/native --output-on-failure -E '^(base_vertex_fold_smoke|darwin_runtime)$'
+
+      - name: Fresh-clone build checks
+        run: python3 ipad/tests/test_public_build.py

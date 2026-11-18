@@ -56,7 +56,7 @@ def build_cov():
         for lo, hi in rs:
             cov[lo - TL:hi - TL] = b'\x01' * (hi - lo)
     for k, v in d.jump_tables.items():
-        tbl = d.decode(k).operands[0].mem.disp & 0xFFFFFFFF
+        tbl = d.jt_base[k]
         if d.in_text(tbl):
             cov[tbl - TL:tbl - TL + 4 * len(v)] = b'\x01' * (4 * len(v))
     return cov

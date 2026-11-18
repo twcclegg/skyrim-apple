@@ -59,5 +59,21 @@ target_compile_definitions(base_vertex_fold_smoke PRIVATE DXVK_NATIVE DXVK_WSI_S
 target_compile_definitions(base_vertex_fold_smoke PRIVATE SKYRIM_MOLTENVK_LIBRARY_PATH="${SKYRIM_MOLTENVK_LIBRARY}")
 target_compile_definitions(base_vertex_fold_smoke PRIVATE SKYRIM_GRAPHICS_CONFIG_PATH="${CMAKE_CURRENT_SOURCE_DIR}/probe.conf")
 set_target_properties(base_vertex_fold_smoke PROPERTIES BUILD_RPATH "${MOLTENVK_LIBRARY_DIR}")
+# The stereo experiment's clip-space offset (dxvk_stereo.h): perspective draws move; w == 1 draws, off-aspect
+# viewports (unless LB_STEREO_PASSES=all) and fixed-function draws do not. Needs a logged-in WindowServer.
+add_executable(stereo_shift_smoke stereo_shift_smoke.cpp)
+target_link_libraries(stereo_shift_smoke PRIVATE dxvk_d3d9 SDL2)
+target_compile_definitions(stereo_shift_smoke PRIVATE DXVK_NATIVE DXVK_WSI_SDL2)
+target_compile_definitions(stereo_shift_smoke PRIVATE SKYRIM_MOLTENVK_LIBRARY_PATH="${SKYRIM_MOLTENVK_LIBRARY}")
+target_compile_definitions(stereo_shift_smoke PRIVATE SKYRIM_GRAPHICS_CONFIG_PATH="${CMAKE_CURRENT_SOURCE_DIR}/probe.conf")
+set_target_properties(stereo_shift_smoke PROPERTIES BUILD_RPATH "${MOLTENVK_LIBRARY_DIR}")
+# Single-pass stereo (LB_STEREO_MULTIVIEW): one draw lands in both layers of a two-layer target with each eye's
+# offset; clears, depth and mono fallbacks per layer. Needs a logged-in WindowServer.
+add_executable(stereo_multiview_smoke stereo_multiview_smoke.cpp)
+target_link_libraries(stereo_multiview_smoke PRIVATE dxvk_d3d9 SDL2)
+target_compile_definitions(stereo_multiview_smoke PRIVATE DXVK_NATIVE DXVK_WSI_SDL2)
+target_compile_definitions(stereo_multiview_smoke PRIVATE SKYRIM_MOLTENVK_LIBRARY_PATH="${SKYRIM_MOLTENVK_LIBRARY}")
+target_compile_definitions(stereo_multiview_smoke PRIVATE SKYRIM_GRAPHICS_CONFIG_PATH="${CMAKE_CURRENT_SOURCE_DIR}/probe.conf")
+set_target_properties(stereo_multiview_smoke PROPERTIES BUILD_RPATH "${MOLTENVK_LIBRARY_DIR}")
 # GPU smoke requires a logged-in WindowServer. Invoke it explicitly; do not
 # automatically launch a window as a side effect of ordinary source checks.

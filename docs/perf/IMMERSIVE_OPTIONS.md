@@ -118,11 +118,14 @@ Two lines report GPU cost on the headset. Neither had ever been read from a head
 - `immersive cadence: N game frames over 900 refreshes; held 1: …; replaced unseen: U; game gpu latency mean X ms,
   max Y ms`, every 900 refreshes, from `ipad/immersive_bridge.mm`. The latency is the time from the game handing a
   frame to the tap (inside Present) to the first compositor refresh that finds it finished. It is an upper bound
-  on the game frame's GPU time: it includes the GPU working through the compositor's own queued work, and is
-  rounded up to the next refresh (about 11 ms at 90 Hz). Frames pushed out of a full mailbox before any refresh
-  polled them are not counted. The suffix is absent when no frame was observed in the window.
+  on the game frame's GPU time: it also includes DXVK's command thread recording and submitting the frame (the
+  tap fires on the game thread as soon as the frame is queued to that thread, before its commands reach the GPU),
+  the GPU working through the compositor's own queued work, and rounding up to the next refresh (about 11 ms at
+  90 Hz). Frames pushed out of a full mailbox before any refresh polled them are not counted. The suffix is absent
+  when no frame was observed in the window.
 
-Read them together: if the game latency is far above the compositor's GPU time, the game is the one that is slow.
+Read them together: if the game latency is far above the compositor's GPU time, the game's frame is the slow part,
+on the GPU or on DXVK's command thread; the line alone does not say which.
 
 ## Live stereo switches (headset session stereo-1)
 
