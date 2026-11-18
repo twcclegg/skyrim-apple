@@ -1,0 +1,85 @@
+{
+ "description": "VR180 capture session for tools/stereo_capture.py (one location). The game clock is scripted by LB_VR180, so nothing is slowed with sgtm; tm hides the HUD. LB_STEREO_PASSES=size keeps DXVK's eye offset off square shadow maps, so the face size (the save folder's iSize, see max_prefs.py) must differ from iShadowMapResolution (4096): use 4032.",
+ "eye_units": 2.24,
+ "units_per_metre": 70,
+ "env": {
+  "LB_VPAD": "0",
+  "LB_STEREO_PASSES": "size"
+ },
+ "game_files": {
+  "stereoequip.txt": [
+   "tgm",
+   "player.additem 00012EB7 1",
+   "player.equipitem 00012EB7"
+  ],
+  "stereoflame.txt": [
+   "tgm",
+   "player.additem 00012EB7 1",
+   "player.equipitem 00012EB7",
+   "player.addspell 00012FCD",
+   "player.equipspell 00012FCD left",
+   "player.setangle z 90",
+   "player.setangle x 12"
+  ],
+  "stereofreeze.txt": [
+   "tm"
+  ]
+ },
+ "locations": [
+  {
+   "name": "flame180",
+   "description": "Riverwood flame-in-hand for a stereo 180-degree video: Flames readied in the left hand, iron sword in the right, facing the river. LB_VR180 renders blocks of 16 frames from frame 3150 (see runtime/d3d9_bridge.cpp); the triplet only gives tools/stereo_capture.py an end point and must come after the last block.",
+   "timeline": [
+    {
+     "at": 600,
+     "console": "coc riverwood",
+     "close": false
+    },
+    {
+     "at": 2400,
+     "console": "bat stereoflame"
+    },
+    {
+     "at": 2650,
+     "key": "R",
+     "frames": 4
+    },
+    {
+     "at": 2850,
+     "console": "bat stereofreeze"
+    }
+   ],
+   "triplets": [
+    5100
+   ],
+   "exit_frame": 5130,
+   "crops": {
+    "hands": [
+     0.45,
+     0.45,
+     0.55,
+     0.55
+    ],
+    "flame": [
+     0.0,
+     0.45,
+     0.45,
+     0.55
+    ],
+    "water": [
+     0.2,
+     0.35,
+     0.6,
+     0.3
+    ],
+    "foliage": [
+     0.0,
+     0.2,
+     0.5,
+     0.35
+    ]
+   },
+   "vr180": "LB_VR180=3150:120:1.1 (120 blocks = 5 s at 24 fps, frames 3150-5069)"
+  }
+ ]
+}

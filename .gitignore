@@ -77,3 +77,7 @@ __pycache__/
 .DS_Store
 # Benchmark runs (tools/bench): logs and screenshots of private game files
 /bench-results/
+# Fetched dependencies (tools/fetch_sdl.py); third_party/dxvk is a git submodule
+/third_party/SDL2/
+/third_party/sdlinc/
+/third_party/downloads/

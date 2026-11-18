@@ -128,7 +128,7 @@ have noticeably less GPU, and the system compositor and passthrough also take pa
   overlay's attach loop and the shim's `SDLXR_ActiveScene` currently match any scene). Check that
   opening a Full Space doesn't fire `UIApplicationWillResignActive` (which suspends the game).
 - Slot handoff: the tap callback fills a one-entry mailbox (replacing = release); the compositor takes
-  it only when `skyrim_present_tap_ready` says the GPU is done, else re-presents the current slot.
+  it only when `dxvk_present_tap_ready` says the GPU is done, else re-presents the current slot.
   Retired slots are released from the completion handler of the first command buffer that no longer
   samples them. Sample through a `.bgra8Unorm_srgb` texture view (the tap image is UNORM holding sRGB
   values); force alpha 1; no vertical flip.
