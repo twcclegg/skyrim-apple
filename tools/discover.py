@@ -75,6 +75,7 @@ for imp in getattr(pe, "DIRECTORY_ENTRY_IMPORT", []):
         iat[e.address] = imp.dll.decode() + "!" + name
 
 jump_tables = {}
+jt_base = {}  # insn_addr -> first byte of its table (below the displacement for tables indexed from their end)
 NORETURN = {"_CxxThrowException", "abort", "exit", "_exit", "_amsg_exit", "ExitProcess", "_invoke_watson"}
 
 
@@ -139,6 +140,17 @@ def find_table_bound(prev_insns, reg):
     return None
 
 
+def negated_index(prev_insns, reg):
+    """True if `neg reg` lies between the bounding `cmp reg, imm` and the jump."""
+    for p in reversed(prev_insns):
+        if p.id == x86.X86_INS_NEG and p.operands[0].type == x86.X86_OP_REG and p.reg_name(p.operands[0].reg) == reg:
+            return True
+        if p.id in (x86.X86_INS_CMP, x86.X86_INS_AND) and len(p.operands) == 2 and \
+                p.operands[0].type == x86.X86_OP_REG and p.reg_name(p.operands[0].reg) == reg:
+            return False
+    return False
+
+
 def explore_function(start):
     """Return dict of blocks, or None if decoding fails."""
     blocks = {}
@@ -147,11 +159,13 @@ def explore_function(start):
     calls = set()
     seen_insn = {}
     carry = {}  # fallthrough of a conditional jump keeps the history (switch bounds)
+    below = {}  # target of `cmp reg, N` / `jb`: the history, and there reg < N
     while work:
         a = work.popleft()
         if a in seen_insn:
             continue
-        prev = carry.pop(a, [])
+        via_jb = a in below and a not in carry
+        prev = carry.pop(a, None) or below.pop(a, [])
         while True:
             if a in seen_insn:
                 break
@@ -195,14 +209,33 @@ def explore_function(start):
                             leaders.add(t2)
                             work.append(t2)
                     carry.setdefault(nxt, list(prev))
+                    if i.id == x86.X86_INS_JB and len(prev) >= 2 and prev[-2].id == x86.X86_INS_CMP:
+                        below.setdefault(t, list(prev))
                     break
                 if op.type == x86.X86_OP_MEM and op.mem.base == 0 and op.mem.scale == 4 \
                         and op.mem.index != 0:
                     reg = i.reg_name(op.mem.index)
-                    n = find_table_bound(prev, reg)
+                    hist = prev
+                    n = None
+                    jbs = [x for x, q in enumerate(prev) if q.id == x86.X86_INS_JB] if via_jb else []
+                    if jbs and jbs[-1] >= 1:
+                        # This block is the target of `cmp reg, N` / `jb`: the index is below N. Only the
+                        # block's own instructions count after that (a later cmp or and re-bounds it).
+                        c, hist = prev[jbs[-1] - 1], prev[jbs[-1] + 1:]
+                        n = find_table_bound(hist, reg)
+                        if n is None and c.operands[0].type == x86.X86_OP_REG and \
+                                c.operands[1].type == x86.X86_OP_IMM and c.reg_name(c.operands[0].reg) == reg:
+                            n = c.operands[1].imm
+                    else:
+                        # (when the jb has left the 8-instruction history, prev holds only this block's own)
+                        n = find_table_bound(prev, reg)
                     tbl = op.mem.disp & 0xFFFFFFFF
                     targets = []
                     k = 0
+                    if n is not None and 0 < n <= 1024 and negated_index(hist, reg):
+                        # `cmp reg, N` / `neg reg` (memmove's backward copy): the index is -(N-1)..0, so
+                        # the table ends at the displacement instead of starting there
+                        tbl -= 4 * (n - 1)
                     while (n is None or k < n) and k < 1024:
                         t = u32(tbl + 4 * k)
                         k += 1
@@ -211,7 +244,16 @@ def explore_function(start):
                                 break
                             continue  # bounded table: index may never be this value
                         targets.append(t)
+                    if n is None and not targets:
+                        # No bound and nothing at the displacement: the index is negative (`sub reg, 4` /
+                        # `jb` to this jump in memcpy), so the table lies below it.
+                        k = 0
+                        while k < 64 and in_text(u32(tbl - 4 * (k + 1))):
+                            k += 1
+                            targets.append(u32(tbl - 4 * k))
+                        tbl -= 4 * k
                     jump_tables[i.address] = targets
+                    jt_base[i.address] = tbl
                     jt_ranges.append((tbl, tbl + 4 * k))
                     for t in targets:
                         if t not in leaders:
@@ -350,8 +392,7 @@ def main():
     # fixed point; jump-table data inside .text is excluded.
     table_bytes = set()
     for k, v in jump_tables.items():
-        i = decode(k)
-        tbl = i.operands[0].mem.disp & 0xFFFFFFFF
+        tbl = jt_base[k]
         table_bytes.update(range(tbl, tbl + 4 * len(v)))
     def coverage():
         cov = bytearray(TEXT_HI - TEXT_LO)
@@ -415,7 +456,7 @@ def main():
                         for y in range(x, x + decode(x).size):
                             cov[y - TEXT_LO] = 1
                 for k, v in jump_tables.items():
-                    tbl = decode(k).operands[0].mem.disp & 0xFFFFFFFF
+                    tbl = jt_base[k]
                     for y in range(tbl, tbl + 4 * len(v)):
                         if in_text(y):
                             table_bytes.add(y)
