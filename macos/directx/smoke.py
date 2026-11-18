@@ -60,7 +60,9 @@ def main():
     native = ROOT / "macos/build/native"
     runtime = sorted((native / "CMakeFiles/skyrim_runtime.dir").rglob("*.o"))
     entry = sorted((native / "CMakeFiles/skyrim_entry.dir").rglob("*.o"))
-    expected_runtime = len(list((ROOT / "runtime").glob("*.c"))) + len(list((ROOT / "runtime").glob("*.cpp"))) - 1
+    # every runtime source but main.c and the native replacements (skyrim_native*.c link with the game only)
+    expected_runtime = (len(list((ROOT / "runtime").glob("*.c"))) + len(list((ROOT / "runtime").glob("*.cpp"))) - 1
+                        - len(list((ROOT / "runtime").glob("skyrim_native*.c"))))
     if len(runtime) != expected_runtime or len(entry) != 1:
         parser.error(f"Build the real macOS runtime first; found {len(runtime)} runtime objects, {len(entry)} entry objects")
     objects = []

@@ -25,7 +25,7 @@ with tempfile.TemporaryDirectory(prefix="skyrim-host-runtime-") as temporary:
     result = subprocess.run([str(binary), str(work)], text=True, capture_output=True, check=True)
     print(result.stdout, end="")
     print(result.stderr, end="")
-    samples = re.search(r"profile: (\d+) samples", result.stderr)
+    samples = re.search(r"profile(?:, all threads)?: (\d+) samples", result.stderr)
     cpu = re.search(r"cpu: (\d+)% of one core", result.stderr)
     if samples is None or int(samples[1]) == 0 or cpu is None or int(cpu[1]) == 0:
         raise SystemExit("Actual Darwin profiler did not report CPU samples and thread time.")
