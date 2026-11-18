@@ -496,6 +496,11 @@ def execute(scenario, args):
     print(f"bench: results in {out}")
     if not exited:
         print("bench: WARNING the run didn't reach its exit frame; don't compare it", file=sys.stderr)
+    if os.environ.get("BENCH_IMMERSIVE") and not isinstance(target, Mac) and "immersive:" not in log_path.read_text(errors="replace"):
+        summary["meta"]["not_immersive"] = True
+        (out / "summary.json").write_text(json.dumps(summary, indent=2))
+        print("bench: WARNING BENCH_IMMERSIVE was set but the log has no immersive: lines; the game ran without the "
+              "immersive space, so this is not a stereo run", file=sys.stderr)
     if paging and paging["swapins"] + paging["swapouts"] > 1024:
         print(f"bench: WARNING the Mac swapped {paging['swapins']} MB in and {paging['swapouts']} MB out during the "
               "run; memory pressure slows everything, so check this run before comparing it", file=sys.stderr)

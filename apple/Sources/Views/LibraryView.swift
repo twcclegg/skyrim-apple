@@ -261,7 +261,20 @@ struct LibraryView: View {
                 .task {
                     guard LauncherModel.benchImmersive, !LauncherModel.benchImmersiveStarted else { return }
                     LauncherModel.benchImmersiveStarted = true
-                    if case .opened = await openImmersiveSpace(id: ImmersiveScreen.spaceID) { startPlay() }
+                    // A bench run asked for the immersive space: say what happened, and retry a few times (it can
+                    // fail while another space or the previous run's is still closing). Never fall back to the flat
+                    // window, which would give a run that looks fine but measures something else.
+                    for attempt in 1...4 {
+                        let result = await openImmersiveSpace(id: ImmersiveScreen.spaceID)
+                        if case .opened = result {
+                            fputs("bench: immersive space opened (attempt \(attempt))\n", stderr)
+                            startPlay()
+                            return
+                        }
+                        fputs("bench: immersive space did not open (attempt \(attempt)): \(result)\n", stderr)
+                        try? await Task.sleep(for: .seconds(2))
+                    }
+                    fputs("bench: giving up on the immersive space; the game is not started\n", stderr)
                 }
             }
             #endif
