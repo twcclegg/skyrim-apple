@@ -30,7 +30,8 @@ follow "start in a window, then expand into immersive play" with one running gam
   backend depends on `UIScreen`, which visionOS lacks). The overlay adds
   `ipad/visionos/sdl/SDL_uikit_xros.{h,m}`: a single display whose size and scale come from the
   app's window scene, and no-op status bar and orientation calls. Only the overlay copy in the
-  ignored build tree changes; the vendored source and the iOS overlay do not.
+  ignored build tree changes; the fetched SDL release (`third_party/SDL2`, from
+  `tools/fetch_sdl.py`) and the iOS overlay do not.
 - `ipad/prepare_moltenvk.py --sdk xros`: the same MoltenVK v1.4.2 release's `MoltenVK-all.tar`
   carries a static `xros-arm64` slice (pinned to the GitHub asset digest).
 - `ipad/build_ffmpeg.py --sdk xros`: the same FFmpeg 7.1.2 WMA decoders, `arm64-apple-xros26.5`.

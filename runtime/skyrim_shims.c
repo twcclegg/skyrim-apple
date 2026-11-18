@@ -113,6 +113,36 @@ static const char *ini_find(IniFile *f, const char *sec, const char *key) {
     return NULL;
 }
 
+/* LB_INI="Section:key=value;Section:key=value": values the game reads instead of its INI files' (any of them), for
+ * benchmarking one setting at a time without editing the player's files. Each override is logged once, when the
+ * game first reads it. */
+#define INI_OVERRIDES 32
+static struct { char sec[64], key[64], val[64]; int logged; } g_ini_over[INI_OVERRIDES];
+static int g_ini_nover = -1;
+static const char *ini_override(const char *sec, const char *key) {
+    if (g_ini_nover < 0) {
+        g_ini_nover = 0;
+        const char *e = getenv("LB_INI");
+        while (e && *e && g_ini_nover < INI_OVERRIDES) {
+            const char *end = strchr(e, ';'), *colon = strchr(e, ':'), *eq = strchr(e, '=');
+            if (!end) end = e + strlen(e);
+            if (colon && eq && colon < eq && eq < end) {
+                snprintf(g_ini_over[g_ini_nover].sec, 64, "%.*s", (int)(colon - e), e);
+                snprintf(g_ini_over[g_ini_nover].key, 64, "%.*s", (int)(eq - colon - 1), colon + 1);
+                snprintf(g_ini_over[g_ini_nover].val, 64, "%.*s", (int)(end - eq - 1), eq + 1);
+                g_ini_nover++;
+            }
+            e = *end ? end + 1 : end;
+        }
+    }
+    for (int i = 0; i < g_ini_nover; i++)
+        if (!strcasecmp(g_ini_over[i].sec, sec) && !strcasecmp(g_ini_over[i].key, key)) {
+            if (!g_ini_over[i].logged++) LOG("ini: LB_INI sets [%s] %s=%s", sec, key, g_ini_over[i].val);
+            return g_ini_over[i].val;
+        }
+    return NULL;
+}
+
 /* Copies a double-NUL list or a string into a guest buffer, Windows style:
  * returns chars written excluding the final NUL; truncates to size-1 (or
  * size-2 for lists). */
@@ -162,7 +192,8 @@ SHIM(GetPrivateProfileStringA) {
         r = put_str(buf, size, tmp, len + 1, 1);
         free(tmp);
     } else {
-        const char *v = f ? ini_find(f, app, key) : NULL;
+        const char *v = ini_override(app, key);
+        if (!v) v = f ? ini_find(f, app, key) : NULL;
         if (!v) v = def ? def : "";
         r = put_str(buf, size, v, strlen(v), 0);
     }
@@ -174,7 +205,8 @@ SHIM(GetPrivateProfileStringA) {
 SHIM(GetPrivateProfileIntA) {
     pthread_mutex_lock(&g_ini_lock);
     IniFile *f = ini_get(GSTR(ARG(3)));
-    const char *v = f && ARG(0) && ARG(1) ? ini_find(f, GSTR(ARG(0)), GSTR(ARG(1))) : NULL;
+    const char *v = ARG(0) && ARG(1) ? ini_override(GSTR(ARG(0)), GSTR(ARG(1))) : NULL;
+    if (!v) v = f && ARG(0) && ARG(1) ? ini_find(f, GSTR(ARG(0)), GSTR(ARG(1))) : NULL;
     uint32_t r = v ? (uint32_t)strtol(v, NULL, 10) : ARG(2);
     pthread_mutex_unlock(&g_ini_lock);
     RET(r, 4);
@@ -435,8 +467,28 @@ static void ini_set(IniFile *f, const char *sec, const char *key, const char *va
 void skyrim_seed_prefs(int w, int h) {
     const char *prefs = "C:\\Users\\Player\\Documents\\My Games\\Skyrim\\SkyrimPrefs.ini";
     char host[1024];
-    /* An existing file is kept (the player's settings), unless LB_PRESET asks for a preset. */
-    if (rt_host_path(prefs, host, sizeof host) && !(getenv("LB_PRESET") && *getenv("LB_PRESET"))) return;
+    /* An existing file is kept (the player's settings), unless LB_PRESET asks for a preset. An explicit LB_WINDOW
+     * still sets the render size in it: the game renders at iSize W x iSize H whatever the window is, so without
+     * this the size of the first run stuck (the headset kept 1280x720 with LB_WINDOW=1920x1080). */
+    if (rt_host_path(prefs, host, sizeof host) && !(getenv("LB_PRESET") && *getenv("LB_PRESET"))) {
+        const char *win = getenv("LB_WINDOW");
+        int ww = 0, wh = 0;
+        if (win && sscanf(win, "%dx%d", &ww, &wh) == 2 && ww >= 320 && wh >= 200) {
+            w = ww;
+            h = wh;
+            pthread_mutex_lock(&g_ini_lock);
+            IniFile *f = ini_get(prefs);
+            char v[16];
+            snprintf(v, sizeof v, "%d", w);
+            ini_set(f, "Display", "iSize W", v);
+            snprintf(v, sizeof v, "%d", h);
+            ini_set(f, "Display", "iSize H", v);
+            ini_save(f);
+            pthread_mutex_unlock(&g_ini_lock);
+            LOG("prefs: render size %dx%d (LB_WINDOW) in %s", w, h, host);
+        }
+        return;
+    }
     pthread_mutex_lock(&g_ini_lock);
     IniFile *f = ini_get(prefs);
     char low[1024];
