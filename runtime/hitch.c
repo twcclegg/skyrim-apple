@@ -35,7 +35,9 @@ static struct { uintptr_t fn; uint32_t hits; } g_funcs[HITCH_FUNCS];
 static uint32_t g_func_samples, g_hitches;
 
 static double g_threshold_ms;
-static mach_port_t g_thread;
+/* The thread that presented last. Skyrim can present from more than one thread (the first frames can come from
+ * another thread than the game loop's), so it is updated on every frame rather than fixed at the first one. */
+static _Atomic mach_port_t g_thread;
 static _Atomic uint64_t g_frame_start_ns;
 static _Atomic int g_frame_no;
 
@@ -91,7 +93,7 @@ static void sample(int others) {
     mach_port_t self = mach_thread_self();
     for (mach_msg_type_number_t i = 0; i < count; i++) {
         mach_port_t th = threads[i];
-        int main = th == g_thread;
+        int main = th == atomic_load(&g_thread);
         if (th != self && !main && !others) th = MACH_PORT_NULL;
         else if (th != self && !main) {
             thread_basic_info_data_t info;
@@ -222,13 +224,13 @@ void hitch_frame(void) {
         init = v && atof(v) > 0;
         if (!init) return;
         g_threshold_ms = atof(v);
-        g_thread = pthread_mach_thread_np(pthread_self());
         pthread_t th;
         pthread_create(&th, NULL, hitch_thread, NULL);
         pthread_detach(th);
         LOG("hitch: sampling frames longer than %.0f ms", g_threshold_ms);
     }
     if (!init) return;
+    atomic_store(&g_thread, pthread_mach_thread_np(pthread_self()));
     atomic_store(&g_frame_start_ns, now_ns());
     atomic_fetch_add(&g_frame_no, 1);
 }
