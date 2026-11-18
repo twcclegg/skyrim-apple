@@ -164,8 +164,8 @@ default to two to avoid occupying the host with unrestricted parallel builds.
 ## Launchers (paused)
 
 Launcher work is paused by the owner. The [single-title macOS
-launcher](launcher/README.md), the shared SwiftUI launcher in `apple/` and the
-Vision Pro launcher in `vision/` have had no launcher, phone or device testing
+launcher](launcher/README.md) and the shared SwiftUI launcher in `apple/` have
+had no launcher, phone or device testing
 since 2026-11-01T10:48Z (N1), and none of the game results above went through
 them. Play from a launcher has not started the game. The one launcher piece in
 use is the command-line bridge, `macos/launcher/bridge.py`, whose `status` and
