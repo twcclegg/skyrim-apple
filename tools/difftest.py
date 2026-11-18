@@ -2,6 +2,10 @@
 
 Usage: difftest.py LEGOBatman.exe functions.json workdir [max_per_shape]
 
+With DIFFTEST_PINNED=1 in the environment (arm64 only) the lifted snippets are built the way LB_PINNED_REGS
+builds the game: guest registers in x21-x28, -O2, the three unsafe LLVM passes off, entry through a
+trampoline like rt_enter_guest. The result should equal the default run's.
+
 Harvests one or more samples of every distinct instruction shape the game
 uses, wraps each in a snippet that loads known register/x87/SSE/MMX state
 and stores the results, lifts the snippets with lift.py, runs them natively
@@ -236,6 +240,23 @@ uint64_t rt_rdtsc(void) { return 0; }
 jmp_buf *rt_setjmp_slot(CPU *c, uint32_t g) { static jmp_buf jb; (void)c; (void)g; return &jb; }
 void rt_setjmp3(CPU *c) { (void)c; }
 #include "tests.inc"
+#if defined(LB_PINNED)
+/* Same hand-over as rt_enter_guest (runtime/dispatch.c): lifted code expects the guest registers in x21-x28. */
+__attribute__((naked, noinline)) static void enter_guest(CPU *c, void (*fn)(CPU *)) {
+    __asm__("stp x29, x30, [sp, #-96]!\n" "mov x29, sp\n"
+            "stp x19, x20, [sp, #16]\n" "stp x21, x22, [sp, #32]\n" "stp x23, x24, [sp, #48]\n"
+            "stp x25, x26, [sp, #64]\n" "stp x27, x28, [sp, #80]\n"
+            "mov x19, x0\n"
+            "ldp w21, w22, [x0]\n" "ldp w23, w24, [x0, #8]\n" "ldp w25, w26, [x0, #16]\n" "ldp w27, w28, [x0, #24]\n"
+            "blr x1\n"
+            "stp w21, w22, [x19]\n" "stp w23, w24, [x19, #8]\n" "stp w25, w26, [x19, #16]\n" "stp w27, w28, [x19, #24]\n"
+            "ldp x19, x20, [sp, #16]\n" "ldp x21, x22, [sp, #32]\n" "ldp x23, x24, [sp, #48]\n"
+            "ldp x25, x26, [sp, #64]\n" "ldp x27, x28, [sp, #80]\n"
+            "ldp x29, x30, [sp], #96\n" "ret\n");
+}
+#else
+static void enter_guest(CPU *c, void (*fn)(CPU *)) { fn(c); }
+#endif
 /* A fault inside one test (on macOS, an atomic access to an unaligned address raises SIGBUS) is that test's
  * result, not the end of the run. */
 static void on_fault(int sig) { g_why = sig == SIGBUS ? "SIGBUS" : "SIGSEGV"; siglongjmp(g_jb, 1); }
@@ -259,7 +280,7 @@ int main(int argc, char **argv) {
         printf("T %u", id);
         g_why = NULL;
         if (sigsetjmp(g_jb, 1)) { printf(" TRAP %s\n", g_why); continue; }
-        g_tests[id](&c);
+        enter_guest(&c, g_tests[id]);
         for (int r = 0; r < 8; r++) printf(" %08x", r == 4 ? c.r[r] - 4 : c.r[r]);
         printf(" |");
         for (int o = 0x100; o < 0x200; o += 4) printf(" %08x", *(uint32_t *)(MEM + 0x0F000000u + o));
@@ -408,8 +429,18 @@ def main():
     open(os.path.join(WORK, "harness.c"), "w").write(HARNESS)
     rt = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "runtime")
     exe = os.path.join(WORK, "harness")
-    subprocess.check_call(["gcc", "-O1", "-w", "-I", rt, "-I", WORK, "-o", exe,
-                           os.path.join(WORK, "harness.c"), os.path.join(rt, "fpu.c"), "-lm"])
+    flags = ["-O1"]
+    if os.environ.get("DIFFTEST_PINNED") == "1":
+        flags = ["-O2", "-DLB_PINNED"] + ["-ffixed-x%d" % n for n in range(21, 29)] + [
+            "-mllvm", "-disable-postra-machine-licm", "-mllvm", "-disable-early-ifcvt",
+            "-mllvm", "-aarch64-enable-ccmp=false"]
+    # The runtime is built the way the game builds it: without the reserved registers and the
+    # pass-disabling flags, which belong to the lifted code only.
+    fpu = os.path.join(WORK, "fpu.o")
+    rt_flags = ["-O2", "-DLB_PINNED"] if "-DLB_PINNED" in flags else ["-O1"]
+    subprocess.check_call(["gcc", *rt_flags, "-w", "-I", rt, "-c", os.path.join(rt, "fpu.c"), "-o", fpu])
+    subprocess.check_call(["gcc", *flags, "-w", "-I", rt, "-I", WORK, "-o", exe,
+                           os.path.join(WORK, "harness.c"), fpu, "-lm"])
     with open(os.path.join(WORK, "input.bin"), "wb") as f:
         f.write(struct.pack("<II", len(ok), len(pages)))
         f.write(scr)
