@@ -18,5 +18,6 @@ ABI = {
         "if (rnd() % 4 == 0) { lo = (int32_t)(rnd() % n); hi = (int32_t)(rnd() % n); } "
         "c->r[1] = obj; M32(esp + 4) = (uint32_t)lo; M32(esp + 8) = (uint32_t)hi;",
         # the guest's frames and those of its recursive calls (32 bytes each), all below the stack pointer
-        "memset(MEM + esp - 0x3000, 0, 0x3000);"),
+        "memset(MEM + esp - 0x3000, 0, 0x3000);",
+        STRICT),  # ecx, edx and the XMM registers are compared too (see native_test.py)
 }
