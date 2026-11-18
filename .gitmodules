@@ -1,0 +1,4 @@
+[submodule "third_party/dxvk"]
+	path = third_party/dxvk
+	url = https://github.com/twcclegg/dxvk-native.git
+	branch = skyrim-apple
