@@ -67,4 +67,7 @@ On an Apple Silicon Mac, as a dedicated standard (non-admin) user:
 
 - **Settings → Actions → General → Fork pull request workflows:** "Require approval for all outside
   collaborators". Required once a runner is registered: without it, a fork's pull request can edit `ci.yml` to
-  run on the private runner (see above).
+  run on the private runner (see above). Set on twcclegg/skyrim-apple on 2026-11-18. Never approve a workflow
+  run from anyone else's fork or pull request.
+- **The job itself** runs only in `twcclegg/skyrim-apple`, only for a push or a manual run, and only when
+  `twcclegg` both caused and triggered the run (`full-build.yml`).

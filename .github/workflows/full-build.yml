@@ -21,7 +21,14 @@ jobs:
   full:
     name: Generated code, macOS game, visionOS engine and app
     # Opt-in per repository: set the Actions variable SKYRIM_PRIVATE_RUNNER to true once a runner is registered.
-    if: vars.SKYRIM_PRIVATE_RUNNER == 'true'
+    # Also only in this repository, and only for runs the owner started (a push or a manual run as twcclegg).
+    # Pull requests from forks run their own copy of the workflow files, so this check alone can't keep them off
+    # the runner: the repository requires approval for every outside contributor's workflow run, and those
+    # approvals must not be given (docs/CI.md).
+    if: >-
+      vars.SKYRIM_PRIVATE_RUNNER == 'true' && github.repository == 'twcclegg/skyrim-apple' &&
+      github.actor == 'twcclegg' && github.triggering_actor == 'twcclegg' &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
     runs-on: [self-hosted, macOS, ARM64, skyrim-private]
     timeout-minutes: 240
     env:
