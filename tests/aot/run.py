@@ -176,9 +176,15 @@ def main() -> int:
     env.update({"LIFT_GAME": "skyrim", "LIFT_FILES": "2", "LIFT_TSO": "1",
                 "LIFT_HOST_OVERRIDES": f"{symbols['ovr_target']:X}"})
     if args.discover:
+        # The fixture's import slots (host round trip, _setjmp3, longjmp) lie outside the PE image, so discovery
+        # writes an empty iat; keep the authored one, or `call [slot]` reads 0.
+        authored_iat = json.loads(function_map.read_text()).get("iat", {})
         discovered = command([sys.executable, str(ROOT / "tools/discover.py"), str(pe), str(function_map)], env=env)
         (output / "discovery.log").write_text(discovered.stdout + discovered.stderr)
-        found = json.loads(function_map.read_text())["functions"]
+        mapped = json.loads(function_map.read_text())
+        mapped["iat"] = {**authored_iat, **mapped.get("iat", {})}
+        function_map.write_text(json.dumps(mapped, indent=2) + "\n")
+        found = mapped["functions"]
         missing = sorted(set(symbols.values()) - {int(address, 16) for address in found})
         if missing:
             raise RuntimeError(f"authored function roots not found by actual discovery: {missing}")
