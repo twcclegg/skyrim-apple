@@ -14,4 +14,15 @@ __attribute__((noinline, used)) void *memmove(void *d, const void *s, size_t n) 
     uint8_t *a = d; const uint8_t *b = s;
     if (a < b) while (n--) *a++ = *b++; else { a += n; b += n; while (n--) *--a = *--b; } return d; }
 uint32_t test_main(uint32_t a, uint32_t b);
+/* x86 calling conventions: clang rejects regparm outright on other targets (the host check builds the same
+ * source natively), and warns about stdcall and fastcall. Programs use these instead. */
+#ifdef __i386__
+#define X86_STDCALL __attribute__((stdcall))
+#define X86_FASTCALL __attribute__((fastcall))
+#define X86_REGPARM(n) __attribute__((regparm(n)))
+#else
+#define X86_STDCALL
+#define X86_FASTCALL
+#define X86_REGPARM(n)
+#endif
 #endif
