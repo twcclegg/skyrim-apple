@@ -1,5 +1,5 @@
 {
-  "description": "Headset version of the M1 scenario: coc riverwood (one console command; a second arrives garbled), stand 10 s (idle), then run forward (run). FRAME NUMBERS ARE PLACEHOLDERS until `bench.py calibrate --device <udid>` shows when the main menu is up on the headset and how long the load takes; shift console_at, the phases, the keys, the shots and exit_frame together.",
+  "description": "Headset version of the M1 scenario: coc riverwood (one console command; a second arrives garbled), stand 10 s (idle), then run forward (run). FRAME NUMBERS ARE PLACEHOLDERS until `bench.py calibrate --device <udid>` shows when the main menu is up on the headset and how long the load takes; shift console_at, the phases, the keys, the shots and exit_frame together. At frame 3100 the console is reopened for `bat benchwx` (benchwx.txt: fw then sw 0000081A, SkyrimClear), so every run has the same clear sky, as in the Mac scenarios: the region's weather is otherwise picked at random per run, and overcast runs draw about 57 more effect draws per frame (measured in Riverwood on the M5). On the headset the coc load's long frames end by frame 2030 (2026-11-10 runs), and the batch is typed, run and closed by frame 3218, well before the first measured phase. LB_VPAD=0 so the A in `bat` is typed rather than pressed as stick-left (see boss-fight-mac); the scripted keys here are keyboard keys, which work without the virtual pad.",
   "console_at": 1800,
   "console": [
     "coc riverwood"
@@ -29,5 +29,20 @@
     4190,
     5390
   ],
-  "exit_frame": 5500
+  "exit_frame": 5500,
+  "env": {
+    "LB_VPAD": "0"
+  },
+  "game_files": {
+    "benchwx.txt": [
+      "fw 0000081A",
+      "sw 0000081A"
+    ]
+  },
+  "console_later": [
+    {
+      "at": 3100,
+      "command": "bat benchwx"
+    }
+  ]
 }
