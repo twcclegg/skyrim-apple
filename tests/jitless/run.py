@@ -15,6 +15,8 @@ import shutil
 import subprocess
 import sys
 
+AOT_FIXTURES = 21  # tests/aot/harness.c cases; raise it with the harness
+
 ROOT = Path(__file__).resolve().parents[2]
 FORBIDDEN_ENTITLEMENTS = {
     "com.apple.security.cs.allow-jit",
@@ -117,7 +119,7 @@ def main():
     aot = copy_and_sign(aot_source, aot_copy)
     aot["run"] = command([aot_copy])
     aot["observed"] = last_json(aot["run"]["stdout"])
-    if aot["observed"] != {"passed": 16, "total": 16}:
+    if aot["observed"] != {"passed": AOT_FIXTURES, "total": AOT_FIXTURES}:
         raise ValueError("Unexpected AOT fixture coverage/result")
     aot["negative"] = {}
     for name, expected in aot_receipt["negative_tests"].items():
