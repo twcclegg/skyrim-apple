@@ -47,8 +47,9 @@ jobs:
       - name: CTest
         # Two tests need things a hosted VM doesn't have, and pass on real Macs (and on the private runner):
         # base_vertex_fold_smoke draws on the GPU (here "Apple Paravirtual device"), and darwin_runtime's
-        # profiler check gets no CPU samples in the VM.
-        run: ctest --test-dir macos/build/native --output-on-failure -E '^(base_vertex_fold_smoke|darwin_runtime)$'
+        # profiler check gets no CPU samples in the VM. audio_device_recovery is timing-sensitive and fails now and
+        # then on the shared VM (#55); it passes on real Macs.
+        run: ctest --test-dir macos/build/native --output-on-failure -E '^(base_vertex_fold_smoke|darwin_runtime|audio_device_recovery)$'
 
       - name: Fresh-clone build checks
         run: python3 ipad/tests/test_public_build.py
