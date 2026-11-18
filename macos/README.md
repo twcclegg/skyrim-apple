@@ -114,7 +114,11 @@ the [Simulator notes](../simulator/README.md) for commands and details.
   `depth_compare_smoke` checks the Apple shadow-compare path (PCF ramp,
   projected lookups, point step, reference clamp). `base_vertex_fold_smoke
   --compare` draws natively and with the Simulator's base-vertex fold forced
-  and requires identical pixels.
+  and requires identical pixels. `stereo_shift_smoke` (and
+  `stereo_shift_smoke_passes_all`, with `LB_STEREO_PASSES=all`) checks DXVK's
+  stereo clip-space offset: perspective draws move by the expected pixels and
+  keep the documented depth, w == 1 draws and off-aspect viewports do not move,
+  and the fixed-function gap is reported as INFO.
 - Authored PE32 test instructions pass actual recursive discovery, C generation,
   native compilation and expected-result checks. These include calls, integer
   flags, unaligned memory, SSE, x87, atomic operations and Windows FS-relative
@@ -164,8 +168,8 @@ default to two to avoid occupying the host with unrestricted parallel builds.
 ## Launchers (paused)
 
 Launcher work is paused by the owner. The [single-title macOS
-launcher](launcher/README.md), the shared SwiftUI launcher in `apple/` and the
-Vision Pro launcher in `vision/` have had no launcher, phone or device testing
+launcher](launcher/README.md) and the shared SwiftUI launcher in `apple/` have
+had no launcher, phone or device testing
 since 2026-11-01T10:48Z (N1), and none of the game results above went through
 them. Play from a launcher has not started the game. The one launcher piece in
 use is the command-line bridge, `macos/launcher/bridge.py`, whose `status` and
@@ -385,7 +389,7 @@ Without a DualSense the game keeps its PC keyboard-and-mouse interface.
 
 ### Verification switches
 
-Each is off unless set, except the 60 fps pacing. On the Mac, set them in the
+Each is off unless set, except the 60 fps pacing and the first-person depth. On the Mac, set them in the
 environment of `macos/run.sh`; in the Simulator, pass them with
 `run_game.py --env KEY=VALUE`.
 
@@ -399,6 +403,9 @@ environment of `macos/run.sh`; in the Simulator, pass them with
 | `LB_MOUSE_CAPTURE=0` | macOS: leave the pointer free, for automated and CUA runs |
 | `LB_ANY_PAD=1` | Development: admit controllers other than a DualSense as XInput pads |
 | `LB_MAX_FPS=N` | Apple present pacing: at most `N` fps, default 60; `0` disables it |
+| `LB_FP_DEPTH_SCALE=0` | On by default: the first-person arms, weapon and spell hand write the scene depth target (the immersive screen's depth, `depth-<frame>.f32`) in the world's encoding (near 15) instead of their own camera's (near 5), so they are not placed three times too far. `0` turns it off; `off@F[,F...]` only on those frames (as `LB_SHOT` numbers them). See `runtime/d3d9_bridge.cpp` |
+| `LB_PASSES=1` | Log `pass <frame> shadow=<draws>/<prims> … other=… rt=<n>` at each Present: draws per kind of pass (`tools/bench/README.md`); `2` also logs a `passdbg` line per run of draws into one target in the `LB_D3DTRACE` frames |
+| `LB_INI=Section:key=value;...` | Values the game reads instead of those in its INI files, for this run only (the files are not changed); each is logged as `ini: LB_INI sets ...` when the game first reads it |
 | `DXVK_FORCE_BASE_VERTEX_FOLD=1` | macOS: force the Simulator's base-vertex fold, so tests can compare it with native drawing |
 
 ## Apple-specific fixes

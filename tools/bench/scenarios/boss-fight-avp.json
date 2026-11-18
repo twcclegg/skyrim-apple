@@ -1,5 +1,5 @@
 {
-  "description": "Headset version of boss-fight-mac (same batch file, placed in Documents/Skyrim by the bench). Frame numbers follow whiterun-market-avp (menu by 1800, city loaded by 6000 with LB_MAX_FPS=120): the mac timings shifted by 4200. Placeholders until one `bench.py calibrate` on the device.",
+  "description": "Headset version of boss-fight-mac (same batch file, placed in Documents/Skyrim by the bench). Frame numbers follow whiterun-market-avp (menu by 1800, city loaded by 6000 with LB_MAX_FPS=120): the mac timings shifted by 4200. Placeholders until one `bench.py calibrate` on the device. At frame 3100 the console is reopened for `bat benchwx` (benchwx.txt: fw then sw 0000081A, SkyrimClear), so every run has the same clear sky, as in the Mac scenarios: the region's weather is otherwise picked at random per run, and overcast runs draw about 57 more effect draws per frame (measured in Riverwood on the M5). On the headset the coc load's long frames end by frame 2030 (2026-11-10 runs), and the batch is typed, run and closed by frame 3218, well before the first measured phase. LB_VPAD=0 so the A in `bat` is typed rather than pressed as stick-left (see boss-fight-mac); the scripted keys here are keyboard keys, which work without the virtual pad.",
   "console_at": 1800,
   "console": [
     "coc whiterunorigin"
@@ -120,10 +120,20 @@
       "player.placeatme 00037C47 4",
       "player.placeatme 00039D5E 4",
       "player.placeatme 00023AA8 2"
+    ],
+    "benchwx.txt": [
+      "fw 0000081A",
+      "sw 0000081A"
     ]
   },
   "env": {
     "LB_VPAD": "0",
     "LB_MAX_FPS": "120"
-  }
+  },
+  "console_later": [
+    {
+      "at": 3100,
+      "command": "bat benchwx"
+    }
+  ]
 }

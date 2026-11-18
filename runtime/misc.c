@@ -66,11 +66,6 @@ SHIM(SysAllocString) {
 SHIM(SysFreeString) { if (ARG(0)) gfree(ARG(0) - 4); RET(0, 1); }
 
 /* ---- winmm ---- */
-static uint64_t now_ms(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
-}
 /* waveOut reports no device (MMSYSERR_NODRIVER) so Bink uses DirectSound. */
 SHIM(waveOutOpen) { RET(6, 6); }
 SHIM(waveOutClose) { RET(0, 1); }
@@ -83,7 +78,8 @@ SHIM(waveOutRestart) { RET(0, 1); }
 SHIM(waveOutSetVolume) { RET(0, 2); }
 SHIM(timeBeginPeriod) { RET(0, 1); }
 SHIM(timeEndPeriod) { RET(0, 1); }
-SHIM(timeGetTime) { RET((uint32_t)now_ms(), 0); }
+uint64_t rt_game_ns(void);
+SHIM(timeGetTime) { RET((uint32_t)(rt_game_ns() / 1000000), 0); }
 
 typedef struct {
     uint32_t id, delay, cb, user, flags;

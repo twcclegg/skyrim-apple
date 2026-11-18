@@ -12,6 +12,7 @@
 #ifdef __APPLE__
 #include <sys/ucontext.h>
 #include <mach/mach.h>
+#include <TargetConditionals.h>
 #else
 #include <ucontext.h>
 #endif
@@ -90,6 +91,13 @@ void prof_start(void) {
     char path[1100];
     snprintf(path, sizeof path, "%s/noprof.txt", g_save_dir);
     if (access(path, F_OK) == 0) return;
+    /* LB_PROF=0 turns it off, LB_PROF=1 on. On visionOS it is off unless asked for: sampling briefly stops every
+     * running thread 200 times a second, which costs frame time and battery on the headset. */
+    const char *want = getenv("LB_PROF");
+    if (want && *want == '0') return;
+#if defined(__APPLE__) && TARGET_OS_VISION
+    if (!want || *want != '1') { LOG("profiler off on visionOS (LB_PROF=1 turns it on)"); return; }
+#endif
     g_samp = calloc(PROF_N, sizeof *g_samp);
     if (!g_samp) return;
 #if defined(__APPLE__) && defined(__aarch64__)
