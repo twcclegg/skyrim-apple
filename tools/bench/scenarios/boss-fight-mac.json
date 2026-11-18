@@ -1,5 +1,5 @@
 {
-  "description": "Heavy combat ('boss fight'). Run with --env LB_VPAD=0: with the virtual pad on, the A in `bat` acts as stick-left and garbles the command (observed), so there is no scripted turning. `coc whiterunorigin` from the main menu, then at frame 1900 (city loaded) the console is reopened for `bat benchboss`, which runs benchboss.txt from the game folder (not in git; contents in docs/perf/LOG.md): god mode, storm, two high-level dragons, 14 bandits (melee, archers, mages) and 2 storm atronachs placed at the player among the city's guards and townspeople. coc inside the batch file together with the spawns hung the load (observed). The player stands still while they fight. Phases: calm (before the spawn), early, late.",
+  "description": "Heavy combat ('boss fight'). Run with --env LB_VPAD=0: with the virtual pad on, the A in `bat` acts as stick-left and garbles the command (observed), so there is no scripted turning. `coc whiterunorigin` from the main menu, then at frame 1900 (city loaded) the console is reopened for `bat benchboss`, which runs benchboss.txt from the game folder (not in git; contents in docs/perf/LOG.md): god mode, storm, two high-level dragons, 14 bandits (melee, archers, mages) and 2 storm atronachs placed at the player among the city's guards and townspeople. coc inside the batch file together with the spawns hung the load (observed). The player stands still while they fight. Phases: calm (before the spawn), early, late. At frame 1510 the console is reopened for `bat benchwx` (benchwx.txt: fw then sw 0000081A, SkyrimClear), so every run has the same clear sky: the region's weather is otherwise picked at random per run, and overcast runs draw about 57 more effect draws per frame (measured in Riverwood on the M5). The calm phase starts at 1660, after the weather batch has run and the console is closed.",
   "console_at": 600,
   "console": [
     "coc whiterunorigin"
@@ -89,7 +89,7 @@
   ],
   "phases": {
     "calm": [
-      1500,
+      1660,
       1880
     ],
     "early": [
@@ -120,9 +120,19 @@
       "player.placeatme 00037C47 4",
       "player.placeatme 00039D5E 4",
       "player.placeatme 00023AA8 2"
+    ],
+    "benchwx.txt": [
+      "fw 0000081A",
+      "sw 0000081A"
     ]
   },
   "env": {
     "LB_VPAD": "0"
-  }
+  },
+  "console_later": [
+    {
+      "at": 1510,
+      "command": "bat benchwx"
+    }
+  ]
 }

@@ -1,5 +1,5 @@
 {
-  "description": "riverwood-walk timed for the macOS native build on the M1 (main menu up by frame 300, Riverwood loaded by frame 2100): coc into Riverwood, stand for 10 s, run forward for 20 s. Default character, no save. One console command only: keys typed within about 1.5 s after a Return are dropped (observed).",
+  "description": "riverwood-walk timed for the macOS native build on the M1 (main menu up by frame 300, Riverwood loaded by frame 2100): coc into Riverwood, stand for 10 s, run forward for 20 s. Default character, no save. One console command only: keys typed within about 1.5 s after a Return are dropped (observed). At frame 2150 the console is reopened for `bat benchwx` (benchwx.txt: fw then sw 0000081A, SkyrimClear), so every run has the same clear sky: the region's weather is otherwise picked at random per run, and overcast runs draw about 57 more effect draws per frame (measured in Riverwood on the M5).",
   "console_at": 600,
   "console": [
     "coc riverwood"
@@ -34,5 +34,17 @@
     4190
   ],
   "exit_frame": 4300,
-  "console_close": false
+  "console_close": false,
+  "console_later": [
+    {
+      "at": 2150,
+      "command": "bat benchwx"
+    }
+  ],
+  "game_files": {
+    "benchwx.txt": [
+      "fw 0000081A",
+      "sw 0000081A"
+    ]
+  }
 }

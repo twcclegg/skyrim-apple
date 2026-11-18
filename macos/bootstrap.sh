@@ -8,6 +8,10 @@ test "$(uname -s)" = Darwin && test "$(uname -m)" = arm64 || {
 command -v cmake >/dev/null
 command -v ninja >/dev/null
 xcrun --find clang >/dev/null
+if [ ! -f "$ROOT/third_party/dxvk/CMakeLists.txt" ]; then
+    git -C "$ROOT" submodule update --init third_party/dxvk
+fi
+python3 "$ROOT/tools/fetch_sdl.py"
 if [ ! -x "$ROOT/macos/.venv/bin/python" ]; then
     python3 -m venv "$ROOT/macos/.venv"
 fi

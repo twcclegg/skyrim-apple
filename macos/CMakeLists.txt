@@ -15,6 +15,7 @@ get_filename_component(SKYRIM_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/.." ABSOLUTE)
 option(LB_STRICT_ORDER "Preserve x86 guest memory ordering on ARM64" ON)
 option(LB_CONST_MEM "Generated code treats the guest base pointer as a constant" ON)
 set(SKYRIM_GEN_FLAGS "" CACHE STRING "Extra compiler flags for the generated code (performance experiments)")
+option(LB_PINNED_REGS "Keep the guest registers in fixed host registers in lifted code (arm64; needs generated code from the same lifter)" OFF)
 option(SKYRIM_BUILD_GAME "Link the game using privately generated Windows code" OFF)
 option(SKYRIM_BUNDLED_SDL "Build the pinned SDL2 source instead of relying on Homebrew SDL2" ON)
 option(SKYRIM_FFMPEG_AUDIO "Decode Windows xWMA source voices with private native FFmpeg libraries" ON)
@@ -26,7 +27,10 @@ if(SKYRIM_BUNDLED_SDL)
   set(SDL_STATIC OFF CACHE BOOL "Do not duplicate SDL compilation" FORCE)
   set(SDL_TEST OFF CACHE BOOL "No SDL test library" FORCE)
   set(SDL_TESTS OFF CACHE BOOL "No unrelated SDL tests" FORCE)
-  add_subdirectory("${SKYRIM_ROOT}/android/app/jni/SDL2" "${CMAKE_CURRENT_BINARY_DIR}/sdl")
+  if(NOT EXISTS "${SKYRIM_ROOT}/third_party/SDL2/CMakeLists.txt")
+    message(FATAL_ERROR "SDL2 is missing: run python3 tools/fetch_sdl.py (macos/bootstrap.sh does)")
+  endif()
+  add_subdirectory("${SKYRIM_ROOT}/third_party/SDL2" "${CMAKE_CURRENT_BINARY_DIR}/sdl")
 else()
   find_package(SDL2 CONFIG REQUIRED)
 endif()
@@ -44,10 +48,18 @@ add_subdirectory(graphics)
 
 file(GLOB RT_C CONFIGURE_DEPENDS "${SKYRIM_ROOT}/runtime/*.c")
 list(REMOVE_ITEM RT_C "${SKYRIM_ROOT}/runtime/main.c")
+# Native replacements of game functions (runtime/skyrim_native*.c) fall back to the lifted bodies
+# (f_XXXXXX_guest), which only exist in the generated game code, so they link with the game, not the runtime
+# the test executables share.
+file(GLOB RT_NATIVE_C CONFIGURE_DEPENDS "${SKYRIM_ROOT}/runtime/skyrim_native*.c")
+list(REMOVE_ITEM RT_C ${RT_NATIVE_C})
 file(GLOB RT_CPP CONFIGURE_DEPENDS "${SKYRIM_ROOT}/runtime/*.cpp")
 add_library(skyrim_runtime OBJECT ${RT_C} ${RT_CPP})
 target_include_directories(skyrim_runtime PUBLIC "${SKYRIM_ROOT}/runtime")
 target_compile_definitions(skyrim_runtime PUBLIC GAME_SKYRIM DXVK_NATIVE)
+if(LB_PINNED_REGS)
+  target_compile_definitions(skyrim_runtime PUBLIC LB_PINNED)
+endif()
 if(LB_STRICT_ORDER)
   target_compile_definitions(skyrim_runtime PUBLIC LB_STRICT_ORDER)
 endif()
@@ -107,6 +119,16 @@ add_executable(audio_device_recovery tests/audio_device_recovery.c tests/fixture
 target_link_libraries(audio_device_recovery PRIVATE skyrim_runtime)
 add_test(NAME audio_device_recovery COMMAND audio_device_recovery)
 set_tests_properties(audio_device_recovery PROPERTIES TIMEOUT 30 ENVIRONMENT "SDL_AUDIODRIVER=dummy")
+# XAudio2 output layout: stereo by default, 5.1 with LB_AUDIO_CHANNELS=6.
+add_executable(audio_surround tests/audio_surround.c tests/fixture_modules.c
+  $<TARGET_OBJECTS:skyrim_entry>)
+target_link_libraries(audio_surround PRIVATE skyrim_runtime)
+add_test(NAME audio_layout_stereo COMMAND audio_surround stereo)
+set_tests_properties(audio_layout_stereo PROPERTIES TIMEOUT 30
+  ENVIRONMENT "SDL_AUDIODRIVER=dummy;LB_AUDIO_METER=1")
+add_test(NAME audio_layout_surround COMMAND audio_surround surround)
+set_tests_properties(audio_layout_surround PROPERTIES TIMEOUT 30
+  ENVIRONMENT "SDL_AUDIODRIVER=dummy;LB_AUDIO_METER=1;LB_AUDIO_CHANNELS=6")
 if(SKYRIM_FFMPEG_AUDIO)
   add_executable(audio_voice_probe audio/voice_probe.c tests/fixture_modules.c
     $<TARGET_OBJECTS:skyrim_entry>)
@@ -186,6 +208,16 @@ if(SKYRIM_BUILD_GAME)
   if(LB_CONST_MEM)
     target_compile_definitions(skyrim_generated PRIVATE LB_CONST_MEM)
   endif()
+  if(LB_PINNED_REGS)
+    # x21-x28 hold the guest registers (runtime/lift_prelude.h); x19/x20 stay with the compiler.
+    target_compile_definitions(skyrim_generated PRIVATE LB_PINNED)
+    target_compile_options(skyrim_generated PRIVATE -ffixed-x21 -ffixed-x22 -ffixed-x23 -ffixed-x24
+      -ffixed-x25 -ffixed-x26 -ffixed-x27 -ffixed-x28)
+    # Three LLVM passes that move or speculate instructions miscompile writes to the reserved registers
+    # (found by whole-build bisection, docs/perf/LOG.md); the build crashes at boot unless all are off.
+    target_compile_options(skyrim_generated PRIVATE "SHELL:-mllvm -disable-postra-machine-licm"
+      "SHELL:-mllvm -disable-early-ifcvt" "SHELL:-mllvm -aarch64-enable-ccmp=false")
+  endif()
   separate_arguments(_gen_flags NATIVE_COMMAND "${SKYRIM_GEN_FLAGS}")
   target_compile_options(skyrim_generated PRIVATE ${_gen_flags})
   set_property(GLOBAL PROPERTY JOB_POOLS generated_compile=2)
@@ -197,8 +229,12 @@ if(SKYRIM_BUILD_GAME)
     BYPRODUCTS "${CMAKE_CURRENT_BINARY_DIR}/skyrim_macos.build-start.json" VERBATIM)
   add_dependencies(skyrim_generated verify_game_inputs)
   add_dependencies(skyrim_runtime verify_game_inputs)
+  add_library(skyrim_natives OBJECT ${RT_NATIVE_C})
+  target_link_libraries(skyrim_natives PRIVATE skyrim_runtime)
+  target_compile_options(skyrim_natives PRIVATE -O2 -fno-strict-aliasing -fwrapv -fsigned-char
+    $<$<COMPILE_LANGUAGE:C>:-Werror=implicit-function-declaration>)
   add_executable(skyrim_macos "${SKYRIM_ROOT}/runtime/main.c"
-    $<TARGET_OBJECTS:skyrim_generated>)
+    $<TARGET_OBJECTS:skyrim_generated> $<TARGET_OBJECTS:skyrim_natives>)
   target_link_libraries(skyrim_macos PRIVATE skyrim_runtime)
   add_dependencies(skyrim_macos verify_game_inputs)
   set_property(TARGET skyrim_macos APPEND PROPERTY LINK_DEPENDS

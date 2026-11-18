@@ -4,6 +4,10 @@
  * (TL32 / TS32) as the lifted code, so LB_STRICT_ORDER keeps its meaning here. */
 #pragma clang fp contract(off)  /* one rounding per operation, as the lifted body does */
 #include "x86.h"
+/* Only for the ordered accessors (TL32/TS32). This is host code: with pinned registers (LB_PINNED) the guest
+ * registers are in the CPU struct here, and the prelude's global register variables need -ffixed-x21..x28,
+ * which only the generated code is built with. */
+#undef LB_PINNED
 #include "lift_prelude.h"
 
 #ifdef GAME_SKYRIM

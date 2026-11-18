@@ -59,7 +59,7 @@ issues each scene draw once per eye with the vertex shader shifting clip-space x
 `eye * separation * (w - convergence)`. The game thread's cost doesn't change; the replay runs on DXVK's
 command thread and the GPU.
 
-What the vendored DXVK 1.9.2 offers (*read*, by a read-only study of `android/app/jni/dxvk`):
+What our DXVK 1.9.2 offers (*read*, by a read-only study of what is now `third_party/dxvk`):
 
 - **Where the shift goes:** `src/dxso/dxso_compiler.cpp` `emitVsFinalize()` (line 3914), between
   `emitLinkerOutputSetup()` and `emitVsClipping()`; the fixed-function vertex shader
@@ -71,7 +71,7 @@ What the vendored DXVK 1.9.2 offers (*read*, by a read-only study of `android/ap
   to a twin of each back-buffer-sized render target and depth buffer. Twins rather than a double-wide target,
   because post passes compute UVs over the whole texture. Vulkan multiview isn't used anywhere in this DXVK and
   would need layered targets that the translated `sampler2D` shaders can't read.
-- **Present:** `skyrim_present_tap_frame` carries one image; it would carry two.
+- **Present:** `dxvk_present_tap_frame` carries one image; it would carry two.
 
 Risks: effects that rebuild position from depth with the mono projection (water, fog, imagespace) will be
 slightly off; the HUD and full-screen passes must be recognised and left unshifted; the game culls for one
@@ -107,3 +107,19 @@ rasterization rate map, as the plan already notes for M2.
 ThinLTO (inlining across the 140 generated files removes spill/reload pairs at direct calls), profile-guided
 optimisation, and a linker order file built from a profile to keep the hot few megabytes of the 110 MB of code
 together. Each needs a 20-minute build per try on the M1.
+
+## Headset GPU log lines (stage 0 of #23: measure before optimising)
+
+Two lines report GPU cost on the headset. Neither had ever been read from a headset run when they were added.
+
+- `immersive: compositor gpu X ms per frame, p95 Y ms, max Z ms`, every 5 s, from `ImmersiveScreen.swift`. The
+  compositor's own command buffers, `gpuEndTime - gpuStartTime`. Mean is exact; p95 is read from a 0.25 ms
+  histogram (rounded up to the bin edge, never above the max); the max is exact.
+- `immersive cadence: N game frames over 900 refreshes; held 1: …; replaced unseen: U; game gpu latency mean X ms,
+  max Y ms`, every 900 refreshes, from `ipad/immersive_bridge.mm`. The latency is the time from the game handing a
+  frame to the tap (inside Present) to the first compositor refresh that finds it finished. It is an upper bound
+  on the game frame's GPU time: it includes the GPU working through the compositor's own queued work, and is
+  rounded up to the next refresh (about 11 ms at 90 Hz). Frames pushed out of a full mailbox before any refresh
+  polled them are not counted. The suffix is absent when no frame was observed in the window.
+
+Read them together: if the game latency is far above the compositor's GPU time, the game is the one that is slow.
