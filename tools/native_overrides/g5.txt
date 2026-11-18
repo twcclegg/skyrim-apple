@@ -1,0 +1,2 @@
+B1B6C0  # frustum culling of a bounding sphere against a node's six planes (plane test inline) -> runtime/skyrim_native_g5.c
+B07B90  # the same culling for an object holding its own six planes (plane test inline) -> runtime/skyrim_native_g5.c
