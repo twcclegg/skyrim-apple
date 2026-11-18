@@ -570,6 +570,7 @@ static const char *const k_pass_names[PASS_COUNT] = {"shadow", "refl", "main", "
 struct PassTotals { int draws; uint32_t prims; };  // per class and frame (a GPU time per class would go here too)
 struct PassTarget { void *rt; uint32_t w, h, fmt; bool ds, bb; };  // what draws go to now (rt: identity only)
 static PassTarget g_pass_biggest, g_pass_biggest_now;  // the largest non-back-buffer target drawn to: last frame, this one
+static int g_pass_draws_last[16];  // draws per pass class last frame (for the late-eyes report)
 struct PassFrame {
     PassTotals cls[PASS_COUNT];
     int rt_changes;
@@ -1013,6 +1014,7 @@ static bool depth_copy_draw(void) {
 static void passes_present(void) {
     g_pass_biggest = g_pass_biggest_now;
     g_pass_biggest_now = PassTarget();
+    for (int c = 0; c < PASS_COUNT && c < 16; c++) g_pass_draws_last[c] = (int)g_pass_frame.cls[c].draws;
     g_depth_copied = false;
     if (g_ui_shift_on) {
         static const float zero[4] = {0, 0, 0, 0};
@@ -2437,9 +2439,13 @@ static void stereo_late_report(void) {
         for (int i = 1; i < LATE_COUNT && n < (int)sizeof why - 64; i++)
             if (counts[i]) n += snprintf(why + n, sizeof why - n, "%s%s %d", n ? ", " : "", k_late_why[i], counts[i]);
         const PassTarget &b = g_pass_biggest;
+        char cls[256];
+        int m = 0;
+        for (int c = 0; c < PASS_COUNT && c < 16 && m < (int)sizeof cls - 32; c++)
+            if (g_pass_draws_last[c]) m += snprintf(cls + m, sizeof cls - m, " %s=%d", k_pass_names[c], g_pass_draws_last[c]);
         LOG("eye views: late eyes requested but inactive in %d of %d frames: %s (largest render target last frame "
-            "%ux%u fmt %u ds %d; back buffer %ux%u)", frames - counts[LATE_APPLIED], frames, why, b.w, b.h, b.fmt,
-            b.ds ? 1 : 0, g_bb_w, g_bb_h);
+            "%ux%u fmt %u ds %d; back buffer %ux%u; draws last frame:%s)", frames - counts[LATE_APPLIED], frames, why,
+            b.w, b.h, b.fmt, b.ds ? 1 : 0, g_bb_w, g_bb_h, m ? cls : " none");
     }
     frames = 0;
     memset(counts, 0, sizeof counts);
