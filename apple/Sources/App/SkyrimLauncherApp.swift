@@ -45,6 +45,11 @@ struct SkyrimLauncherApp: App {
         .windowResizability(.contentMinSize)
         #endif
         #if os(visionOS) && SKYRIM_NATIVE_RUNTIME
+        // Every launch opens the launcher, whatever scenes the last run left open: a run that ended inside the
+        // game window (LB_GAME_SCENE=1) or the immersive space would otherwise come back as only that, with no
+        // launcher to start the game, which also leaves bench autoplay with nothing to press. (visionOS 26; the
+        // native build targets 26.5, the launcher-only build 2.0.)
+        .defaultLaunchBehavior(.presented)
         // The glass comes from ImmersiveGhost, so it can go away while immersive play runs.
         .windowStyle(.plain)
         #endif
@@ -54,6 +59,9 @@ struct SkyrimLauncherApp: App {
             GameSurfaceView(model: model)
         }
         .windowStyle(.plain)
+        // Only Play opens it; a relaunch never brings back an empty game window.
+        .defaultLaunchBehavior(.suppressed)
+        .restorationBehavior(.disabled)
         .defaultSize(width: 2400, height: 1300)
         ImmersiveSpace(id: ImmersiveScreen.spaceID) {
             CompositorLayer(configuration: ImmersiveScreenConfiguration()) { layer in
@@ -76,6 +84,9 @@ struct SkyrimLauncherApp: App {
             }
         }
         .immersionStyle(selection: .constant(.full), in: .full)
+        // Only Play opens it: a relaunch after a run that was killed in the space must not come back inside it,
+        // where Play Immersive's openImmersiveSpace then fails because the space is already open.
+        .restorationBehavior(.disabled)
         // No Home indicator to catch the pointer or the eyes when looking up mid-game (Minecraft port, observed).
         .persistentSystemOverlays(.hidden)
         #endif

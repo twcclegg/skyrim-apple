@@ -69,7 +69,8 @@ set_target_properties(Vulkan::Vulkan PROPERTIES IMPORTED_LOCATION "${SKYRIM_MOLT
   INTERFACE_INCLUDE_DIRECTORIES "${SKYRIM_MOLTENVK_ROOT}/include"
   INTERFACE_LINK_LIBRARIES "-framework Metal;-framework QuartzCore;-framework Foundation;-framework IOSurface;-framework CoreGraphics;-framework UIKit")
 set(DXVK_STATIC ON CACHE BOOL "" FORCE)
-add_subdirectory("${SKYRIM_ROOT}/android/app/jni/dxvk" dxvk)
+set(DXVK_VULKAN_INCLUDE_DIR "${SKYRIM_MOLTENVK_ROOT}/include")
+add_subdirectory("${SKYRIM_ROOT}/third_party/dxvk" dxvk)
 
 file(GLOB RT_C CONFIGURE_DEPENDS "${SKYRIM_ROOT}/runtime/*.c")
 list(REMOVE_ITEM RT_C "${SKYRIM_ROOT}/runtime/main.c")
@@ -111,7 +112,7 @@ add_library(skyrim_ipad_bridge OBJECT native_bridge.mm)
 if(SKYRIM_SDL_PLATFORM STREQUAL "visionos")
   # The immersive compositor's frame handoff needs DXVK's tap header and MoltenVK's Vulkan headers.
   target_sources(skyrim_ipad_bridge PRIVATE immersive_bridge.mm)
-  target_include_directories(skyrim_ipad_bridge PRIVATE "${SKYRIM_ROOT}/android/app/jni/dxvk/include/native"
+  target_include_directories(skyrim_ipad_bridge PRIVATE "${SKYRIM_ROOT}/third_party/dxvk/include/native"
     "${SKYRIM_MOLTENVK_ROOT}/include")
 endif()
 target_include_directories(skyrim_ipad_bridge PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
@@ -129,6 +130,18 @@ if(LB_CONST_MEM)
   target_compile_definitions(skyrim_ipad_generated PRIVATE LB_CONST_MEM)
 endif()
 target_compile_options(skyrim_ipad_generated PRIVATE -O2 -g0 -fno-strict-aliasing -fwrapv -fsigned-char)
+# Guest registers in x21-x28 (runtime/lift_prelude.h), as in macos/CMakeLists.txt: the generated code
+# reserves the registers and has the three LLVM passes that move writes to reserved registers turned
+# off; the runtime only needs to know the mode is on, for its entry trampoline.
+option(LB_PINNED_REGS "Keep the guest registers in fixed host registers in lifted code" OFF)
+if(LB_PINNED_REGS)
+  target_compile_definitions(skyrim_ipad_runtime PUBLIC LB_PINNED)
+  target_compile_definitions(skyrim_ipad_generated PRIVATE LB_PINNED)
+  target_compile_options(skyrim_ipad_generated PRIVATE -ffixed-x21 -ffixed-x22 -ffixed-x23 -ffixed-x24
+    -ffixed-x25 -ffixed-x26 -ffixed-x27 -ffixed-x28
+    "SHELL:-mllvm -disable-postra-machine-licm" "SHELL:-mllvm -disable-early-ifcvt"
+    "SHELL:-mllvm -aarch64-enable-ccmp=false")
+endif()
 set_property(GLOBAL PROPERTY JOB_POOLS generated_compile=2)
 set_property(TARGET skyrim_ipad_generated PROPERTY JOB_POOL_COMPILE generated_compile)
 
