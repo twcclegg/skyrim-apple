@@ -376,6 +376,16 @@ final class ImmersiveCompositor: @unchecked Sendable {
     /// head), with the eye separation scaled about the point between them.
     private func giveEyes(_ drawable: LayerRenderer.Drawable, camera c: [Float], unitsPerMetre: Float) {
         guard drawable.views.count >= 2 else { return }
+        // The game's field of view follows the eyes (LB_FOV unset or "eyes"): ask for a frustum that holds both eyes'
+        // whole frusta plus the margin, so the window below clips nothing once the game has widened.
+        let margin = eyeMarginDegrees * .pi / 180
+        var needX: Float = 0, needY: Float = 0
+        for view in drawable.views.prefix(2) {
+            let t = view.tangents  // positive extents: left, right, top, bottom
+            needX = max(needX, tan(atan(max(abs(t[0]), abs(t[1]))) + margin))
+            needY = max(needY, tan(atan(max(abs(t[2]), abs(t[3]))) + margin))
+        }
+        skyrim_eye_fov_request(needX, needY)
         var window: (l: Float, r: Float, t: Float, b: Float)
         if let eyeWindow {
             window = (-eyeWindow.x, eyeWindow.x, eyeWindow.y, -eyeWindow.y)

@@ -69,6 +69,10 @@ void skyrim_head_set(float yaw, float pitch, int on);
 void skyrim_stereo_set_eyes(const float tangents[8], const float eye_pose[32], float units_per_metre);
 /* Back to the game's own frustum and the plain eye offset. */
 void skyrim_stereo_clear_eyes(void);
+/* runtime/d3d9_bridge.cpp, eye views: the half-extents (tangents, positive) the game's frustum must reach to hold
+ * both eyes' whole frusta and the compositor's margin; with LB_FOV unset or LB_FOV=eyes the game's field of view
+ * follows them. */
+void skyrim_eye_fov_request(float tan_x, float tan_y);
 /* The game heading (radians, clockwise from north) that head yaw 0 maps to; *valid = 0 until steering anchors. */
 float skyrim_head_offset(int *valid);
 /* runtime/motion_path.h (LB_IMMERSIVE_MOTION=1): for a frame whose game camera was at (east, north, up), how far

@@ -146,5 +146,5 @@ once, at launch, from the environment or `Documents/SkyrimNative/launch-env.json
 
 Related: `LB_MAX_FPS` (visionOS default 45: every second 90 Hz refresh; logged as `present pacing: at most 45 fps
 (LB_MAX_FPS)`), and `LB_WINDOW` (render size, also written into `SkyrimPrefs.ini`: `prefs: render size WxH (LB_WINDOW)
-in <path>`). `LB_FOV` sets the game's field of view at its 4:3 reference. The vertical field stays the same at any
+in <path>`). `LB_FOV` sets the game's field of view at its 4:3 reference; with `LB_EYE_VIEWS=1` and `LB_FOV` unset (or `LB_FOV=eyes`) it follows the eyes instead: the compositor asks for a frustum holding both eyes' whole frusta plus its margin, and the runtime sets the field of view from that and the back buffer's aspect (`eye views: game field of view <deg> degrees (4:3 reference) to cover the eyes: tangents <x> x <y>, back buffer WxH`). A number in `LB_FOV` always wins. The vertical field stays the same at any
 aspect, and the horizontal grows with the window's width.

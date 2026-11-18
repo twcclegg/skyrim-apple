@@ -1903,14 +1903,46 @@ extern "C" int skyrim_frame_eye(float *k_out) {
 
 /* LB_FOV: the game's field of view in degrees at its 4:3 reference (65 by default, about 81 degrees across at
  * 16:9), written to PlayerCamera worldFOV (+0xAC) and firstPersonFOV (+0xB0) as the console's fov command
- * does. Head tracking wants it wider than the headset shows. */
+ * does. Head tracking wants it wider than the headset shows.
+ *
+ * Eye views (LB_EYE_VIEWS=1): the compositor asks for the half-extents (tangents) the game's frustum must reach so
+ * both eyes' whole frusta, plus its margin, fit inside it (skyrim_eye_fov_request). With LB_FOV unset or
+ * LB_FOV=eyes, the field of view is set from that and the back buffer's aspect: the game's vertical tangent is
+ * 0.75 tan(fov/2) and its horizontal one that times the aspect, so tan(fov/2) = max(y, x / aspect) / 0.75. A number
+ * in LB_FOV always wins. Without eye views no request is made and nothing changes. */
+static std::atomic<float> g_eye_fov_x{0}, g_eye_fov_y{0};
+extern "C" void skyrim_eye_fov_request(float tan_x, float tan_y) {
+    g_eye_fov_x = tan_x;
+    g_eye_fov_y = tan_y;
+}
 static void game_fov_apply(void) {
     static float fov = -1;
-    if (fov < 0) fov = getenv("LB_FOV") ? (float)atof(getenv("LB_FOV")) : 0;
+    static bool from_eyes;
+    if (fov < 0) {
+        const char *e = getenv("LB_FOV");
+        from_eyes = !e || !strcmp(e, "eyes");
+        fov = e && !from_eyes ? (float)atof(e) : 0;
+    }
+    float use = fov;
+    if (from_eyes) {
+        static float last;
+        const float x = g_eye_fov_x, y = g_eye_fov_y;
+        if (x > 0 && y > 0 && g_bb_w && g_bb_h) {
+            const float t = fmaxf(y, x * (float)g_bb_h / (float)g_bb_w) / 0.75f;
+            use = fminf(2.0f * atanf(t) * 57.29578f, 150.0f);
+            if (fabsf(use - last) > 0.5f) {
+                LOG("eye views: game field of view %.1f degrees (4:3 reference) to cover the eyes: tangents %.3f x %.3f, "
+                    "back buffer %ux%u", use, x, y, g_bb_w, g_bb_h);
+                last = use;
+            }
+        } else if (last > 0) {
+            use = last;  // keep it through menus and lost tracking, when the compositor stops asking
+        }
+    }
     uint32_t pc = M32(0x12E7288);
-    if (fov <= 0 || pc < 0x10000) return;
-    memcpy(MEM + pc + 0xAC, &fov, 4);
-    memcpy(MEM + pc + 0xB0, &fov, 4);
+    if (use <= 0 || pc < 0x10000) return;
+    memcpy(MEM + pc + 0xAC, &use, 4);
+    memcpy(MEM + pc + 0xB0, &use, 4);
 }
 
 /* LB_CAMLOG=N: log the world camera every N frames (to check the layout above). */
@@ -2397,6 +2429,14 @@ static void stereo_test_eyes(const GameCamera &cam, float d_units) {
     pose[0][12] = -half_m;
     pose[1][12] = half_m;
     skyrim_stereo_set_eyes(&t[0][0], &pose[0][0], 70.0f);
+    if (mode == 2) {  // as the compositor does: ask for a game frustum holding both eyes plus its 2 degree margin
+        float x = 0, y = 0;
+        for (int e = 0; e < 2; e++) {
+            x = fmaxf(x, tanf(atanf(fmaxf(fabsf(t[e][0]), fabsf(t[e][1]))) + 0.034906585f));
+            y = fmaxf(y, tanf(atanf(fmaxf(fabsf(t[e][2]), fabsf(t[e][3]))) + 0.034906585f));
+        }
+        skyrim_eye_fov_request(x, y);
+    }
     LOG("stereo test eyes: L %.3f %.3f %.3f %.3f R %.3f %.3f %.3f %.3f, eyes %.4f m apart", t[0][0], t[0][1], t[0][2],
         t[0][3], t[1][0], t[1][1], t[1][2], t[1][3], 2 * half_m);
 }
