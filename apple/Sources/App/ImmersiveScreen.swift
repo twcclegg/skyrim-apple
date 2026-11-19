@@ -582,11 +582,14 @@ final class ImmersiveCompositor: @unchecked Sendable {
     /// and weapon, which travel with the camera (LB_IMMERSIVE_MOTION_NEAR_M; 0 moves everything with the world).
     private lazy var motionNear: Float = getenv("LB_IMMERSIVE_MOTION_NEAR_M").flatMap { Float(String(cString: $0)) } ?? 1.0
 
-    /// Per-pixel depth search steps (LB_IMMERSIVE_REFINE; 0 = off, 2 is enough) and the eye separation used for
+    /// Per-pixel depth search steps (LB_IMMERSIVE_REFINE; default 4, 0 = off) and the eye separation used for
     /// drawing as a multiple of the wearer's (LB_IMMERSIVE_IPD_SCALE; above 1 gives stronger depth and a smaller
     /// looking world). Both read when the first game frame is drawn, like the depth settings.
     private lazy var refineSteps: Float = {
-        let steps = getenv("LB_IMMERSIVE_REFINE").flatMap { Float(String(cString: $0)) } ?? 0
+        // On by default: without it the mesh's triangles at depth edges (foliage against the sky) show as shards and
+        // the hole fill behind them as dark smears. On the Vision Pro with live stereo at 1600x1100, 4 steps cost the
+        // compositor 3.4-4.2 ms per refresh (p95 4.3-6.3) with every 90 Hz refresh presented.
+        let steps = getenv("LB_IMMERSIVE_REFINE").flatMap { Float(String(cString: $0)) } ?? 4
         log("per-pixel depth search: \(Int(steps)) steps")
         return max(0, min(steps.rounded(), 8))
     }()
