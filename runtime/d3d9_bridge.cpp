@@ -426,11 +426,13 @@ void B_IDirect3DDevice9_CreateAdditionalSwapChain(CPU *c) {
     RET(hr, 3);
 }
 
+static void hud_layer_release(void);  // LB_HUD_LAYER, below
 void B_IDirect3DDevice9_Reset(CPU *c) {
     auto *d = (IDirect3DDevice9 *)com_host(ARG(0));
     D3DPRESENT_PARAMETERS pp;
     pp_from_guest(ARG(1), &pp);
     { extern void hud_screen_reset(void); hud_screen_reset(); }
+    hud_layer_release();  // a default-pool render target: Reset refuses while it lives
     rt_host_affinity_begin();
     HRESULT hr = d->Reset(&pp);
     rt_host_affinity_end();
@@ -479,6 +481,79 @@ extern "C" void dxvk_stereo_set_view_ui_offsets(const float view0[4], const floa
 /* Live stereo: the interface (pass class ui: menus, HUD) at LB_STEREO_HUD_DEPTH metres (default 2) instead of at
  * infinity. g_ui_k is each view's clip offset for a point at that depth, set each frame by stereo_after_present. */
 static float g_ui_k[2][2];  // [view][x, y]
+
+/* LB_HUD_LAYER=1 (immersive): the interface is drawn on its own. Its draws (the ui pass class: into the back buffer
+ * after the final image) go to a transparent RGBA target instead, without a depth-stencil, and that target goes to
+ * the compositor beside the frame (dxvk_present_tap_set_hud), which shows it as a flat layer 2 m ahead of the frame's
+ * camera. Then it is never moved by the depth mesh: before, panning tore the reticle in two (each pixel was placed
+ * at the depth of the scene behind it). The back buffer, the depth-stencil and the viewport are put back before
+ * Present. Stereo HUD offsets are off with it (the layer is drawn once, as a plane). */
+static int g_hud_layer = -1;
+static IDirect3DSurface9 *g_hud_rt;
+static IDirect3DSurface9 *g_hud_saved_rt, *g_hud_saved_ds;
+static D3DVIEWPORT9 g_hud_saved_vp;
+static bool g_hud_used;
+extern "C" void dxvk_present_tap_set_hud(void *surface);
+static bool hud_layer_on(void) {
+#if !defined(__APPLE__)
+    return false;  // the present tap is Apple-only
+#endif
+    if (g_hud_layer < 0) {
+        const char *e = getenv("LB_HUD_LAYER");
+        g_hud_layer = e && !strcmp(e, "1");
+        if (g_hud_layer) LOG("hud layer: the interface is drawn on its own");
+    }
+    return g_hud_layer == 1;
+}
+static void hud_layer_release(void) {
+    if (g_hud_rt) { g_hud_rt->Release(); g_hud_rt = nullptr; }
+}
+/* At a ui draw: make sure it lands in the HUD target (cleared once per frame). */
+static void hud_layer_draw(IDirect3DDevice9 *d) {
+    if (!d || !g_bb_w || !g_bb_h) return;
+    if (g_hud_rt) {
+        D3DSURFACE_DESC desc;
+        if (FAILED(g_hud_rt->GetDesc(&desc)) || desc.Width != g_bb_w || desc.Height != g_bb_h) hud_layer_release();
+    }
+    if (!g_hud_rt && FAILED(d->CreateRenderTarget(g_bb_w, g_bb_h, D3DFMT_A8R8G8B8, D3DMULTISAMPLE_NONE, 0, FALSE,
+                                                  &g_hud_rt, nullptr))) {
+        g_hud_rt = nullptr;
+        return;
+    }
+    IDirect3DSurface9 *rt = nullptr;
+    d->GetRenderTarget(0, &rt);
+    if (rt) rt->Release();
+    if (rt == g_hud_rt) return;
+    if (!g_hud_used) {
+        // First ui draw of the frame: remember what to put back, then switch and clear.
+        g_hud_saved_rt = rt;
+        if (g_hud_saved_rt) g_hud_saved_rt->AddRef();
+        d->GetDepthStencilSurface(&g_hud_saved_ds);
+        d->GetViewport(&g_hud_saved_vp);
+    }
+    D3DVIEWPORT9 vp;
+    d->GetViewport(&vp);
+    d->SetRenderTarget(0, g_hud_rt);
+    d->SetDepthStencilSurface(nullptr);
+    d->SetViewport(&vp);
+    if (!g_hud_used) {
+        d->Clear(0, nullptr, D3DCLEAR_TARGET, 0x00000000, 1.0f, 0);
+        g_hud_used = true;
+    }
+}
+/* Before Present: name the HUD for the tap and put the game's targets back. */
+static void hud_layer_present(IDirect3DDevice9 *d) {
+#if defined(__APPLE__)
+    dxvk_present_tap_set_hud(g_hud_used ? g_hud_rt : nullptr);
+#endif
+    if (!g_hud_used) return;
+    d->SetRenderTarget(0, g_hud_saved_rt);
+    d->SetDepthStencilSurface(g_hud_saved_ds);
+    d->SetViewport(&g_hud_saved_vp);
+    if (g_hud_saved_rt) { g_hud_saved_rt->Release(); g_hud_saved_rt = nullptr; }
+    if (g_hud_saved_ds) { g_hud_saved_ds->Release(); g_hud_saved_ds = nullptr; }
+    g_hud_used = false;
+}
 static bool g_ui_shift_on;
 static uint32_t g_skip_class_mask;  // LB_SKIP_CLASS=depth,shadow,...: skip every draw of those classes (timing only)
 static int g_bisect_from = -1, g_draw_no;
@@ -855,7 +930,8 @@ void d3d_passes_draw(uint32_t prims) {
     }
     int k = pass_class(prims);
     g_last_class = k;
-    if ((g_ui_k[0][0] != 0 || g_ui_k[1][0] != 0 || g_ui_k[0][1] != 0 || g_ui_k[1][1] != 0) && (k == PASS_UI) != g_ui_shift_on) {
+    if (k == PASS_UI && hud_layer_on()) hud_layer_draw(g_pass_device);
+    if (!hud_layer_on() && (g_ui_k[0][0] != 0 || g_ui_k[1][0] != 0 || g_ui_k[0][1] != 0 || g_ui_k[1][1] != 0) && (k == PASS_UI) != g_ui_shift_on) {
         g_ui_shift_on = k == PASS_UI;
         const float on0[4] = {g_ui_shift_on ? g_ui_k[0][0] : 0.0f, g_ui_shift_on ? g_ui_k[0][1] : 0.0f, 0, 0},
                     on1[4] = {g_ui_shift_on ? g_ui_k[1][0] : 0.0f, g_ui_shift_on ? g_ui_k[1][1] : 0.0f, 0, 0};
@@ -981,7 +1057,7 @@ static void passes_init(IDirect3DDevice9 *d) {
             LOG("LB_SKIP_CLASS=%s: skipping pass classes mask %x", sc, g_skip_class_mask);
         }
         const bool fp_wanted = (fp && atoi(fp)) || getenv("LB_FP_SKIP") || (eye && atof(eye) != 0) || g_fp_flame
-                            || g_skip_class_mask || g_depth_copy == 1;
+                            || g_skip_class_mask || g_depth_copy == 1 || hud_layer_on();
         g_d3d_passes = g_passes_log || fp_wanted;
         // without an LB_D3DTRACE range, LB_PASSES=2 looks at the first frame
         g_passdbg = g_passes_log == 2 && !getenv("LB_D3DTRACE");
@@ -2793,6 +2869,7 @@ void B_IDirect3DDevice9_Present(CPU *c) {
     g_frame_eye_k = g_stereo.on ? g_stereo.k_applied : 0.0f;
     game_fov_apply();
     dxvk_present_tap_set_depth(menu_open() ? nullptr : d3d_scene_depth_target());
+    if (hud_layer_on()) hud_layer_present(d);
 #endif
     platform_present_draws(g_d3d_draws);
     g_d3d_draws = 0;
@@ -2802,6 +2879,7 @@ void B_IDirect3DDevice9_Present(CPU *c) {
     platform_present_end();
 #if defined(__APPLE__)
     dxvk_present_tap_set_depth(nullptr);
+    if (hud_layer_on()) dxvk_present_tap_set_hud(nullptr);
     d3d_scene_depth_reset();
 #endif
     stereo_after_present();
