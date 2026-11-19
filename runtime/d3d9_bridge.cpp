@@ -2193,6 +2193,7 @@ struct StereoState {
 };
 static StereoState g_stereo;
 static bool stereo_live_multiview(void);
+static IDirect3DDevice9 *g_stereo_device;  // the presenting device, set before stereo_init
 
 static void stereo_init(void) {
     StereoState &st = g_stereo;
@@ -2312,6 +2313,7 @@ static void stereo_write_info(const char *tag, const StereoSlot &slot, int base)
 
 // Before Present: capture the frame if it belongs to a group.
 static void stereo_before_present(IDirect3DDevice9 *d) {
+    g_stereo_device = d;
     if (!g_stereo.init) stereo_init();
     if (!g_stereo.on) return;
     int base = 0;
@@ -2338,9 +2340,21 @@ static void stereo_fp_changed(int kind) {
 }
 static bool stereo_skip_fp(void) { return g_stereo.skip_fp; }
 
+extern "C" int dxvk_stereo_multiview_enabled(void *device);  // DXVK (dxvk_stereo.h)
+/* LB_STEREO_MULTIVIEW=1 and the device really renders multiview: DXVK falls back to mono when the Vulkan device
+ * lacks multiview or layered rendering (the visionOS simulator). Then the eye offset must not be applied either,
+ * or the one picture is the left eye's. Decided at the first Present, when the device is known. */
 static bool stereo_live_multiview(void) {
     static int on = -1;
-    if (on < 0) { const char *e = getenv("LB_STEREO_MULTIVIEW"); on = e && !strcmp(e, "1"); }
+    if (on < 0) {
+        const char *e = getenv("LB_STEREO_MULTIVIEW");
+        if (!e || strcmp(e, "1")) on = 0;
+        else if (!g_stereo_device) return false;
+        else {
+            on = dxvk_stereo_multiview_enabled(g_stereo_device) ? 1 : 0;
+            if (!on) LOG("stereo: LB_STEREO_MULTIVIEW=1 but the device renders mono (see DXVK's log); no eye offset");
+        }
+    }
     return on == 1;
 }
 
