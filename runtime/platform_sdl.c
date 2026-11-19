@@ -175,7 +175,7 @@ static void head_steer(void) {
         if (t && !strcmp(t, "sweep")) test = 2;
         else if (t && sscanf(t, "%f,%f", &test_yaw, &test_pitch) >= 1) test = 1;
         counts = getenv("LB_HEAD_COUNTS") ? (float)atof(getenv("LB_HEAD_COUNTS")) : 1000.0f;
-        gain = getenv("LB_HEAD_GAIN") ? (float)atof(getenv("LB_HEAD_GAIN")) : 0.2f;
+        gain = getenv("LB_HEAD_GAIN") ? (float)atof(getenv("LB_HEAD_GAIN")) : 0.5f;
         stick_gain = getenv("LB_HEAD_STICK_GAIN") ? (float)atof(getenv("LB_HEAD_STICK_GAIN")) : 7.0f;
         stick_dead = getenv("LB_HEAD_STICK_DEAD") ? (float)atof(getenv("LB_HEAD_STICK_DEAD")) : 0.25f;
         if (test) LOG("head: test %s, %.0f counts/rad, gain %.2f", t, counts, gain);
@@ -183,7 +183,11 @@ static void head_steer(void) {
     frame++;
     float head_yaw, head_pitch;
     if (test == 1) { head_yaw = test_yaw * 0.017453293f; head_pitch = test_pitch * 0.017453293f; }
-    else if (test == 2) { float t = frame / 60.0f; head_yaw = 0.6f * sinf(t * 0.8f); head_pitch = 0.25f * sinf(t * 0.5f); }
+    else if (test == 2) {  /* LB_HEAD_TEST_SPEED: the sweep this many times faster (1: 27 deg/s at most) */
+        static float speed = -1;
+        if (speed < 0) speed = getenv("LB_HEAD_TEST_SPEED") ? fmaxf(0.1f, (float)atof(getenv("LB_HEAD_TEST_SPEED"))) : 1.0f;
+        float t = frame / 60.0f * speed; head_yaw = 0.6f * sinf(t * 0.8f); head_pitch = 0.25f * sinf(t * 0.5f);
+    }
     else if (atomic_load(&g_head_on)) { head_yaw = atomic_load(&g_head_yaw); head_pitch = atomic_load(&g_head_pitch); }
     else { if (anchored) { void input_head_stick(float, float); input_head_stick(0, 0); } anchored = 0; atomic_store(&g_head_anchored, 0); return; }
     if (test) {  /* for skyrim_head_now */
@@ -236,20 +240,26 @@ static void head_steer(void) {
     }
     input_head_stick(0, 0);
     /* Mouse path. How far the game turns per count depends on the player's sensitivity setting, so the gain is
-     * kept low (stable up to several times the default sensitivity; on the Mac at the default it follows a 27
-     * deg/s sweep about 10 deg behind) and each frame's motion is capped. Y inversion isn't handled. */
+     * moderate (LB_HEAD_GAIN, 0.5; 0.8 already overshoots at the default sensitivity) and each frame's motion is
+     * capped (LB_HEAD_CAP, below). Y inversion is detected (below). */
     static float prev_err, ysign = 1, win_dy, win_pitch0;
-    static int diverging, win_n;
+    static int diverging, win_n, contradicting, y_decided;
     const float kx = counts, ky = counts;
     /* Inverted Y (the game's Invert Y Axis option): over 20-frame windows, if the pitch moved against the
-     * vertical motion sent, flip the sign. Uninverted, mouse down (dy > 0) looks down. */
+     * vertical motion sent, flip the sign. Uninverted, mouse down (dy > 0) looks down. The evidence must hold for
+     * three windows in a row, and the sign is decided once: on the Vision Pro a single window often disagreed
+     * (the head moving the target while the game lags), and the sign flipped 5 times in a 5-minute session, each
+     * wrong flip steering pitch the wrong way until the next. */
     if (win_n == 0) { win_pitch0 = game_pitch; win_dy = 0; }
     if (++win_n >= 20) {
         float tilted = game_pitch - win_pitch0;
         /* expected: dy > 0 tilts down (tilted < 0) when ysign = 1, up when ysign = -1 */
-        if (fabsf(win_dy) > 40 && fabsf(tilted) > 0.02f && (tilted > 0) == ((win_dy > 0) == (ysign > 0))) {
+        const bool against = fabsf(win_dy) > 40 && fabsf(tilted) > 0.02f && (tilted > 0) == ((win_dy > 0) == (ysign > 0));
+        contradicting = against ? contradicting + 1 : 0;
+        if (!y_decided && contradicting >= 3) {
             ysign = -ysign;
-            LOG("head: vertical mouse looks inverted; flipping (now %s)", ysign > 0 ? "normal" : "inverted");
+            y_decided = 1;
+            LOG("head: vertical mouse looks inverted; flipping (now %s), decided for this session", ysign > 0 ? "normal" : "inverted");
         }
         win_n = 0;
     }
@@ -270,7 +280,12 @@ static void head_steer(void) {
     frame_scale = fmaxf(0.5f, fminf(3.0f, frame_scale));
     carry_x += err_yaw * kx * gain * frame_scale;
     carry_y -= err_pitch * ky * gain * ysign * frame_scale;   /* mouse down = look down, unless inverted */
-    float cap = 40;
+    /* LB_HEAD_CAP: the most counts sent per frame and axis (120 by default; it was 40, about 2.3 degrees per frame
+     * at the default 1000 counts per radian, so a fast head turn outran the game camera). With LB_HEAD_GAIN 0.5 (was
+     * 0.2), a sweep at up to 81 deg/s on the Mac (LB_HEAD_TEST=sweep LB_HEAD_TEST_SPEED=3) trails by 2.2 degrees on
+     * average and 3.8 at most, against 5.4 and 8.8 before; gain 0.8 with cap 200 overshoots (6.0 and 18.3). */
+    static float cap = -1;
+    if (cap < 0) cap = getenv("LB_HEAD_CAP") ? fmaxf(1.0f, (float)atof(getenv("LB_HEAD_CAP"))) : 120.0f;
     carry_x = fmaxf(-cap, fminf(cap, carry_x));
     carry_y = fmaxf(-cap, fminf(cap, carry_y));
     int dx = (int)carry_x, dy = (int)carry_y;
