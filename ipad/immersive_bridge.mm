@@ -42,7 +42,9 @@ typedef struct skyrim_immersive_frame {
 int skyrim_frame_camera(float out[18]);  /* runtime/d3d9_bridge.cpp */
 int skyrim_frame_eyes(float tangents[8], float eye_pose[32]);
 int skyrim_frame_eye(float *k_out);  /* runtime/d3d9_bridge.cpp: -1 left, 0 none/centre, +1 right; k_out: clip shift */
+int skyrim_present_frame(void);  /* runtime/d3d9_bridge.cpp: LB_SHOT's frame number */
 }
+void tap_shot_shown(int frame, id<MTLTexture> eye0, id<MTLTexture> eye1);  /* ipad/tap_shot.mm: LB_TAP_SHOT */
 
 namespace {
 
@@ -60,6 +62,7 @@ struct Entry {
     bool valid = false;
     uint64_t submitted_ns = 0;  /* monotonic, stamped in on_frame; see gpu_observe */
     uint64_t ready_ns = 0;      /* monotonic, when acquire first saw the frame ready; 0 until then */
+    int game_frame = 0;         /* LB_SHOT's number for the frame (LB_TAP_SHOT) */
 };
 
 struct Cached {
@@ -102,6 +105,7 @@ Entry entry_of(const dxvk_present_tap_frame *frame) {
     entry.depth_layers = frame->depth_layers;
     entry.has_camera = skyrim_frame_camera(entry.camera) != 0;  /* called inside this frame's Present */
     entry.eye_views = entry.has_camera && entry.layers >= 2 && skyrim_frame_eyes(entry.eye_tangents, entry.eye_pose) != 0;
+    entry.game_frame = skyrim_present_frame();
     entry.valid = true;
     return entry;
 }
@@ -358,6 +362,7 @@ extern "C" int skyrim_immersive_acquire(skyrim_immersive_frame *out) {
     if (!texture.sampled) return 0;
     out->texture = (__bridge void *)texture.sampled;
     out->needs_srgb_decode = texture.decode ? 1 : 0;
+    if (out->is_new) tap_shot_shown(g_shown.game_frame, texture.sampled, texture.sampled_eye2);
     out->width = g_shown.width;
     out->height = g_shown.height;
     const CachedDepth &depth = depth_texture(g_shown);
