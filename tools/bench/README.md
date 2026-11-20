@@ -66,6 +66,69 @@ Both are optional; a log without them parses as before.
   excluded, as for frame times. `compare` prints a per-class table (draws, prims, GPU ms; baseline->candidate and
   the ratio) per phase when both runs have `passes`. Pass lines are read from the game log and the console.
 
+## Frame budget per phase (`budget`)
+
+Every phase in `summary.json` (and `overall`) also gets a `budget` object, from lines the runtime, DXVK and the
+immersive compositor print anyway (`budget.py` lists them). Blocks whose lines a log lacks are left out, so Mac and
+older logs parse as before.
+
+- `gpu_busy`: DXVK's `gpu busy` windows (`LB_POWER_LOG_S`): frame-weighted `ms` and `pct`, the range over windows,
+  and `capped` (the frame cap was on). Busy time measured under the cap understates the work on Apple GPUs, so
+  compare capped runs only with capped runs, and take headroom from an uncapped run (`LB_MAX_FPS=0`).
+- `cadence`: the compositor's `immersive cadence` windows: how many game frames were held for 1, 2, 3 or 4+
+  refreshes (at 45 fps on 90 Hz every frame should be held 2; `held_2_share`), frames replaced unseen, and the game
+  GPU latency mean (weighted by frames) and max. That latency is an upper bound on the game frame's GPU time (see
+  `ipad/immersive_bridge.mm`).
+- `compositor_gpu`: the compositor's own GPU time per refresh: the mean of its 5 s windows, their range, the
+  highest window p95 and the max. There are two refreshes per game frame at 45 fps.
+- `pipelines`: pipelines compiled at draw time (`LB_PIPE_LOG=1`): count, total ms, longest ms; and compiled ahead.
+  A compile counts towards the frame whose `ft` line follows it.
+- `hitches`: frames the hitch sampler caught (`LB_HITCH_MS`), with its threshold and the longest. Screenshot frames
+  are left out, as for frame times.
+
+The windowed lines carry no frame number, so each is placed at the last `ft` frame before it and covers the frames
+of its window; it counts towards a phase when at least half of it lies inside. `overall` covers loading and menus
+too, so its windowed blocks keep only windows in which the game delivered at least 90% of its frame cap
+(`basis: "steady"`), when there are any. A log without `ft` lines (a play session) puts everything in `overall`.
+
+`meta` gets the run's `thermal` state (`worst`, `last`, `seen`), `frame_cap_fps` (from the runtime's `present
+pacing` line, not the environment: on a device `launch-env.json` overrides it), `state_cache_entries`,
+`hitch_threshold_ms` and, for immersive runs, the compositor's `foveation` and `refine_steps`. A run that reaches
+*serious* prints a warning.
+
+`bench.py parse <results dir>` re-parses a run with today's parser (`--write` updates its `summary.json`).
+
+## Headset sessions (`session.py`, `report.py`)
+
+`session.py` runs a session plan: several launch configurations (arms) interleaved across scenarios, with a
+manifest. A plan (`sessions/*.json`) names env fragments, arms built from them, a launch check, sequences of
+`[scenario, arm, run]` (or `{"scenarios", "rounds", "arms"}`, which alternates arms within each round), and optional
+questions. `sessions/budget.json` is the frame-budget session: stereo 1600x1100 and 1280x880 and mono 1280x880,
+two rounds each in the boss fight and the Whiterun market, after two warm-up runs, then one uncapped run.
+
+    export SKYRIM_BENCH_DEVICE=<udid> SKYRIM_BUNDLE_ID=<the installed app's bundle ID>
+    python3 tools/bench/session.py budget check --tag <build>      # stops on an abort or missing stereo lines
+    python3 tools/bench/session.py budget run warmup --tag <build> # untimed: fills DXVK's pipeline cache
+    python3 tools/bench/session.py budget run timed --tag <build>  # --from N / --only N to resume or repeat
+    python3 tools/bench/session.py budget run uncapped --tag <build>
+    python3 tools/bench/session.py budget restore                  # the device's own launch-env.json back
+    python3 tools/bench/session.py budget report                   # bench-results/sessions/budget/summary.md
+
+On a device the app applies `Documents/SkyrimNative/launch-env.json` over the environment bench launches it with, so
+the driver puts each arm's keys in that file (saving the device's own first) rather than on bench's command line.
+The plan's `"immersive": true` starts the game through Play Immersive (`BENCH_IMMERSIVE=1`), which stereo and the
+compositor need. Runs are labelled `<plan>-<tag>-<arm>-r<run>`; run 0 is a warm-up. `push ARM` puts one arm on the
+device for play by hand; `--pull-layers` also pulls both eyes' shots and depth files. `--mac BUILD_DIR` runs the
+same plan on the macOS build as a dry run (its own manifest; there is no compositor there). The session folder
+(`--dir`, default `bench-results/sessions/<plan>`) holds the manifest, the saved `launch-env.json` and the answers.
+
+`report.py` re-parses runs (a manifest, result directories, or a hand-pulled game log) and writes one Markdown
+report: per run and phase, work mean and p95, frame p95 and frames over 33 ms, held counts, game GPU latency,
+compositor GPU, GPU busy (capped or not), at-draw compiles, hitches and thermal state; then a mean per scenario and
+arm over complete runs below *serious*, without warm-ups. `--json` writes every re-parsed summary.
+
+`test_bench.py` checks all of this on a synthetic log.
+
 ## Scenarios
 
 JSON in `scenarios/`. From the main menu they open the console, type commands (`tgm`, then `coc <cell>`, which
@@ -78,6 +141,6 @@ when the main menu is up, and adjust `console_at`, the phases and `exit_frame`.
 - On a device the headset must be worn and awake; visionOS suspends apps otherwise.
 - Input is timed in frames, so a slow load shifts everything after it. The screenshots show whether the run went
   where it should. A run that didn't reach its exit frame is flagged and shouldn't be compared.
-- Note the thermal state (`native: thermal …` in the notes) before comparing runs.
+- Note the thermal state (`meta.thermal` in `summary.json`) before comparing runs.
 - Simulator runs need the visionOS Simulator build installed with the game staged in its `Documents/Skyrim`.
   They measure CPU-side changes, not the M2's GPU.

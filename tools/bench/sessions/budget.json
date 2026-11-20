@@ -1,0 +1,35 @@
+{
+  "about": "Headset frame budget at the best known configuration. Two untimed warm-up runs fill DXVK's pipeline cache, then three arms interleaved for two rounds in the boss fight and Whiterun market: stereo 1600x1100 and 1280x880 (eye views, so the game's field of view follows the eyes, 119.8 degrees with the measured tangents), and mono 1280x880 at the same field of view by number with the depth copy on. Then one uncapped stereo 1600x1100 boss fight, because GPU busy time measured under the frame cap understates the work on Apple GPUs. Every arm logs pipeline compiles (LB_PIPE_LOG) and samples frames over 40 ms (LB_HITCH_MS). Steps: check, run warmup, run timed, run uncapped, restore, report (about 50 minutes).",
+  "immersive": true,
+  "env": {
+    "common": {"LB_IMMERSIVE_HEAD": "1", "LB_PIPE_LOG": "1", "LB_MAX_FPS": "45", "LB_HITCH_MS": "40"},
+    "stereo": {"LB_STEREO_EYE_UNITS": "2.24", "LB_STEREO_MULTIVIEW": "1", "LB_STEREO_PRESENT": "1",
+               "LB_EYE_VIEWS": "1", "LB_EYE_LATE": "1", "LB_STEREO_HUD_DEPTH": "2"},
+    "w880": {"LB_WINDOW": "1280x880"},
+    "w1100": {"LB_WINDOW": "1600x1100"},
+    "mono": {"LB_FOV": "119.8", "LB_DEPTH_COPY": "1"},
+    "uncapped": {"LB_MAX_FPS": "0"}
+  },
+  "arms": {
+    "stereo-1100": ["common", "stereo", "w1100"],
+    "stereo-880": ["common", "stereo", "w880"],
+    "mono-880": ["common", "mono", "w880"],
+    "stereo-1100-uncapped": ["common", "stereo", "w1100", "uncapped"]
+  },
+  "check": {
+    "scenario": "riverwood-walk-avp",
+    "arm": "stereo-880",
+    "expect": ["stereo: live single-pass stereo"],
+    "expect_device": ["immersive: stereo frames: each eye draws its own picture", "immersive: eyes: tangents"]
+  },
+  "sequences": {
+    "warmup": [["boss-fight-avp", "stereo-1100", 0], ["boss-fight-avp", "mono-880", 0]],
+    "timed": {"scenarios": ["boss-fight-avp", "whiterun-market-avp"], "rounds": [1, 2],
+              "arms": ["stereo-1100", "stereo-880", "mono-880"]},
+    "uncapped": [["boss-fight-avp", "stereo-1100-uncapped", 1]]
+  },
+  "questions": [
+    "Any visible hitch or judder in the timed runs, and where?",
+    "Shadows and foliage edges correct in both eyes?"
+  ]
+}
