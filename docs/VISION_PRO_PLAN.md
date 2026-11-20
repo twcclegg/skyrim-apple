@@ -1,195 +1,179 @@
-# Vision Pro plan (working draft)
+# Vision Pro plan
 
 Native Apple Vision Pro support for the AOT-recompiled 2011 Skyrim runtime, developed in
-`twcclegg/skyrim-apple`. Upstream (`zschwendi/skyrim-apple`) is inactive, and nothing further is expected
-from it. The order is **windowed play → immersive (stereo + head tracking) → PSVR2 Sense**, each gated
-on its own device evidence.
+`twcclegg/skyrim-apple` (DXVK in `twcclegg/dxvk-native`, branch `skyrim-apple`). Upstream
+(`zschwendi/skyrim-apple`) is inactive. This document says what the project is now and what comes next, in
+order. Measurements and their history are in [perf/LOG.md](perf/LOG.md) and issue #42. Rewritten 2026-11-20;
+the earlier milestone plan is summarised under [Superseded](#superseded).
 
-**Status:** windowed play (M1) works on the M2 Vision Pro (visionOS 27.3): about 60 fps at 1280×720
-on the Low preset, with audio, keyboard and saves. The trackpad can't keep the pointer in
-a Shared Space window, so mouse look stops at the window's edge.
+## Status (2026-11-20)
 
-3D immersive with head tracking (M2 and the M3a path: the game's depth on a world-locked screen, the head
-turning the game camera) mostly works and is borderline playable on the M2 at the Low preset and 1280×720
-in quiet scenes; busy scenes such as combat drop frames. Open problems: the trackpad still loses the pointer,
-and the headset powered off twice on battery (never on AC). See [HEAD_TRACKING.md](HEAD_TRACKING.md).
+- **Target:** the game at 45 fps on the 90 Hz display, each game frame shown for two refreshes: **22.2 ms per
+  game frame** for CPU, GPU and the compositor's share.
+- **Works on the M2 Vision Pro:** live per-eye stereo (DXVK multiview), head tracking, and the
+  depth-reprojecting immersive compositor, at the full field of view of both eyes. In Riverwood the game holds
+  45 fps and every refresh is presented (headset, 19 Nov; #42).
+- **Not known:** whether 45 fps holds in combat at the current config. Every timed headset run at this config is
+  in Riverwood, the quiet scene; the only stereo boss-fight runs on the headset are at 1280×720 and `LB_FOV=65`.
+- **Windowed play** (Shared Space window) also works: about 60 fps at 1280×720 on the Low preset, with audio,
+  keyboard and saves. The trackpad can't keep the pointer in the window, so mouse look stops at its edge.
+- **Visible defects:** hitches from pipelines compiled at draw time; the reticle doubles on fast pans (fix in
+  #66); shadows break with eye views (eye views stay off).
 
-## How the existing iPad runtime works (what we inherit)
+## How it works
 
-- `gen/` (private, per-user) is the x86 game lifted to C; compiled for arm64 with the runtime.
-  Nothing in it is iPad-specific, so the same `gen/` should compile for `xros` unchanged.
-- `runtime/` emulates Win32/D3D9/XAudio/DInput. D3D9 calls go through
-  `runtime/d3d9_bridge*.cpp` into DXVK (d3d9 → Vulkan) → MoltenVK → Metal.
-- `runtime/platform_sdl.c` owns the SDL2 window (Vulkan surface for DXVK), event pump,
-  pause/suspend/quit (`LB_IOS_DEVICE`), and `platform_present_hook()` runs once per Present.
-- `ipad/native_bridge.mm` is the C API the SwiftUI launcher calls (`skyrim_native_run` etc.).
-  The game runs **on the main thread** inside the launcher; SDL attaches its `UIWindow` to the
-  launcher's scene (`simulator/prepare_sdl.py` overlay on pinned SDL 2.30.9).
-- `ipad/build.py` + `ipad/CMakeLists.txt` build one merged static `libSkyrimNative.a`
-  (gen + runtime + SDL + DXVK + MoltenVK + FFmpeg), then `xcodebuild` links it into the
-  `SkyrimIOS` target via `SKYRIM_NATIVE_LDFLAGS` / `SKYRIM_NATIVE_RUNTIME`.
-- The 4 GiB guest reservation needs `extended-virtual-addressing` + `increased-memory-limit`.
-- `apple/project.yml` already has a `SkyrimVision` launcher target (launcher only, no runtime).
-- Useful precedents in-tree:
-  - `runtime/hud_screen.cpp` redirects `IMenu::Render` vtable slots and swaps render targets to
-    draw HUD/menus into a separate image — the exact tool for floating menus in immersive.
-  - DXVK's `wsi_native_surface.{h,cpp}` lets us hand DXVK an arbitrary native surface by HWND.
-  - `d3d9_bridge.cpp` `B_IDirect3DDevice9_Present` is the single choke point for frame handoff.
+### Runtime (from the iPad port)
 
-## Blockers found
+- `gen/` (private, per user) is the x86 game lifted to C and compiled for arm64 with the runtime, with pinned
+  guest registers (`LB_PINNED_REGS`, which also needs three LLVM passes off: `macos/CMakeLists.txt`).
+- `runtime/` emulates Win32, D3D9, XAudio and DInput. D3D9 goes through `runtime/d3d9_bridge*.cpp` into DXVK
+  (D3D9 → Vulkan) → MoltenVK → Metal.
+- `runtime/platform_sdl.c` owns the SDL2 window, event pump, pacing and suspend; `ipad/native_bridge.mm` is the
+  C API the SwiftUI launcher calls. The game runs on the main thread inside the launcher.
+- `ipad/build.py --platform visionos` builds one static `libSkyrimNative.a` (gen, runtime, SDL with the
+  visionOS overlay, DXVK, MoltenVK, FFmpeg) that `xcodebuild` links into the `SkyrimVision` app. The 4 GiB guest
+  reservation uses `extended-virtual-addressing` and `increased-memory-limit`.
 
-| # | Blocker | Plan |
-|---|---|---|
-| B1 | Vendored **SDL 2.30.9 has no visionOS support** (uses `UIScreen`, unavailable on xros). | Extend the `prepare_sdl.py` overlay with a visionOS adaptation (backport SDL3's `SDL_PLATFORM_VISIONOS` handling: no `UIScreen`, scene-sized window, fixed display mode, no orientation). Keeps runtime input code identical. |
-| B2 | MoltenVK fetcher uses `MoltenVK-ios.tar` (no xros slice). | `MoltenVK-all.tar` v1.4.2 **does** contain `static/MoltenVK.xcframework/xros-arm64` (+ xros simulator). Add a pinned xros extraction. |
-| B3 | FFmpeg built for `iphoneos` only. | Same script, `arm64-apple-xros` triple + `xros` SDK. |
-| B4 | Build tooling hard-codes iphoneos (`CMakeLists.txt` SDK check, `platforms()` LC_BUILD_VERSION check expects 2; xros device is 11). | Parameterise `ipad/build.py` by platform (`--platform visionos`), new `vision/toolchain.cmake`. |
-| B5 | **Memory entitlements on visionOS** are the #1 risk: without the 4 GiB reservation nothing runs. Apple's docs don't list visionOS for EVA, but avp-craft, mc-avp-stereo and the maintainer's Titanfall work all report it granted and working on the headset. | Day-1 on-device probe (signed `mmap(4 GiB)` app). Do **not** add `increased-debugging-memory-limit` (iOS-only; one bad key fails signing and drops the memory keys with it). |
-| B7 | visionOS watchdog kills apps whose main thread blocks (avp-craft). The iPad build runs the game on the main thread and relies on SDL turning the run loop. | Keep that for M1 (it's what works on iPad) but measure; fallback is Halo's model: engine on its own high-QoS pthread, UI/SDL events on main. |
-| B8 | Deployment target is visionOS 2.0; Sense, `AccessoryTrackingProvider`, `UIHostingSceneDelegate` immersive need 26. | Target visionOS 26 with the Xcode 27 SDK, like 117-vision and avp-craft. |
-| B6 | Launcher gates runtime to `os(iOS)` (`NativeRuntime.swift`, `LauncherModel.Runtime`). | Add `os(visionOS)` paths, `Native-visionOS-*.entitlements`, link flags on `SkyrimVision`. |
+### Stereo: DXVK multiview
 
-## Target hardware: Vision Pro M2
+- `LB_STEREO_MULTIVIEW=1` gives two layers to colour targets of the back buffer's size and to their
+  depth-stencil, and draws those passes once with two views (main scene, effects, first person, full-size post,
+  interface). Each view gets its own clip matrices. Shadow maps, the downsampled post chain and the 960×540 pass
+  (`refl` class; what it is: see [perf/LOG.md, Pass classes](perf/LOG.md#pass-classes)) stay mono, and the
+  two-view passes sample them in both eyes.
+- `LB_STEREO_EYE_UNITS=2.24` (half of a 64 mm separation at 70 units per metre) is required; without it live
+  stereo stays off.
+- `LB_DEPTH_COPY` (on with multiview) replaces the game's second scene pass into an R32F depth target with a GPU
+  copy of the hardware depth: −12% GPU in stereo on the M1.
+- `LB_STEREO_PRESENT=1` hands both eyes' final pictures and depth layers to the compositor through the present
+  tap in `d3d9_swapchain.cpp` (`VK_EXT_metal_objects`). The interface is drawn at 2 m (`LB_STEREO_HUD_DEPTH=2`);
+  #66 with dxvk-native #7 draws it as its own flat layer instead.
+- First-person draws write depth through their own near plane; the bridge rescales it to the world's
+  (`LB_FP_DEPTH_SCALE`), so hands and weapons are reprojected at the right distance.
+- On a device without layered rendering (the visionOS simulator) #63 with dxvk-native #6 falls back to mono.
 
-Our headset is the original M2 Vision Pro (8-core CPU, 10-core GPU, 16 GB). The only verified device
-is an iPad Pro M5, which rendered at 1210×834 with no steady 60 fps claim — so the M2 headset will
-have noticeably less GPU, and the system compositor and passthrough also take part of it.
+### Immersive compositor (`apple/Sources/App/ImmersiveScreen.swift`)
 
-- **Measure before designing stereo.** M1 must record steady-state frame times (in town, in the open,
-  in combat) at a few resolutions and presets. Those numbers decide M3.
-- **Get an early estimate off the headset:** run the existing macOS build on an M2 Mac at the same
-  resolution and settings before the visionOS port is up.
-- **Default settings:** start windowed at about 1280×720 on the Low/Medium preset with reduced
-  shadows, and expose a render-scale knob (`LB_*`).
-- **Shader compilation:** first-run DXVK shader compilation stutters more on fewer cores. Keep the
-  state cache, and consider a warm-up pass.
-- **Immersive GPU budget:** the compositor pass must be cheap (one textured quad, foveated). Halo
-  dropped to 45 Hz when compositor GPU time went over 11.1 ms.
-- **Memory:** record `os_proc_available_memory()` at launch. The headset's limit may be below the
-  iPad's even with `increased-memory-limit`.
-- **Thermals:** run 30-minute soak tests. Sustained clocks on the headset are the real limit.
+- A `CompositorLayer` frame loop at 90 Hz shows the newest finished game frame; at 45 fps each is held for two
+  refreshes (`immersive cadence: … held 2`).
+- Each eye's picture is drawn as a mesh from its depth layer, at the pose it was rendered with, and viewed from
+  the current head pose, so head motion between game frames is corrected with parallax. `LB_IMMERSIVE_REFINE=N`
+  adds a per-pixel depth search that removes the mesh's shards at foliage edges (#64 makes it the default).
+- Gaps the mesh leaves at depth edges get a blurred fill (`LB_IMMERSIVE_HOLES`, on by default; about 2.3 ms of
+  compositor GPU on the headset, 16 Nov).
+- Cost on the headset: 3.4–4.2 ms per refresh, twice per game frame (19 Nov).
+- Implemented, not in the best config: system foveation of the compositor pass (`LB_FOVEATION=1`, never run on
+  the headset) and following the player between game frames (`LB_IMMERSIVE_MOTION=1`).
 
-## Milestones
+### Head steering (`LB_IMMERSIVE_HEAD=1`, [HEAD_TRACKING.md](HEAD_TRACKING.md))
 
-### M0 — Bring-up (no game yet)
-- Workflow: `twcclegg/skyrim-apple`, a branch and PR per milestone, merged there.
-- Build our own `gen/` from an owned 1.9.32.0.8 install; build + run the iPad target once as a
-  baseline so we know the toolchain is healthy before touching it.
-- Entitlement probe on the headset (B5). Record device model (M2 vs M5 AVP) and visionOS version.
+The compositor publishes the head's yaw and pitch; each game frame the runtime turns the game's camera toward
+them with synthetic mouse look, closed-loop on the camera it reads at Present. Aim follows the head; the right
+stick adds a body yaw offset. The compositor corrects what steering hasn't caught up with. On the headset,
+steering trailed by up to 12.5° in pitch and its vertical-inversion detector flipped; #65 fixes both (Mac
+sweep: lag 5.4°/8.8° → 2.2°/3.8° mean/max).
 
-### M1 — Windowed play
-1. SDL visionOS overlay (B1); compile-only first, then window creation in a SwiftUI WindowGroup.
-2. Deps for xros (B2, B3); `ipad/build.py --platform visionos engine/app`.
-3. Launcher: `SkyrimVision` links the engine; `NativeRuntime` on visionOS; status.json/logs same.
-4. Game window: separate 16:9 window (resizable), back buffer sized from window points × scale;
-   `view_rect()` letterboxing already handles aspect.
-5. Input: DualSense via GameController (same XInput path), GCKeyboard/GCMouse.
-   visionOS turns controller input into pinches unless the game view opts in: add a
-   `GCEventInteraction` (`handledEventTypes = .gamepad`) to SDL's view in the SDL overlay (117-vision
-   does this on its MTKView); SDL's MFi joystick path then gets input exclusively. SDL 2.30.9's
-   GCKeyboard/GCMouse path compiles for xros (the xros 27.2 SDK defines
-   `__IPHONE_OS_VERSION_MAX_ALLOWED` = 17.0, observed). Device unknowns: pointer lock in a Shared Space
-   window, BT mouse as GCMouse. No-controller fallback: pinch → click for menus, and the existing
-   virtual-pad overlay (`runtime/touch.cpp`, `LB_TOUCH=1`) for play.
-6. Lifecycle: scene phase / occlusion → `platform_native_set_suspended`; pause → launcher.
-7. Acceptance: menu + cart ride + 10 min play, audio, controls, pause/resume, save/load, on device,
-   with frame-time logs. Check thermals/perf on the AVP GPU (M2 is much weaker than iPad M5).
+### Field of view and eye views
 
-### M2 — Immersive "cinema" (mono, low risk)
-- `ImmersiveSpace { CompositorLayer }` opened from the running game ("Expand"); closing returns
-  to the same running game. Copy 117-vision's single-owner state machine: one runtime, one
-  serialized presentation owner; Expand = open space → wait for first compositor frame → dismiss
-  window; Return = open window → wait for `.foregroundActive` → dismiss space; scene generations
-  reject stale `onDisappear`.
-- Compositor thread at display rate (90 Hz), independent of the game's ≤60 fps; it re-presents
-  the newest finished game image. Frame loop per avp-craft/117: `queryNextFrame` →
-  `predictTiming` → `wait(optimalInputTime)` → `queryDrawables` → `startSubmission` → encode →
-  `encodePresent` → `endSubmission` (never end an abandoned frame). Head pose at
-  `presentationTime`; `drawable.deviceAnchor` = display pose.
-- Handoff at `Present` (static review of dxvk-native 1.9.2 + MoltenVK 1.4.2, untested):
-  there is no `ID3D9VkInteropDevice` in 1.9.2, but we build our own DXVK (the fork
-  `twcclegg/dxvk-native`, branch `skyrim-apple`), so tap it directly there. Add an
-  `extern "C"` present-tap in `d3d9_swapchain.cpp` `D3D9SwapChainEx::PresentImage`, inside the
-  `SubmitPresent` CS lambda after `submitCommandList`, passing VkDevice/VkQueue and the D3D9 back
-  buffer's VkImage (`m_backBuffers[0]->GetCommonTexture()->GetImage()->handle()`), extent and format.
-  Enable `VK_EXT_metal_objects` in `DxvkAdapter::createDevice`'s `__APPLE__` block and get the
-  `MTLTexture` via `vkExportMetalObjectsEXT` (proc address; 1.9.2's loader lacks it). Export the back
-  buffer, **never** swapchain images (MoltenVK returns the current `CAMetalDrawable`, which changes and
-  can block). Sync: timeline semaphore → exported `MTLSharedEvent`, compositor `encodeWait` before its
-  blit into a 3–6 slot ring; publish with the pose it was rendered at (gta5-vision `sendToVR`). The
-  bridge's `Present` and `platform_present_hook` run before DXVK's async present: bookkeeping only.
-- Layer: `bgra8Unorm_srgb` + `depth32Float`; pipeline built against the *granted* colour format.
-  **Write the quad's geometric depth** (reverse-Z, `.greater`, writes on, clear to 0): visionOS
-  reprojects with drawable depth, and a quad without depth writes is invisible (avp-craft, on device).
-  Foveation off for M2; turn it on only together with `rasterizationRateMap` on the pass. Validate
-  config through `LayerRenderer.Properties` (throws instead of killing the scene).
-- Prerequisites (design review, untested): `UIApplicationSupportsMultipleScenes = true` (an
-  ImmersiveSpace is a second scene), so SDL must bind **explicitly** to the game window's scene (the
-  overlay's attach loop and the shim's `SDLXR_ActiveScene` currently match any scene). Check that
-  opening a Full Space doesn't fire `UIApplicationWillResignActive` (which suspends the game).
-- Slot handoff: the tap callback fills a one-entry mailbox (replacing = release); the compositor takes
-  it only when `dxvk_present_tap_ready` says the GPU is done, else re-presents the current slot.
-  Retired slots are released from the completion handler of the first command buffer that no longer
-  samples them. Sample through a `.bgra8Unorm_srgb` texture view (the tap image is UNORM holding sRGB
-  values); force alpha 1; no vertical flip.
-- Risk: while immersive, DXVK still presents to the (hidden) SDL window, and `nextDrawable` can stall
-  ~1 s. Plan: a tap-only mode that skips WSI acquire/present while the immersive layer runs, pacing
-  with the runtime's `pace_present`.
-- Content: a world-locked 16:9 screen (~2.8 m wide at 3 m, placed at head yaw, recenter on request); menus/settings via `.utilityPanel` windows.
+- Each eye sees tangents 1.732 outward, 1.0 inward, 1.0 up, 1.192 down, eyes 66 mm apart (about 105° × 95°).
+  A symmetric game frustum covering both eyes plus the compositor's 2° margin is ±1.881 × ±1.280: `LB_FOV=119.8`
+  at the 4:3 reference. Per eye only about 62% of the rendered pixels are ever shown.
+- Eye views (`LB_EYE_VIEWS=1`, with `LB_EYE_LATE=1` turning the eyes toward the head before the main pass)
+  render each layer through that eye's own frustum. On the headset they put the scene's shadows on a tilted plane
+  in one eye and make them swim in the other, so they are off until items 3 and 4 below.
 
-### M3 — Immersive stereo + head tracking
-- **The approach depends on M2 performance.** Alternating eyes halves each eye's frame rate: a 60 fps
-  game gives 30 fps per eye, which is fine, but 40 fps gives 20, which is likely uncomfortable. If M1
-  shows the M2 can't hold about 50–60 fps at a usable resolution, ship **M3a, mono with head-look**
-  first: the head pose turns the render camera, with rotational timewarp, and no stereo. Make
-  alternate-eye stereo an opt-in setting.
-- Alternate-eye rendering (gta5-vision / R.E.A.L. style): hook the main scene camera update in
-  the generated code (NiCamera world→camera for the player camera), apply head pose + eye offset
-  for render only, **restore after** so game logic/aim/collision never see it.
-- Camera hook candidates (static reads of TESV_unpacked.exe d97eb0cc… + gen/, **not runtime-verified**;
-  full notes kept privately with the RE work):
-  - Main world NiCamera W: `*(*(0x1B2E8BC)+0xB8)`. NiCamera: world rotation +0x54..+0x74, translation
-    +0x78..+0x80, world→**clip** matrix (view × projection) +0xA8..+0xE4, frustum l/r/t/b tangents
-    +0xE8..+0xF4, near/far +0xF8/+0xFC, ortho +0x100. 0xAB8640 builds the matrix from the transform
-    **and** the frustum, so write the frustum first, then call it. Projection is standard D3D Z [0,1].
-  - PlayerCamera singleton 0x12E7288; worldFOV +0xAC, firstPersonFOV +0xB0. FOV→frustum at 0xB17960
-    (horizontal FOV at a 4:3 reference, inferred).
-  - Frame order in 0x69F950: PlayerCamera update (0x73F240) → world render 0x69BDF0 (frustum via
-    0x6975D0, then world passes). The 1st-person camera (0x697FC0 / 0x698B30) re-runs 0xB17960 on W
-    with firstPersonFOV, copies W's frustum and **rotation** only, takes its translation from
-    PlayerCamera + a viewmodel origin offset, then restores W's frustum.
-  - So a one-shot frustum write is lost. Hook instead: post-hook 0xB17960 (or 0xAB7710) to substitute
-    the per-eye frustum on every call; apply head rotation + translation + eye offset to W after
-    0x6975D0 returns (0x69B540); post-hook 0x697FC0/0x698B30 to add translation + eye offset to the
-    1st-person camera; restore after 0x69BDF0 returns (0x69FA1D). In stereo, 1st-person FOV = headset FOV.
-  - Confirm first at runtime: one-frame entry/exit log of 0x73F240, 0x6975D0, 0x697FC0, 0xB17960,
-    0x69BDF0, and read W's frustum at 0x69B540 with `fDefaultWorldFOV=90` to settle the FOV axis.
-  - Per-pixel depth for later (M3+): the game creates a readable INTZ depth texture (RESZ path,
-    supported by DXVK 1.9.2); export it before the UI passes, linearise, mask UI.
-- Tag each frame with its pose (ring buffer), draw per-eye quads at the rendered pose with a wider
-  game FOV than the display → rotational reprojection covers 60→90 Hz and eye alternation.
-- Skyrim is Z-up; ~70 game units per metre for head translation. Yaw-only recenter on start and on
-  Crown press.
-- Disable depth of field / imagespace blur in stereo (INI) to avoid eye-swap smear.
-- Compositor draws each eye's image as a quad at the pose/FOV it was rendered with, viewed from the
-  current head pose (avp-craft `kl_reproject.h`, rotation-only timewarp; no translation without depth).
-- HUD/menus to a floating panel via the `hud_screen.cpp` render-target redirect technique; lazy
-  head-follow (117-vision `EngineImmersiveHUDPose`: small deadband, ≤10° lag) or avp-craft's
-  head-locked 2 m / −15° placement.
-- Comfort: off / smooth / 30°·45° snap turn (no auto-repeat), recenter on request.
-- Later upgrade if AER halves perceived rate too much: 117-vision's "centre-only stereo" (render
-  only the forward view twice) — but Skyrim can't easily render a scene twice per frame, so AER first.
+## Current best headset config
 
-### M4 — PSVR2 Sense (deferred: no Sense controllers to test with)
-- `GCProductCategorySpatialController` (visionOS 26+; launcher already detects it) →
-  `Accessory(device:)` → `AccessoryTrackingProvider` on its **own** `ARKitSession`
-  (a denied permission must not kill rendering); `predictAnchor(for:at:)` per frame.
-  Info.plist: `NSWorldSensingUsageDescription`, `NSAccessoryTrackingUsageDescription`.
-- Buttons/sticks → XInput first; tracked aiming later. Cancel system trigger-pinch while active.
+| Key | Value |
+|---|---|
+| `LB_IMMERSIVE_HEAD` | `1` |
+| `LB_STEREO_EYE_UNITS` | `2.24` |
+| `LB_STEREO_MULTIVIEW` | `1` (turns on `LB_DEPTH_COPY`) |
+| `LB_STEREO_PRESENT` | `1` |
+| `LB_STEREO_HUD_DEPTH` | `2` |
+| `LB_WINDOW` | `1600x1100` (the eyes' aspect) |
+| `LB_FOV` | `119.8` |
+| `LB_IMMERSIVE_REFINE` | `4` |
+| `LB_MAX_FPS` | `45` (the visionOS default) |
+| eye views | off |
+
+Riverwood at this config (19 Nov, capped): DXVK GPU busy 57–65%, 12.7–14.4 ms per frame; game GPU latency mean
+15 ms; compositor 3.4–4.2 ms per refresh. Capped busy time on Apple GPUs is not a cost measure (the GPU clocks
+down with slack; #42 correction), so the headroom is uncertain both ways. A measured win not yet in it:
+`LB_LOCK_STAGING=1` (−3 to −10% game work by phase on the M5).
+
+## Work list, in order
+
+Numbers are the items of the 2026-11-20 plan review; the order is by expected value per effort. S ≤ 1 day,
+M 2–4 days, L a week or more.
+
+| Rank | Item | What | Size / where | Depends on |
+|---|---|---|---|---|
+| 1 | 1. Headset frame budget | The timed session never run: stereo 1600×1100, stereo 1280×880, mono 1280×880 (`LB_FOV=119.8 LB_DEPTH_COPY=1`), interleaved, two rounds, `boss-fight-avp` and `whiterun-market-avp`, two warm-ups; then one uncapped stereo 1600×1100 run. Decides GPU work vs CPU work next, and whether 1600×1100 holds in combat | S / headset | — |
+| 2 | 2. Compositor cost | A/B `LB_FOVEATION=1` against off and `LB_IMMERSIVE_REFINE=2` against 4; make foveation the default if clean. Expect 2–4 ms of GPU per game frame back | S / headset | #64 |
+| 3 | 3. The 960×540 pass | Mac: `LB_SKIP_CLASS=refl` against default with `LB_SHOT` in sunlit Riverwood; compare the headset's and the bench's shadow INI keys; eye views with the measured eye tangents and `LB_EYE_LATE=1` under the head sweep. Settles whether it is the shadow mask, which would explain the eye-views fault (a mono pass drawn with the left eye's matrices, before the late turn) | S / Mac | — |
+| 4 | 5. Pipelines compiled at draw | A warm state cache still compiles at draw in stereo (160 compiles, longest 201 ms, in one headset session). Log why entries miss on the next launch; check per-draw state that multiplies variants and whether replay finishes before play; fix; ship a seed cache if entries are portable | M / Mac, then headset | — |
+| 5 | 9. Comfort session | One headset session for #65 (steering), #66 (flat HUD) and `LB_IMMERSIVE_MOTION=1` against 0 while moving; merge what passes | S / headset | #63, #64 |
+| 6 | 10. CPU wins onto the headset | (a) `LB_LOCK_STAGING=1` by default after one headset pair; (b) on the M5, the cost of the three LLVM passes pinned registers turn off; (c) `LB_STRICT_TRAP` only if the CPU binds | S / headset, M5 | (a) rides with 1 |
+| 7 | 6. GPU attribution | M5, stereo 1600×1100 FOV 119.8, uncapped: per-class GPU time (`LB_PASSES=1 LB_PASSES_GPU=1`) and one Metal frame capture; then one-switch candidates (depth copy route, `bFloatPointRenderTarget=0`, `d3d9.floatEmulation`) | S+ / M5 | — |
+| 8 | 4. Per-eye shadow mask, earlier late eyes | If 3 confirms: two layers for the mask target and its depth-stencil, keyed on the target, not its size; late eyes at the first scene-aspect pass; a per-view inverse only if the mask rebuilds position from depth. Makes eye views usable, so each eye uses all its pixels | L / M5, headset | 3 (and 7 for device captures) |
+| 9 | 7. Right-eye captures on the device | `LB_SHOT` returns layer 0 for both eyes on the headset; fix the read-back or dump the compositor's input | S–M / Mac, headset | — |
+| 10 | 11. Budget report in the repo | Session driver and summariser into `tools/bench`; `summary.json` gets cadence, GPU latency, compositor GPU, at-draw compiles, hitches, thermal state | S | — |
+| 11 | 12. Plan and log | This document and the repaired log; fix the `refl` label once 3 answers | S | 3 for the label |
+| 12 | 13. Soak | 30 min of scripted Whiterun at the chosen config, on AC then battery | S / headset | 1 (ideally 2, 5) |
+| 13 | 8. Skip unseen pixels | Only if 4 stalls: near depth in the strip each eye can't see, per view, so early depth rejects it there (about 23% of each eye's width on scene passes) | M / M5, headset | 6; excludes 4 |
+
+**In parallel now:** 3, 5, 6, 11, 12 and 10b. One headset session covers 1, 2 and 10a; a second, shorter one
+covers 9; 13 runs unattended afterwards. Serial: 3 → 4; 6 → 8; 4 and 8 both edit `d3d9_device.cpp`;
+#64 → 2 → #66 in `ImmersiveScreen.swift`; #63, #66, 4 and 7 all edit `d3d9_bridge.cpp`, so land #63 first.
+
+**Not on the list, with reasons**
+- More lifter work (#22 items 2–5, #57 stack slots, PGO, order file): each measured as nothing on top of pinned
+  registers. Reopen only if item 1 shows game work p95 over about 18 ms at FOV 119.8.
+- Havok threading, guest CPU count, QoS hints, half-rate shadows, single-threaded device: closed with numbers
+  (#42).
+- Foveated game render through a MoltenVK patch: broke the same screen-position shadow lookups and its GPU gain
+  was inconclusive (#21). Revisit after items 4 and 6.
+- Temporal upscaling: MetalFX's temporal scaler is unavailable in the visionOS SDK, and neither it nor a
+  hand-written resolve gained in moving foliage (#21).
+
+## Constraints
+
+- **Hardware:** the original M2 Vision Pro (8-core CPU with 4 performance cores, 10-core GPU, 16 GB),
+  visionOS 27.3. The M5 MacBook Air is the A/B machine for GPU and CPU questions; the 8 GB M1 swaps and is used
+  for counts, captures and builds.
+- **Thermals and power:** after about 2 h on battery, runs were 7% slower, then *serious*; the headset powered
+  off twice on battery, never on AC. Drop runs at *serious* from comparisons.
+- **Memory:** a 19 Nov JetsamEvent report lists the game as the largest process (1.76 GB resident, peak
+  2.37 GB); whether it ended a session is not established.
 
 ## Validation conventions
-- Label every claim tested / untested / observed; Mac or simulator ≠ headset.
-- Per-build evidence: device, OS, build hash, frame counts, audio, logs (as the iPad README does).
-- Env-var knobs (`LB_*`) with an A/B for each risky setting; first-frame checkpoint trace.
-- Pure-logic fixtures for state machines (window↔immersive ownership, HUD pose, recenter).
-- Never commit `gen/`, game files, provisioning, or team IDs; use `--team/--bundle-id` overrides.
+
+- Label every claim measured / read / inferred; a Mac or the simulator is not the headset.
+- Per run: device, OS, build and DXVK commits, thermal state, frame counts, logs.
+- **Measure GPU cost uncapped** (`LB_MAX_FPS=0`, `DXVK_CONFIG=d3d9.presentInterval = 0`). Capped busy time
+  misstates differences because Apple GPUs clock down with slack.
+- Interleave arms, rotate the order, one warm-up per arm, six or more rounds for the boss fight; pin the weather.
+- On a Mac the OS's Metal cache hides compile time: count compiles there, time them on the headset.
+- `LB_SHOT`'s per-layer capture is wrong on the device (item 7); verify stereo by capture on a Mac.
+- `LB_*` switches with an A/B for each risky setting. Never commit `gen/`, game files, provisioning, team or
+  bundle IDs, or captures of the game.
+
+## Superseded
+
+The 2026-11-10 plan ordered the work as windowed play → mono "cinema" screen → alternate-eye stereo through
+hooks on the game's camera → PSVR2 Sense. Windowed play and the cinema screen were built (the bring-up blockers:
+SDL visionOS overlay, xros MoltenVK and FFmpeg, build tooling, memory entitlements, deployment target, launcher
+gating). The cinema screen grew into the depth-reprojecting compositor. Alternate-eye stereo and the camera hooks
+were replaced by DXVK multiview (both eyes every frame) and by head steering through mouse look, which needs no
+regenerated code. PSVR2 Sense input is deferred: no controllers to test with. The full text is in git history.
+
+### Game camera addresses (from the old M3 notes; used by `game_camera_read` in `runtime/d3d9_bridge.cpp`)
+
+Static reads of the 1.9.32.0.8 executable; only the camera read itself is verified at runtime.
+- Main world NiCamera W: `*(*(0x1B2E8BC)+0xB8)`. World rotation +0x54..+0x74 (3×3, row-major), translation
+  +0x78..+0x80, world → clip matrix +0xA8..+0xE4, frustum tangents l r t b +0xE8..+0xF4, near/far +0xF8/+0xFC,
+  ortho +0x100. 0xAB8640 builds the matrix from the transform and the frustum.
+- PlayerCamera singleton 0x12E7288: worldFOV +0xAC, firstPersonFOV +0xB0. FOV → frustum at 0xB17960.
+- Frame order in 0x69F950: PlayerCamera update (0x73F240) → world render 0x69BDF0 (frustum via 0x6975D0). The
+  first-person camera (0x697FC0 / 0x698B30) re-runs 0xB17960 on W with firstPersonFOV and restores W's frustum.
