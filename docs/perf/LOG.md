@@ -37,7 +37,16 @@ replaced by a copy with `LB_DEPTH_COPY`), `fp` (first-person draws), `fx` (effec
   at `iShadowMaskQuarter=4` it is back-buffer-sized and drawn in both views. That mono draw is why per-eye view
   matrices (`LB_EYE_VIEWS`) misplace the right eye's shadows. Earlier readings that called it a reflection
   (2026-11-17) were wrong: the bench trace then looked for a full-screen reconstruct, which these settings do
-  not use. The class keeps its `refl` name in the code for now.
+  not use. #71 renames the class `mask` (`LB_SKIP_CLASS=refl` still works).
+- Measured on the M1 (plan item 4, eye views with the measured tangents, Riverwood, ground area, mean absolute
+  difference on 0–255): the right eye's shadow error is 17.0 with the mono mask, 3.3 with the mask drawn per eye
+  (#71), 3.3 with the mask skipped in both runs, and 2.2 for plain multiview with a mono mask; the same run
+  repeated differs by about 1. The remaining 3.3 is not from the mask: the sun glare and haze are also placed
+  for the left eye. Item 3's earlier "about 38×" figure is withdrawn: the bench kept the second eye's screenshot
+  as `shot-<frame>.bmp` in every stereo result (fixed in #71), so its two layers were the same picture.
+- Late eyes turned the eyes after the mask was drawn, so the left eye's shadows stayed put while the picture
+  turned; #71 turns them at the first mask draw. `LB_HEAD_TEST=5,0` anchors the head to the camera and does not
+  turn the eyes; use `LB_HEAD_TEST=sweep LB_HEAD_GAIN=0` to test late eyes.
 
 ## 2026-11-10 — setup
 
