@@ -30,11 +30,12 @@ come from private game files).
 `--env LB_PASSES=1` adds one line per frame next to the `ft` line, with the frame's draw calls and primitives by
 the kind of pass they belong to (the classes add up to the `ft` draw count; `rt` counts render-target changes):
 
-    pass <frame> shadow=<draws>/<prims> refl=… main=… depth=… fp=… mask=… fx=… post=… ui=… other=… rt=<n>
+    pass <frame> shadow=<draws>/<prims> mask=… main=… depth=… fp=… fx=… post=… ui=… other=… rt=<n>
 
 The classes are guessed from the bound targets (size and format relative to the back buffer, whether a
 depth-stencil is bound, depth-only clears, quads); the rules and which of them are unverified are in
-`runtime/d3d9_bridge.cpp` (`pass_class`). `LB_PASSES=2` also logs, for the frames in `LB_D3DTRACE=<from>:<to>` (the
+`runtime/d3d9_bridge.cpp` (`pass_class`). `mask` is the deferred sun-shadow mask; logs before 2026-11-20 call it
+`refl`, and their `mask` column (a guess that never matched a draw in Riverwood) is gone. `LB_PASSES=2` also logs, for the frames in `LB_D3DTRACE=<from>:<to>` (the
 first frame without it), one `passdbg <frame> <class> <w>x<h> fmt=<n> ds=<0|1> draws=<n> prims=<n>` line per run
 of draws of one class into one target, to check the rules against a real frame.
 
@@ -42,7 +43,7 @@ of draws of one class into one target, to check the rules against a real frame.
 issued by the bridge at every change of target or class and at Present, read back without flushing a few frames
 later. Each frame gets one more line once its timestamps are in:
 
-    passgpu <frame> shadow=<ms> refl=… … other=<ms> total=<ms> marks=<timestamps> zero=<spans that read 0>
+    passgpu <frame> shadow=<ms> mask=… … other=<ms> total=<ms> marks=<timestamps> zero=<spans that read 0>
 
 `bench.py` merges it into the frame's `pass` line as the third number (`gpu_ms_mean`) and keeps `total`, `marks`
 and `zero` as `gpu.total`, `gpu.marks` and `gpu.zero`. GPU idle inside a frame counts towards the span it falls
@@ -59,7 +60,7 @@ Both are optional; a log without them parses as before.
   count. These lines carry no frame numbers, so they can't be tied to phases: the figure covers the whole run
   (loading and menus included). `compare` prints it as one line.
 - Pass classes: with `LB_PASSES=1` (add `--env LB_PASSES=1`) the game prints one line per frame,
-  `pass <frame> shadow=<draws>/<prims> refl=... main=620/41233/3.21 ... rt=<n>`. Every `key=a/b[/c]` is parsed
+  `pass <frame> shadow=<draws>/<prims> mask=... main=620/41233/3.21 ... rt=<n>`. Every `key=a/b[/c]` is parsed
   generically, so new classes or the third number (GPU ms) need no parser change. Each phase (and `overall`)
   gets `passes`: `{class: {"frames", "draws_mean", "prims_mean", "gpu_ms_mean"}}`; `gpu_ms_mean` appears only when
   the lines carry it, and a single-number key such as `rt` gives `{"frames", "value_mean"}`. Screenshot frames are

@@ -53,7 +53,9 @@ GPU_BUSY = re.compile(r"dxvk: gpu busy ([\d.]+)%, ([\d.]+) ms per frame over (\d
 PASS = re.compile(r"^pass (\d+)((?: [\w.-]+=[\d.]+(?:/[\d.]+){0,2})+)\s*$")
 PASS_FIELD = re.compile(r"([\w.-]+)=([\d.]+(?:/[\d.]+){0,2})")
 PASSGPU = re.compile(r"^passgpu (\d+)((?: [\w.-]+=[\d.]+)+)\s*$")  # LB_PASSES_GPU: GPU ms per class, a few frames late
-SHOT = re.compile(r"^LB_SHOT frame (\d+) \d+x\d+ -> (.+)$")
+# The frame's own picture: stereo runs also log shot-<frame>-layer1.bmp (the second eye) for the same frame, after it,
+# which must not replace it.
+SHOT = re.compile(r"^LB_SHOT frame (\d+) \d+x\d+ -> (.+?(?<!-layer\d)\.bmp)$")
 SHOT_ANY = re.compile(r"^LB_SHOT frame \d+ ")  # any screenshot line: the next frame time logged includes its stall
 CONTAINER = re.compile(r"/Containers/Data/Application/[0-9A-F-]+/(.+)$")
 NOTABLE = ("native: thermal", "bench:", "immersive:", "pointer:", "fatal", "device lost", "rt_unimpl", "quit requested")
