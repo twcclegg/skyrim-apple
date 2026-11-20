@@ -123,6 +123,7 @@ M 2–4 days, L a week or more.
 | 11 | 12. Plan and log | This document and the repaired log; fix the `refl` label once 3 answers | S | 3 for the label |
 | 12 | 13. Soak | 30 min of scripted Whiterun at the chosen config, on AC then battery | S / headset | 1 (ideally 2, 5) |
 | 13 | 8. Skip unseen pixels | Only if 4 stalls: near depth in the strip each eye can't see, per view, so early depth rejects it there (about 23% of each eye's width on scene passes) | M / M5, headset | 6; excludes 4 |
+| 14 | 14. Alternate-eye compositor | Only if 1 shows the GPU binding in combat: show `LB_STEREO_ALTERNATE=1` frames (rendering is on main, #31) by keeping one frame slot per eye and moving each from its own render time, rays from each eye's origin. Near-zero extra GPU and no mono-pass shadow fault; each eye updates at half the game rate and the eyes are one frame apart, so self-moving objects may shimmer (comfort to judge on the headset). Alternative to 8 | M / headset | 1; after #66 and 2 in `ImmersiveScreen.swift` |
 
 **In parallel now:** 3, 5, 6, 11, 12 and 10b. One headset session covers 1, 2 and 10a; a second, shorter one
 covers 9; 13 runs unattended afterwards. Serial: 3 → 4; 6 → 8; 4 and 8 both edit `d3d9_device.cpp`;
@@ -167,7 +168,8 @@ hooks on the game's camera → PSVR2 Sense. Windowed play and the cinema screen 
 SDL visionOS overlay, xros MoltenVK and FFmpeg, build tooling, memory entitlements, deployment target, launcher
 gating). The cinema screen grew into the depth-reprojecting compositor. Alternate-eye stereo and the camera hooks
 were replaced by DXVK multiview (both eyes every frame) and by head steering through mouse look, which needs no
-regenerated code. PSVR2 Sense input is deferred: no controllers to test with. The full text is in git history.
+regenerated code. (Alternate-eye rendering itself survives as `LB_STEREO_ALTERNATE`, rendered through DXVK's clip
+shift rather than camera hooks; its compositor side is work item 14.) PSVR2 Sense input is deferred: no controllers to test with. The full text is in git history.
 
 ### Game camera addresses (from the old M3 notes; used by `game_camera_read` in `runtime/d3d9_bridge.cpp`)
 
