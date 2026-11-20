@@ -28,12 +28,16 @@ outside git.
 512×512), `refl` (the 960×540 pass), `main`, `depth` (the scene drawn again into a back-buffer-sized R32F target;
 replaced by a copy with `LB_DEPTH_COPY`), `fp` (first-person draws), `fx` (effects), `post`, `ui`.
 
-- `refl`, the 960×540 A8R8G8B8 pass drawn before the main pass:
-  **unverified: shadow mask or reflection, see plan item 3**
-  ([VISION_PRO_PLAN.md](../VISION_PRO_PLAN.md#work-list-in-order)). For the mask: the Linux trace
-  (2026-11-13; `iShadowMaskQuarter=1` shrinks it to 320×180) and the first-person trace (2026-11-14). For a
-  reflection: no screen-space mask target in the bench settings' trace, and no change from `bDeferredShadows=0`
-  (2026-11-17). The entries below record each reading as evidence; none of them settles it.
+- `refl`, the 960×540 A8R8G8B8 pass drawn before the main pass, is **the deferred sun-shadow mask**, not a
+  reflection (settled 2026-11-20, plan item 3). Its size is the back buffer × `iShadowMaskQuarter`/4 (960×540 at
+  1280×720 with the low preset's 3), with its own D24S8 depth-stencil. It draws scene geometry with per-object
+  world-view-projection and shadow-map rows, writes red only and samples the shadow map; it does not rebuild
+  position from depth. Skipping the class (`LB_SKIP_CLASS=refl`) removes every cast sun shadow and nothing else.
+  Because it is smaller than the back buffer it is drawn once (mono, with view 0's matrices) under multiview;
+  at `iShadowMaskQuarter=4` it is back-buffer-sized and drawn in both views. That mono draw is why per-eye view
+  matrices (`LB_EYE_VIEWS`) misplace the right eye's shadows. Earlier readings that called it a reflection
+  (2026-11-17) were wrong: the bench trace then looked for a full-screen reconstruct, which these settings do
+  not use. The class keeps its `refl` name in the code for now.
 
 ## 2026-11-10 — setup
 
