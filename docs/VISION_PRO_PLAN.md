@@ -14,7 +14,8 @@ the earlier milestone plan is summarised under [Superseded](#superseded).
   depth-reprojecting immersive compositor, at the full field of view of both eyes. In Riverwood the game holds
   45 fps and every refresh is presented (headset, 19 Nov; #42).
 - **Not known:** whether 45 fps holds in combat at the current config. Every timed headset run at this config is
-  in Riverwood, the quiet scene; the only stereo boss-fight runs on the headset are at 1280×720 and `LB_FOV=65`.
+  in Riverwood, the quiet scene. No stereo boss-fight run has been recorded on the headset at all; the 18 Nov
+  boss-fight runs at 1280×720 and `LB_FOV=65` (549–587 pipelines compiled at draw) were Mac dry runs.
 - **Windowed play** (Shared Space window) also works: about 60 fps at 1280×720 on the Low preset, with audio,
   keyboard and saves. The trackpad can't keep the pointer in the window, so mouse look stops at its edge.
 - **Visible defects:** hitches from pipelines compiled at draw time; the reticle doubles on fast pans (fix in
