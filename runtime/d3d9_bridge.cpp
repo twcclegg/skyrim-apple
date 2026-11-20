@@ -622,6 +622,8 @@ static bool stereo_skip_fp(void);         // stereo captures: a frame drawn with
 static void stereo_late_eyes(void);       // eye views, LB_EYE_LATE: the eyes turned toward the head, below
 static void stereo_mask_seen(void);       // eye views: the sun-shadow mask given a layer per eye, below
 static void stereo_mask_present(bool reset);
+static void stereo_post_draw(void);           // eye views: the post chain's per-eye targets given a layer per eye, below
+static void stereo_post_present(bool reset);
 
 // The kind of the first-person draw being made, from the target bound (FP_NONE outside first-person draws).
 static int fp_kind(void) {
@@ -867,6 +869,7 @@ void d3d_passes_draw(uint32_t prims) {
     }
     if (k == PASS_MAIN && g_depth_copy == 1 && !g_main_ds && g_pass_device) g_pass_device->GetDepthStencilSurface(&g_main_ds);
     if (k == PASS_MASK) stereo_mask_seen();
+    if (prims <= 2) stereo_post_draw();
     if (k == PASS_MASK || k == PASS_MAIN) stereo_late_eyes();  // the first scene pass that has the eyes' matrices
     if (g_passes_gpu) gpu_draw(k);
     PassFrame &f = g_pass_frame;
@@ -919,6 +922,7 @@ void d3d_passes_target(IDirect3DDevice9 *d) {
 static void d3d_passes_reset(IDirect3DDevice9 *d) {
     g_pass_frame.fp_late = g_pass_frame.fp_proj = false;
     stereo_mask_present(true);
+    stereo_post_present(true);
     d3d_passes_target(d);
 }
 
@@ -1029,6 +1033,7 @@ static void passes_present(void) {
     }
     if (g_main_ds) { g_main_ds->Release(); g_main_ds = nullptr; }
     stereo_mask_present(false);
+    stereo_post_present(false);
     if (!g_d3d_passes) return;
     g_pass_frame.fp_late = g_pass_frame.fp_proj = false;
     fp_update();
@@ -2414,6 +2419,94 @@ static void stereo_mask_present(bool reset) {
     for (IDirect3DSurface9 *&s : g_mask_pending) { if (s) s->Release(); s = nullptr; }
 }
 
+/* Eye views: the post chain's per-eye targets. After the scene the game filters it at a quarter of the back
+ * buffer's size, in two one-layer A8R8G8B8 targets (320x220 at 1280x880; Riverwood traced with LB_PASSES=2, frame
+ * 2650): a downsample of the HDR scene and a bright-pass blur in both directions (the bloom), which the
+ * tone-mapping quad adds over the scene; then a downsample and blur of the tone-mapped picture, which the final
+ * quad blends in by depth (the distance blur). DXVK gives two layers only to back-buffer-sized targets, so these
+ * passes are mono: they read layer 0 of the scene, the left eye's, and the right eye gets the left eye's bloom and
+ * distance blur. Under eye views the eyes' frusta differ so much that this lays a glare and haze over the right eye
+ * where the left eye has bright sky (plain multiview's eyes are only a parallax shift apart).
+ * The rule follows the data, not the size: a quad (<= 2 primitives) drawn into a one-layer target with no
+ * depth-stencil that samples a two-layer texture is noted (made from the eyes' pictures); if a later quad drawn
+ * into a two-layer target samples it (read back per eye), it is given a second layer at the next Present
+ * (dxvk_stereo_make_layered), and from then on its passes draw both views, each from its own eye's layer. A blur
+ * of such a target is caught a frame later, once its source has two layers. The luminance chain that sets the eye
+ * adaptation reduces the scene to 1x1 through one-layer targets that only mono passes read, so it stays one
+ * value for both eyes, from the left eye's picture, as before.
+ * Same switch as the mask: by default with eye views only; LB_STEREO_POST=1 also with plain multiview, =0 never. */
+static IDirect3DSurface9 *g_post_seen[8];  // one-layer targets drawn from two-layer textures (refs held)
+static bool g_post_wanted[8];              // ... and read by a two-layer pass since: layer at the next Present
+static int g_post_n;
+// The level-0 surfaces of the 2D textures bound to samplers 0-7, refs held; returns how many.
+static int bound_texture_surfaces(IDirect3DDevice9 *d, IDirect3DSurface9 *out[8]) {
+    int n = 0;
+    for (DWORD s = 0; s < 8; s++) {
+        IDirect3DBaseTexture9 *bt = nullptr;
+        if (FAILED(d->GetTexture(s, &bt)) || !bt) continue;
+        if (bt->GetType() == D3DRTYPE_TEXTURE
+            && SUCCEEDED(static_cast<IDirect3DTexture9 *>(bt)->GetSurfaceLevel(0, &out[n])) && out[n])
+            n++;
+        bt->Release();
+    }
+    return n;
+}
+// At each draw of <= 2 primitives.
+static void stereo_post_draw(void) {
+    const PassTarget &t = g_pass_target;
+    if (!t.rt || !g_pass_device) return;
+    static int want = -1;  // 0 never, 1 always, 2 with eye views
+    if (want < 0) { const char *e = getenv("LB_STEREO_POST"); want = e && *e ? (atoi(e) ? 1 : 0) : 2; }
+    if (!want || (want == 2 && !g_live_m_valid)) return;
+    static IDirect3DDevice9 *checked;
+    static bool mv;
+    if (checked != g_pass_device) { checked = g_pass_device; mv = dxvk_stereo_multiview_enabled(g_pass_device) != 0; }
+    if (!mv) return;
+    const int rl = dxvk_stereo_surface_layers(t.rt);
+    const bool producer = rl == 1 && !t.ds && !t.bb;
+    if (!producer && rl != 2) return;
+    IDirect3DSurface9 *tex[8];
+    const int n = bound_texture_surfaces(g_pass_device, tex);
+    for (int i = 0; i < n; i++) {
+        const int tl = dxvk_stereo_surface_layers(tex[i]);
+        if (producer && tl == 2) {
+            bool known = false;
+            for (int j = 0; j < g_post_n; j++) known |= (void *)g_post_seen[j] == t.rt;
+            if (!known && g_post_n < 8) {
+                g_post_seen[g_post_n] = static_cast<IDirect3DSurface9 *>(t.rt);
+                g_post_seen[g_post_n++]->AddRef();
+            }
+        } else if (!producer && tl == 1) {
+            for (int j = 0; j < g_post_n; j++)
+                if (g_post_seen[j] == tex[i]) g_post_wanted[j] = true;
+        }
+    }
+    for (int i = 0; i < n; i++) tex[i]->Release();
+}
+// At Present (layer what is wanted), or at a Reset (forget everything: the game may make its targets again).
+static void stereo_post_present(bool reset) {
+    for (int j = 0; j < g_post_n;) {
+        if (!reset && g_post_wanted[j]) {
+            D3DSURFACE_DESC rd = {};
+            g_post_seen[j]->GetDesc(&rd);
+            const long hr = dxvk_stereo_make_layered(g_pass_device, g_post_seen[j]);
+            if (hr == 0) LOG("stereo: post target %ux%u (format %u) now drawn per eye (two layers)", rd.Width, rd.Height,
+                             (unsigned)rd.Format);
+            else LOG("stereo: post target %ux%u left mono: layering failed (hr %08lx)", rd.Width, rd.Height, (unsigned long)hr);
+        }
+        if (reset || g_post_wanted[j]) {  // done with it: once layered, it is only ever a source
+            g_post_seen[j]->Release();
+            g_post_n--;
+            g_post_seen[j] = g_post_seen[g_post_n];
+            g_post_wanted[j] = g_post_wanted[g_post_n];
+            g_post_seen[g_post_n] = nullptr;
+            g_post_wanted[g_post_n] = false;
+        } else {
+            j++;
+        }
+    }
+}
+
 // After Present: set the eye, and the clock, for the next frame.
 /* Eye views, stage 2 of plans/eye-views.md (LB_EYE_LATE=1): the game camera trails the head (head steering is a
  * closed loop on the camera the game last presented, about 10 degrees behind a 27 deg/s sweep on the Mac), and
@@ -2821,6 +2914,10 @@ static void stereo_before_present(IDirect3DDevice9 *) {}
 static void stereo_after_present(void) {}
 static void stereo_fp_changed(int) {}
 static void stereo_late_eyes(void) {}
+static void stereo_mask_seen(void) {}
+static void stereo_mask_present(bool) {}
+static void stereo_post_draw(void) {}
+static void stereo_post_present(bool) {}
 static bool stereo_skip_fp(void) { return false; }
 static void vr180_before_present(IDirect3DDevice9 *) {}
 static void vr180_after_present(void) {}
