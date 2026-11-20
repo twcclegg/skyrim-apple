@@ -1910,6 +1910,9 @@ extern "C" int skyrim_frame_eye(float *k_out) {
     return g_frame_eye;
 }
 
+/* The number of the frame being presented, as LB_SHOT numbers it (ipad/tap_shot.mm reads it from the present tap). */
+extern "C" int skyrim_present_frame(void) { return g_frame; }
+
 /* LB_FOV: the game's field of view in degrees at its 4:3 reference (65 by default, about 81 degrees across at
  * 16:9), written to PlayerCamera worldFOV (+0xAC) and firstPersonFOV (+0xB0) as the console's fov command
  * does. Head tracking wants it wider than the headset shows.
@@ -2490,6 +2493,13 @@ static void stereo_late_report(void) {
     frames = 0;
     memset(counts, 0, sizeof counts);
 }
+/* LB_STEREO_DEBUG_HUD=X (live multiview, checks only): the interface in view 1 (the right eye) only is moved X in
+ * clip units, i.e. left by X/2 of the picture's width (DXVK subtracts it). The left eye is untouched, so a capture
+ * shows which eye it really holds. Needs the world camera (in game, not the main menu) and no LB_HUD_LAYER. */
+static float stereo_debug_hud(void) {
+    static const float x = [] { const char *e = getenv("LB_STEREO_DEBUG_HUD"); return e ? (float)atof(e) : 0.0f; }();
+    return x;
+}
 static void stereo_after_present(void) {
     StereoState &st = g_stereo;
     if (!st.on) return;
@@ -2543,6 +2553,7 @@ static void stereo_after_present(void) {
             g_ui_k[0][0] = 2.0f / (r - l) * -st.d / hud_units;  // a point hud_units away: clip offset k / w, w = depth
             g_ui_k[1][0] = -g_ui_k[0][0];
         }
+        g_ui_k[1][0] += stereo_debug_hud();
         if (use_matrices) {
             { std::lock_guard<std::mutex> hold(g_stereo_eyes_lock); g_eyes_drawing = eyes; }
             memcpy(g_live_m_world, m, sizeof m);
