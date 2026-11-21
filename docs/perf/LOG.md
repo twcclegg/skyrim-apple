@@ -51,7 +51,8 @@ replaced by a copy with `LB_DEPTH_COPY`), `fp` (first-person draws), `fx` (effec
   right eye at run-to-run noise). The 512x512 fp16 target is a 6-face cube map drawn with axis-aligned 90° views;
   the 512x512 water reflection (sky only at low settings) is drawn with a square viewport from the game camera; the
   shadow map is in light space. The one measurable difference left is the shared eye adaptation, computed from
-  the left eye: the right eye is 1.6–3.3% darker than its own truth, global, not localised.
+  the left eye: the right eye is 1.6–3.3% darker than its own truth, global, not localised. Kept as is (decided
+  2026-11-21): both eyes stay identical in brightness.
 
 ## 2026-11-10 — setup
 
