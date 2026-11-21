@@ -936,6 +936,20 @@ Measured with a scripted scene (`coc riverwood`, `bat fpflame`: iron sword and F
 - **Open:** the boss fight's frame-time p95 is 15–25 ms in all three on runs against 9.5–10.5 off (means +1.9 /
   +1.2 ms). Riverwood stays at 120 fps. Cause not yet found; #71 and #72 stay draft until it is.
 
+## 2026-11-21 — shader bytecode cache (the M5; #69)
+
+- **Setup:** #69 with its DXVK change; the boss fight, stereo 1600×1100, `LB_PIPE_LOG`, hitches over 40 ms.
+  Cache on against `DXVK_SHADER_BYTECODE_CACHE=0`: three cold launches each (state cache and bytecode cache
+  wiped), then three warm launches, alternating.
+- **Pipelines compiled at draw** (count; total ms; longest ms): cold on 689 / 718 / 681, 588 / 1262 / 651 ms,
+  3.6 / 170 / 69; cold off 713 / 704 / 684, 1326 / 652 / 703 ms, 148 / 50 / 113; warm on 17 / 63 / 20, 10 / 72 /
+  22 ms, 1.2 / 2.7 / 5.4 (679–755 compiled ahead); warm off 267 / 214 / 198, 304 / 263 / 250 ms, 4.3 / 4.0 / 3.7
+  (493–588 ahead). The cached shaders are created at startup in 56–61 ms (613–641 shaders).
+- **Hitches over 40 ms in play:** cold on 1 / 2 / 1, off 2 / 1 / 1; warm on 0 / 0 / 13, off 0 / 1 / 0. The 13 are one
+  cluster in one warm run (up to 136 ms) with the game thread waiting on DXVK's command-stream thread and only 4
+  small compiles nearby: not compile hitches; cause not found.
+- **Verdict:** warm launches compile 4–15× fewer pipelines at draw; cold launches are unchanged, as expected.
+
 <!-- Issue comments cited above -->
 [#21-c2]: https://github.com/twcclegg/skyrim-apple/issues/21#issuecomment-6869056184
 [#21-c3]: https://github.com/twcclegg/skyrim-apple/issues/21#issuecomment-6869156538
