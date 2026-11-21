@@ -885,6 +885,33 @@ Measured with a scripted scene (`coc riverwood`, `bat fpflame`: iron sword and F
   headset, while depth layers are right; a fix based on "identical eyes" made things worse and was reverted.
   ([#42-c37])
 
+## 2026-11-21 — GPU attribution in stereo (the M5; plan item 6)
+
+- **Setup:** main 50f0db9d, pinned registers, multiview stereo 1600×1100, `LB_FOV=119.8`, uncapped
+  (`LB_MAX_FPS=0`), `LB_PASSES=1 LB_PASSES_GPU=1`; three rotating rounds of Riverwood and the boss fight, with
+  warm-ups. Riverwood still runs at 120 fps, held by the macOS compositor (present mode is already IMMEDIATE),
+  with the GPU 74% busy, so its numbers are not fully uncapped; the boss fight runs at about 100 fps.
+- **GPU ms per frame by class** (Riverwood / boss early / boss late): main 2.68 / 3.08 / 3.43; fx 1.26 / 2.40 /
+  2.11; shadow 0.87 / 1.74 / 2.28; post 0.81 / 0.79 / 0.82; mask (`refl`) 0.54 / 0.57 / 0.60; depth 0.46 / 0.44 /
+  0.45; fp 0.07 / 0.09 / 0.09; total 6.70 / 9.10 / 9.78. Shadows and effects grow most in combat.
+- **One-switch candidates:**
+  - `bFloatPointRenderTarget=0` (8-bit main target, confirmed in the log): no saving; total +0.03 / +0.46 /
+    +0.55 ms. The classifier then files the main scene under another class, so only totals compare.
+  - `d3d9.floatEmulation = False`: within noise (−0.02 / −0.29 / +0.02 ms; paired boss differences −0.79 to
+    +0.76 ms).
+  - Depth copy route: no switch to try. The depth class (its draws already skipped by the copy) costs 0.44–0.46 ms
+    everywhere, about 7% of Riverwood's GPU frame; that is the most a direct copy could save.
+- **Render passes:** DXVK stores every attachment. Riverwood has 36 passes per frame, 21 of which load the full
+  two-layer targets; the boss fight has 119, 104 of which load them. The main scene is split into 12 (Riverwood)
+  to 40 (boss) passes in a row on the same RGBA16F and D32S8 two-layer targets, each loading and storing both;
+  shadow passes (55 in a row in the boss fight) keep the main two-layer depth bound and load and store it over the
+  shadow map's area; depth-only two-layer passes load and store the depth. Only the final one-layer composite uses
+  DONTCARE. Open: the GPU timestamps of `LB_PASSES_GPU` may themselves split passes; a render-pass log without
+  timers settles it.
+- **Verdict:** neither format switch is worth taking. The candidate left is fewer pass breaks and fewer
+  loads and stores of the two-layer targets, once the untimed log confirms the split is the game's and not the
+  timers'. One Metal frame capture of the Riverwood walk was taken and kept locally.
+
 <!-- Issue comments cited above -->
 [#21-c2]: https://github.com/twcclegg/skyrim-apple/issues/21#issuecomment-6869056184
 [#21-c3]: https://github.com/twcclegg/skyrim-apple/issues/21#issuecomment-6869156538
