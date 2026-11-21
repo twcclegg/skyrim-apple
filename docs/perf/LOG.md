@@ -923,6 +923,19 @@ Measured with a scripted scene (`coc riverwood`, `bat fpflame`: iron sword and F
 - **Verdict:** turning the passes off costs about 0.3–0.5% of game work. A compiler fixed so they could stay on
   would give back at most that, not enough to carry an LLVM patch for speed.
 
+## 2026-11-21 — cost of the per-eye mask and post targets (the M5; #71, #72)
+
+- **Setup:** #72 (on #71) with dxvk-native #9; stereo 1600×1100, `LB_FOV=119.8`, eye views and late eyes with
+  test eyes, uncapped, `LB_PASSES_GPU=1`; `LB_STEREO_MASK=1 LB_STEREO_POST=1` (what the default does here)
+  against `0 0`, three pairs in alternating order, Riverwood and the boss fight. Late eyes do not apply on the Mac
+  (no head pose).
+- **GPU ms, on minus off** (Riverwood idle / run / boss early / boss late): mask +0.31 / +0.27 / +0.43 / +0.47 (the
+  mono pass is 0.43–0.56, so per eye it costs about 1.7× that); post +0.11 / +0.10 / +0.18 / +0.19. Both move
+  the same way in every pair. Totals are not clean (main falls 0.25–0.44 ms in Riverwood in the same runs; one
+  boss pair is +4.1).
+- **Open:** the boss fight's frame-time p95 is 15–25 ms in all three on runs against 9.5–10.5 off (means +1.9 /
+  +1.2 ms). Riverwood stays at 120 fps. Cause not yet found; #71 and #72 stay draft until it is.
+
 <!-- Issue comments cited above -->
 [#21-c2]: https://github.com/twcclegg/skyrim-apple/issues/21#issuecomment-6869056184
 [#21-c3]: https://github.com/twcclegg/skyrim-apple/issues/21#issuecomment-6869156538
