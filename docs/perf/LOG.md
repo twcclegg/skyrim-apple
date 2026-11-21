@@ -1,9 +1,17 @@
-# Lifted-code performance log
+# Performance and measurement log
 
-One entry per change: hypothesis, diff summary, difftest result, before/after numbers, verdict. Work is on the
-local branch `perf/lifted-arm64`. Numbers are from the M1 (MacBook Air, 8 cores) unless marked otherwise.
-Private inputs (`gen/`, game files, logs, screenshots) stay in `~/SkyrimAVP/` and `bench-results/`, both outside
-git.
+One entry per change or measurement: hypothesis, change, check, before/after numbers, verdict, in date order.
+Numbers are from the M1 (MacBook Air, 8 GB) unless marked; later entries also use the M5 (MacBook Air, the A/B
+machine) and the M2 Vision Pro ("the headset"). Private inputs (`gen/`, game files, logs, screenshots) stay
+outside git.
+
+- From 2026-11-13 on, many results were first posted on issues #21 and #42. Entries that summarise them cite the
+  comment: `#42-c11` is the 11th comment on #42 (linked at the end of this file). Dates are the local date of the
+  work.
+- Commit IDs in entries before 2026-11-18 predate that day's history rewrite; the old → new map is in
+  [#42-c33].
+- **GPU time:** busy time measured under the frame cap is not a cost measure on Apple GPUs, which clock down when
+  they have slack. Compare GPU cost uncapped (2026-11-16 evening, "Correction").
 
 ## How things are measured
 
@@ -14,10 +22,41 @@ git.
   the 60 fps pacing sleep and without D3D9 `Present`, i.e. the game's own CPU time on the presenting thread. The
   60 fps cap stays on, so both sides of a comparison play the same scene.
 
+## Pass classes
+
+`LB_PASSES` and `LB_SKIP_CLASS` name the passes of a frame by class: `shadow` (shadow maps, 512×1024 and
+512×512), `refl` (the 960×540 pass), `main`, `depth` (the scene drawn again into a back-buffer-sized R32F target;
+replaced by a copy with `LB_DEPTH_COPY`), `fp` (first-person draws), `fx` (effects), `post`, `ui`.
+
+- `refl`, the 960×540 A8R8G8B8 pass drawn before the main pass, is **the deferred sun-shadow mask**, not a
+  reflection (settled 2026-11-20, plan item 3). Its size is the back buffer × `iShadowMaskQuarter`/4 (960×540 at
+  1280×720 with the low preset's 3), with its own D24S8 depth-stencil. It draws scene geometry with per-object
+  world-view-projection and shadow-map rows, writes red only and samples the shadow map; it does not rebuild
+  position from depth. Skipping the class (`LB_SKIP_CLASS=refl`) removes every cast sun shadow and nothing else.
+  Because it is smaller than the back buffer it is drawn once (mono, with view 0's matrices) under multiview;
+  at `iShadowMaskQuarter=4` it is back-buffer-sized and drawn in both views. That mono draw is why per-eye view
+  matrices (`LB_EYE_VIEWS`) misplace the right eye's shadows. Earlier readings that called it a reflection
+  (2026-11-17) were wrong: the bench trace then looked for a full-screen reconstruct, which these settings do
+  not use. #71 renames the class `mask` (`LB_SKIP_CLASS=refl` still works).
+- Measured on the M1 (plan item 4, eye views with the measured tangents, Riverwood, ground area, mean absolute
+  difference on 0–255): the right eye's shadow error is 17.0 with the mono mask, 3.3 with the mask drawn per eye
+  (#71), 3.3 with the mask skipped in both runs, and 2.2 for plain multiview with a mono mask; the same run
+  repeated differs by about 1. The remaining 3.3 is not from the mask: the sun glare and haze are also placed
+  for the left eye. Item 3's earlier "about 38×" figure is withdrawn: the bench kept the second eye's screenshot
+  as `shot-<frame>.bmp` in every stereo result (fixed in #71), so its two layers were the same picture.
+- Late eyes turned the eyes after the mask was drawn, so the left eye's shadows stayed put while the picture
+  turned; #71 turns them at the first mask draw. `LB_HEAD_TEST=5,0` anchors the head to the camera and does not
+  turn the eyes; use `LB_HEAD_TEST=sweep LB_HEAD_GAIN=0` to test late eyes.
+- With #71 and #72 no other mono pass misplaces the right eye's picture (2026-11-21, M1, river and Riverwood scenes;
+  right eye at run-to-run noise). The 512x512 fp16 target is a 6-face cube map drawn with axis-aligned 90° views;
+  the 512x512 water reflection (sky only at low settings) is drawn with a square viewport from the game camera; the
+  shadow map is in light space. The one measurable difference left is the shared eye adaptation, computed from
+  the left eye: the right eye is 1.6–3.3% darker than its own truth, global, not localised.
+
 ## 2026-11-10 — setup
 
 - `gen/` (manifest sha 5b68dc33…) and the game were already on the M1 in the planning session's scratch folder;
-  cloned to `~/SkyrimAVP/` (APFS clones). Mint was not contacted.
+  cloned to a private working folder (APFS clones). Mint was not contacted.
 - macOS build bootstrapped (`macos/bootstrap.sh`; the DirectX fetch step needs `cabextract`, which isn't
   installed and isn't needed because the game folder already has both DLLs).
 - `macos/CMakeLists.txt`: `SKYRIM_GAME_DIR` (the manifest records a path on another volume), `LB_CONST_MEM`,
@@ -166,8 +205,8 @@ Running total: baseline 11.47 → 8.94 ms idle (**−22%**).
 ## 2026-11-10 — depth for stereo, and a visionOS engine with the changes
 
 - **Frame structure** (one Riverwood frame, `LB_D3DTRACE` with the new render-target lines): 2,013 draws in
-  about 27 passes. Two 512×512 targets (17 draws), a 512×1024 shadow map (268), a 960×540 reflection (197), the
-  main scene into a 1280×720 16-bit float target (620), then **the scene's depth again into a 1280×720 R32F
+  about 27 passes. Two 512×512 targets (17 draws), a 512×1024 shadow map (268), the 960×540 pass (197; `refl`,
+  see [Pass classes](#pass-classes)), the main scene into a 1280×720 16-bit float target (620), then **the scene's depth again into a 1280×720 R32F
   colour target (638 draws)**, effects and first-person passes, the luminance chain, and the final image.
 - **Depth capture:** `LB_SHOT` now also writes that R32F target (`depth-<frame>.f32`). Values are D3D depth
   (0.92–1.0 in the test frame, 1 = sky); with the near plane at 15 units the nearest surface is 2.7 m away and
@@ -176,8 +215,8 @@ Running total: baseline 11.47 → 8.94 ms idle (**−22%**).
   wide, 1.9% of pixels unresolved, all at depth edges. The HUD moves with the scene behind it, so it needs its
   own panel. Details in `IMMERSIVE_OPTIONS.md`.
 - **visionOS engine:** `ipad/build.py engine --platform visionos` from the regenerated code with
-  `LB_CONST_MEM`: `libSkyrimNative.a` sha256 e4849f52…, 143 MB (the previous one, 160 MB, is kept in
-  `~/SkyrimAVP/engines/`). Built only; not packaged into the app, not installed, not run.
+  `LB_CONST_MEM`: `libSkyrimNative.a` sha256 e4849f52…, 143 MB (the previous one, 160 MB, is kept
+  locally). Built only; not packaged into the app, not installed, not run.
 
 ## 2026-11-10 — a busier scene: `whiterun-market-mac`
 
@@ -237,7 +276,7 @@ Running total: baseline 11.47 → 8.94 ms idle (**−22%**).
   thermal state nominal.
 - **Builds:** A = the app installed on 2026-11-09 (binary 17339b74…); B = the same launcher with the engine
   from this branch at commit 0b5b053 (binary 11835a06…, engine e4849f52…: x87 cache, constant guest base,
-  native `0x472580`, lock-free COM lookup). Thomas approved the install and wore the headset.
+  native `0x472580`, lock-free COM lookup). The owner approved the install and wore the headset.
 - **Idle, mean frame ms (fps):** A 12.7 (78), 11.7 (85); B 9.0 (111), 9.0 (111). **About −26%**, two runs a
   side, each B run below each A run by more than the A runs differ from each other.
 - **Run phase:** A 9.7, 9.4 ms; B 8.4, 8.4 ms, which is the 120 fps cap, so the gain there is clipped; B's own
@@ -294,36 +333,9 @@ tear handling, and flat menus).
 - **Menus:** 18 changes logged. Flat with 3 open/1 pausing, 4 open/1 pausing, 5 open/2 pausing, and with 2 or
   3 open and none pausing (non-pausing menus, as the rule intended); depth with only the HUD open.
 - **CPU:** the process used 43–70% of one core, the main thread 21–28%. Thermal state stayed nominal.
-- **Thomas's verdict:** "Much better." His screenshots show clean edges on a rock and the sword at the
+- **The wearer's verdict:** "Much better." The screenshots show clean edges on a rock and the sword at the
   reduced depth, and a flat main menu.
 
-## 2026-11-15 — first-person depth in the world's encoding (M5, Riverwood, 1280×720 low; twcclegg/skyrim-apple#23)
-
-The R32F scene-depth target that the immersive screen reprojects holds d = P33 (1 − near/z) through whichever
-projection drew the pixel. The world uses near 15; the late first-person pass (arms, weapon, spell hand) writes its
-depth through its own camera with near 5, so hands and weapons were reprojected about three times too far away.
-`runtime/d3d9_bridge.cpp` now detects those draws (a Clear of depth only on a back-buffer-sized target after the
-main pass, confirmed by a projection whose near plane is not the world's) and, for the draws into the R32F target
-only, binds a bytecode copy of the game's pixel shader whose output is `A d + B` (here 3.00008 d − 2.00009, from
-the projections the game sets). Vertex shader, z-buffer, depth test and compositor unchanged. On by default;
-`LB_FP_DEPTH_SCALE=0` turns it off, `=off@F,...` off on frames F only.
-
-Measured with a scripted scene (`coc riverwood`, `bat fpflame`: iron sword and Flames readied; `bat stereofreeze`:
-`sgtm 0.02`, HUD off), two runs with the fix on, one with `LB_FP_DEPTH_SCALE=0`, one with `off@2900`:
-
-- **Depth on the first-person pixels** (101,140 px: (1 − d) on/off ratio 2.5–3.5 between frames 2901 and 2900 of the
-  `off@2900` run, eroded by 2 px): decoded with near 15, median distance 99.1–99.6 units without the fix and
-  33.0–33.9 with it. The ratio is 2.998 within one run (frames 2901/2900) and 3.0006 / 2.9996 between the second
-  fix-on run and the fix-off run (frames 2900 / 3000). Disparity for a 64 mm eye separation (`stereo_proto.py`'s
-  formula, 80.7° across): 34.0 px → 101.4–102.2 px.
-- **World depth** (pixels 4 px clear of the hands): within one run, frames 2900 (off) and 2901 (on) are
-  bit-identical on 87.0%, frames 2899 and 2901 (both on) on 86.9%. Across runs, fix-on against fix-on 71.8–73.4%,
-  fix-on against fix-off 71.6–85.1%: the same as run-to-run noise.
-- **Picture:** within one run, off-frame 2900 against its fix-on neighbours differs by 1.20 and 1.31 /255 mean per
-  channel, the two fix-on neighbours by 2.05. Across runs, the two fix-on runs differ by 11.2–11.8 (they caught
-  different moments), fix-on against fix-off by 2.5–12.2.
-- **Cost:** `work` per frame in the held phase (1,900 frames, 3 runs each, alternating): 6.11 / 6.30 / 6.17 ms with
-  the fix, 6.18 / 6.22 / 6.17 ms without it. No difference measured.
 ## 2026-11-10 (evening) — heavy combat scenario (`boss-fight-mac`) and its first profile
 
 - **Scenario:** `tools/bench/scenarios/boss-fight-mac.json`, run with `--env LB_VPAD=0`. `coc whiterunorigin`,
@@ -569,6 +581,29 @@ the other, and pinned together with PGO.
   measured on the game; Skyrim's x87 code spills floats to `[esp+N]` constantly, so this is the part most
   likely to show up there.
 
+## 2026-11-13 — depth pass and shadow-mask trace, motion simulation, stack slots on the game, MetalFX (Linux and the M1; #21)
+
+- **No INI key removes the second scene-depth pass.** Linux desktop build (x86, DXVK, RTX 4070), low, 1280×720,
+  Riverwood, weather pinned: the R32F pass is 638 draws under all 16 settings tried. `bDoDepthOfField=0` removes
+  four blur passes only; `bFloatPointRenderTarget=0` makes the main target A8R8G8B8; `iShadowMaskQuarter=1`
+  shrinks the 960×540 pass to 320×180 with the same 143 draws; `bUseWater=0` crashes. The R32F texture is read by
+  the 16-draw pass after it, the effects pass, and the final composite when depth of field is on. This led to
+  `LB_DEPTH_COPY` (2026-11-16). ([#21-c2])
+- **Following the player between frames, simulated** on an 80 s recorded route (Linux, about 136 fps, replayed
+  at a 90 Hz display): judder while moving 1.53 cm with the path against 5.06 cm holding the newest frame at
+  42 fps, 1.59 against 6.42 at 29 fps; how far the picture trails is unchanged at 42 fps (21.8 against 21.4 cm).
+  ([#21-c2])
+- **Stack slots on the game (`LIFT_SLOTS=1`): no measurable gain.** After two fixes it runs clean. Six
+  boss-fight runs each: 11.55 against 11.45 ms work (−0.9%, inside the spread); Whiterun 8.95 against 8.90. An
+  earlier three-run −7.5% did not reproduce. The memcpy/memmove discovery fix gained nothing either. Three
+  boss-fight runs per arm are too few on the M1 (sd 2–9%): use six or more, alternating. PGO on top of pinned
+  registers: no gain. ([#21-c3])
+- **MetalFX's temporal scaler is unavailable on visionOS.** In the 27.2 device SDK the temporal scaler, the
+  denoised scaler, the frame interpolator and their `MTL4FX` versions are `API_UNAVAILABLE(visionos)`; the
+  spatial scaler is available. ([#21-c4], [#21-c5])
+- **A hand-written temporal resolve** (numpy, real frames, half-size input): about +6 dB over one upscaled frame
+  standing still, at or below one frame while moving through foliage. Not ported. ([#21-c7])
+
 ## 2026-11-14 — the first-person draws (M5, Riverwood, low preset, 1280×720; twcclegg/skyrim-apple#23 chunk 1.1)
 
 Traced with `LB_D3DTRACE` (now with draw numbers, viewports, the world camera at each Clear, and several frame
@@ -659,3 +694,296 @@ offline before any compositor work.
   game's own sun-shadow mask. The flame's light on the world is in W (it is a light, not a first-person draw).
   The real layer (chunk 1.3) is drawn before tone mapping into its own target and has none of this unless the post
   chain runs for it. Its alpha also has to come from the pass itself, not from a depth difference.
+
+## 2026-11-14 — motion replay, foveated render, MetalFX, strict-order traps, cull prefetch, native math, audio, pipeline cache (#21)
+
+- **Motion replay of a real camera log** (Mac, Whiterun, recorded at 42 fps, 90 Hz display simulated): step
+  error while moving 2.26 cm with the path against 4.73 cm held at 41.8 fps, 2.25 against 7.70 at 22.7 fps. The
+  path trails slightly more: +0.5 cm at 42 fps, +4.8 cm at 23. The route has no turning. ([#21-c10])
+- **Foveated game render** (the M5, prototype MoltenVK patch, Riverwood, low): geometry, HUD and menus are right,
+  shadows are not (a second, displaced copy), inferred to be shaders that turn `VPOS` into a lookup with the
+  logical size (24 of 137 pixel shaders read `vPos.xy`). Under a rate map Metal gives fragment position in
+  physical texels and the scissor in screen space. GPU: mapped 2560×1440 3–7% below uniform at 120 fps and
+  0–13% at 60 fps; inconclusive, since the measure barely separates 1280×720 from 2560×1440 at low. ([#21-c11])
+- **MetalFX temporal at 2× on the M5** (macOS, frame dumps, walking through tall grass): 23.78 dB with 60% of
+  the fine detail, against 23.61 dB / 64% for one bilinear frame and 23.04 dB / 106% for the spatial scaler;
+  standing still 5 dB closer to the full-size frame than either. Not worth headset time for foliage. ([#21-c14])
+- **`LB_STRICT_TRAP`** (no inline alignment test; 16-byte-crossing accesses handled in the SIGBUS handler; 18
+  hot copy functions keep the test; traps 2.9 million → 400–500 per run). Without pinned registers: phase means
+  2–4% lower (boss fight overall 12.55 → 12.31 ms, 6 runs each), each about one sd. With pinned registers: boss
+  fight overall −1.3%, calm −3.6% (8.67 → 8.36 ms, sd 0.18 / 0.05), Whiterun −1.6%. A small real gain, 1–2%
+  overall. Not run on visionOS. ([#21-c15], [#21-c20])
+- **Prefetch in the cull walk** (`-DLB_PREFETCH` at `0xB19EB0`): Whiterun −0.3%, boss fight −1.3%, inside one
+  sd. The walk is pointer chasing; closed. ([#21-c16])
+- **Native math on the M5** (Xcode 27.3 beta, six rounds): −8.7% Whiterun idle and −12.2% boss calm against its
+  base in every round; combat phases within noise. The Xcode 27.3 build of `main` was 13–14% faster on static
+  phases than the 27.2 build (not interleaved; compare only builds from one Xcode). ([#21-c17])
+- **Audio mixer:** about 10% of a core in the boss fight now (asleep for 4,365 of 4,836 samples); the earlier
+  34–40% predates the mixer's fast paths. Struck. ([#21-c18])
+- **Persisting the Vulkan pipeline cache:** no change in wall time, CPU time or frames over 33 ms (Whiterun).
+  Struck. ([#21-c19])
+
+## 2026-11-15 — first-person depth in the world's encoding (M5, Riverwood, 1280×720 low; twcclegg/skyrim-apple#23)
+
+The R32F scene-depth target that the immersive screen reprojects holds d = P33 (1 − near/z) through whichever
+projection drew the pixel. The world uses near 15; the late first-person pass (arms, weapon, spell hand) writes its
+depth through its own camera with near 5, so hands and weapons were reprojected about three times too far away.
+`runtime/d3d9_bridge.cpp` now detects those draws (a Clear of depth only on a back-buffer-sized target after the
+main pass, confirmed by a projection whose near plane is not the world's) and, for the draws into the R32F target
+only, binds a bytecode copy of the game's pixel shader whose output is `A d + B` (here 3.00008 d − 2.00009, from
+the projections the game sets). Vertex shader, z-buffer, depth test and compositor unchanged. On by default;
+`LB_FP_DEPTH_SCALE=0` turns it off, `=off@F,...` off on frames F only.
+
+Measured with a scripted scene (`coc riverwood`, `bat fpflame`: iron sword and Flames readied; `bat stereofreeze`:
+`sgtm 0.02`, HUD off), two runs with the fix on, one with `LB_FP_DEPTH_SCALE=0`, one with `off@2900`:
+
+- **Depth on the first-person pixels** (101,140 px: (1 − d) on/off ratio 2.5–3.5 between frames 2901 and 2900 of the
+  `off@2900` run, eroded by 2 px): decoded with near 15, median distance 99.1–99.6 units without the fix and
+  33.0–33.9 with it. The ratio is 2.998 within one run (frames 2901/2900) and 3.0006 / 2.9996 between the second
+  fix-on run and the fix-off run (frames 2900 / 3000). Disparity for a 64 mm eye separation (`stereo_proto.py`'s
+  formula, 80.7° across): 34.0 px → 101.4–102.2 px.
+- **World depth** (pixels 4 px clear of the hands): within one run, frames 2900 (off) and 2901 (on) are
+  bit-identical on 87.0%, frames 2899 and 2901 (both on) on 86.9%. Across runs, fix-on against fix-on 71.8–73.4%,
+  fix-on against fix-off 71.6–85.1%: the same as run-to-run noise.
+- **Picture:** within one run, off-frame 2900 against its fix-on neighbours differs by 1.20 and 1.31 /255 mean per
+  channel, the two fix-on neighbours by 2.05. Across runs, the two fix-on runs differ by 11.2–11.8 (they caught
+  different moments), fix-on against fix-off by 2.5–12.2.
+- **Cost:** `work` per frame in the held phase (1,900 frames, 3 runs each, alternating): 6.11 / 6.30 / 6.17 ms with
+  the fix, 6.18 / 6.22 / 6.17 ms without it. No difference measured.
+
+## 2026-11-15 — native batch 2 and pinned registers on the M5; main-thread waits and lock staging (#21, #42)
+
+- **Native batch 2** (the M5, eight more native functions, quiet series, muted): −5.7% Whiterun idle, −4.8%
+  run, −5.6% boss calm, lower in all six rounds; pan and combat phases within noise. ([#21-c23])
+- **Pinned registers on the M5** (two rounds, Whiterun only): about −6% overall and in idle. Indicative only.
+  ([#21-c24])
+- **What the main thread waits for** (M1 `sample` captures): in the boss fight 12.5–13% of main-thread samples
+  wait on DXVK's buffer lock (`LockBuffer` → `SynchronizeCsThread`), 11–13% on a per-frame guest wait at
+  `0x6F3F00`. ([#42-c1])
+- **Single-threaded D3D9 device: not safe.** Seven guest threads call D3D9 in the boss fight; the calling thread
+  changed within a frame 730 times, including state setters. Closed (at most about 2%). ([#42-c2])
+- **The waiting locks** are plain whole-buffer locks of WRITEONLY (not DYNAMIC) vertex buffers in buffer map
+  mode. `LB_LOCK_STAGING=1` (dxvk-native) switches such a buffer to staging uploads after its first wait: waits
+  among the top lock kinds 32k → 0. ([#42-c2], [#42-c3])
+
+## 2026-11-16 — headset session (night of 15–16 Nov); lock staging, guest waits, threads (#42)
+
+- **Headset**, immersive, 1920×1080, FOV 110, `LB_MAX_FPS=120`, 43 runs. combined-v6 (v5 plus the import cache
+  with pinned registers and two native fixes) against v5, boss fight, interleaved: work 10.00 against 10.35 ms
+  (−3%); Whiterun agrees. `LB_QOS=3` is worse (boss work 9.84 against 9.32 ms): dropped. Long tour of v6: boss
+  fight 9.32 ms work (about 90 fps), Whiterun 7.3 and Riverwood 6.4 (60 fps capped). After about 2 h on battery
+  runs were 7% slower at the same thermal state, then reached *serious*. Hole fill (`LB_IMMERSIVE_HOLES`) costs
+  about 2.3 ms of compositor GPU per frame. ([#42-c4])
+- **Lock staging settled on the M1** (8 pairs, order alternated): work −3.2% overall, −4.4% calm, −6.7% early,
+  −2.6% late. The `LockBuffer` wait falls from 5.7–15% of main-thread samples to 0–1.1%; `dxvk-cs` is on-CPU
+  16–27% either way, so the wait is removed, not moved. ([#42-c5])
+- **The guest wait at `0x6F3F00`** is a per-frame join on the game's two AI worker threads, each 57–60% on-CPU
+  and not saturated: 1–5% of wall time on average, about 10% at peaks. The six-thread tasklet pool is mostly
+  idle. ([#42-c6])
+- **One-hour soak with staging** (Whiterun): passes; work 4.45–4.74 ms after the first block, RSS 390–490 MB
+  with no growth. ([#42-c7])
+- **Function-wide x87 cache** (gen-fn1 against gen-fn0, boss fight, 6 pairs): −0.2%, no effect. ([#42-c7])
+- **Guest CPU count** 4 against 8: no change in threads or timing (+0.6%); 2 is much slower. The cap of 4
+  stays. ([#42-c7])
+- **Havok threading:** `iNumThreads` only creates idle threads; forcing the multithreaded simulation faults at
+  about frame 808 of the boss fight. Closed. ([#42-c8])
+
+## 2026-11-16 (evening) — full stereo on the Macs: GPU cost, depth copy, render size, field of view (#42)
+
+- **First game run of DXVK multiview** (M1): two views for the main scene (708 draws) and the R32F depth pass
+  (524); mono for shadows (279), the 960×540 pass (175), the post chain and the interface. Eye 2 is real:
+  12–34 px disparity at 1–5 m. Its capped GPU busy figures (+16% Riverwood, +29% boss fight) are **superseded by
+  the correction below**. ([#42-c9])
+- **Correction: capped GPU busy time is misleading on Apple GPUs.** With less work they clock down, so busy time
+  barely moves: skipping the shadow passes or the R32F pass changed it by under 0.2 ms, while timestamp queries
+  give those passes 2.45 and 1.68 ms. Uncapped (`LB_MAX_FPS=0`, `d3d9.presentInterval = 0`), Riverwood: GPU
+  busy 6.3 ms mono, 9.5 ms stereo (+50%), 8.1 ms stereo without the R32F pass. ([#42-c11])
+- **`LB_DEPTH_COPY`** (M1): copies the main pass's depth into the R32F target instead of redrawing the scene;
+  equal within 1e-4 on 90% of pixels. Uncapped GPU: stereo 9.47 → 8.32 ms (−12%), mono 6.33 → 5.95 ms; stereo
+  now costs +31% over mono instead of +50%. On by default with multiview. The same day the headset target was
+  set to 45 fps on the 90 Hz display, 22.2 ms per game frame. ([#42-c12])
+- **M5 job 1, v7 (pinned registers, import cache) against v5:** −5 to −7% work in steady phases, −8 to −12% in
+  combat. Staging on: −3% Whiterun idle and run, −4.8% boss calm, −9.9% boss early; Whiterun pan +3.2% (p95
+  +10.6%; see job 10, 2026-11-17). Import cache on against off: within noise. ([#42-c10])
+- **M5 job 2, stereo GPU cost:** uncapped busy +37% in Riverwood (2.93 → 4.01 ms) and +28% in the boss fight
+  (3.87 → 4.95 ms); the capped figures (+85%, +34%) mix in clock changes. Uncapped frame time +11–24%. Skipping
+  the doubled R32F pass removes about 0.7 ms, 60–67% of the stereo GPU overhead. Per-class GPU ms, capped (so
+  inflated), mono → stereo: shadow 1.95 → 2.24, `refl` 0.53 → 0.63, main 2.19 → 5.11, depth 1.15 → 2.75,
+  fp 0.14 → 0.33, fx 0.84 → 1.81, post 0.60 → 0.95, ui 0.26 → 0.53. ([#42-c13])
+- **Eye views, stage 1** (M1): working with synthetic test eyes. A taller game window (stereo, depth copy,
+  uncapped): 1280×896 at FOV 77.3 +9% GPU, 1280×1024 at FOV 93.7 +10% GPU and up to +8% work. ([#42-c14]; its
+  checks were redone in [#42-c16])
+- **M5 job 3, one-hour soak of v7 with staging:** clean; work 3.78 → 3.84 → 3.77 ms; RSS flat at about 1.0 GB;
+  the four gameplay hitches over 250 ms are all in Present. ([#42-c15])
+- **Correction, HUD depth** (M1): since the HUD moved to 2 m, a scratch quad drawn into the back buffer earlier
+  in the frame was taken as the final image, so each eye's whole picture moved by the HUD's offset (infinity at
+  2 m). Fixed in 4f967b29: distant mountains 1 px apart, compass 24 px. The eye-views checks above searched only
+  small shifts; redone with a full fit, they hold. ([#42-c16])
+- **M5 job 4, visionOS simulator smoke of v7:** immersive gameplay passes; an empty grey window floats in front
+  of the picture. ([#42-c17])
+- **Lock staging in Whiterun** (M1, 5 pairs): idle −2.1%, run −0.8%, pan +0.5% (noise), so no pan regression. 73
+  buffers switch; the largest is 94 KB, 1.4 MB in all. ([#42-c18])
+- **M5 job 5, render size** (uncapped): stereo with the copy fits 22.2 ms at every size up to 1920×1080 on the
+  M5; the worst phase (boss late at 1920×1080) is 11.35 ms mean, 15.40 ms p95. The copy saves 0.45–0.56 ms of GPU
+  in Riverwood and 0.30–0.47 ms in the boss fight. Stereo's frame-time overhead in Riverwood grows from +9% at
+  720p to +38% at 1080p. ([#42-c19])
+- **M5 job 6:** with staging on, capped, boss-fight work does not rise from mono to stereo (within ±3.5%).
+  ([#42-c20])
+
+## 2026-11-17 — shadows, soaks, field of view, sharper render, simulator (#42)
+
+- **Half-rate shadows and 960×540 pass: not worth doing.** Upper bound by skipping each every frame (M1, stereo
+  with the copy, uncapped, 1280×720): shadow pass −4% GPU in Riverwood, −1% in the boss fight; the 960×540 pass
+  −3% in Riverwood, noise in the boss fight; work unchanged. ([#42-c21])
+- **M5 job 7, one-hour stereo soak** (multiview, present, copy, 1280×720, capped): clean, 0 `mvk-error` lines,
+  work 3.87 → 3.81 ms, RSS flat at 980–1,137 MB. Six gameplay hitches over 250 ms, four of them in Present.
+  ([#42-c22])
+- **M5 job 8, `bDeferredShadows=0` under stereo:** no measurable or visible change. ([#42-c23])
+- **No screen-space mask target in the bench settings** (M1): a Riverwood trace shows the shadow maps, the
+  960×540 pass, main, depth, effects and post, and draw counts per class are the same with `bDeferredShadows=0`
+  in either INI or neither. Read at the time as shadows applied in the main pass from world positions; see
+  [Pass classes](#pass-classes). ([#42-c24])
+- **M5 job 9, field of view** (stereo with the copy, uncapped): 1280×896 at FOV 77.3 +10–11% GPU; 1280×1024 at
+  FOV 93.7 +12% in Riverwood and +17% in the boss fight, with combat game work +13–17%. Worst phase 8.31 ms mean.
+  ([#42-c25])
+- **M5 job 10, staging in Whiterun with 120 s cool-downs:** idle −3.5%, run −3.4%, pan +0.5% on the mean; pan
+  p95 +5.3% in all five pairs (4.33 → 4.58 ms). The earlier pan regression was mostly heat. ([#42-c26])
+- **Eye-views soak** (M1, one hour, asymmetric test eyes, synthetic head sweep, `LB_EYE_LATE=1`): clean; late
+  eyes active throughout, turns up to 2.4°; 13 stalls over 250 ms, 3 in loading, the rest mostly in Present on
+  the swapping M1. ([#42-c27])
+- **M5 job 12, 1600×1280 against 1280×1024 at FOV 93.7** (stereo, uncapped): frame time +34% where the GPU
+  dominates, +2 to +15% in combat; GPU busy +34% in Riverwood, +25% in the boss fight. Worst phase 8.87 ms mean,
+  11.68 ms p95. ([#42-c28])
+- **M5 job 13, visionOS simulator:** stereo aborts because the simulator's MoltenVK has no layered attachments
+  (mono fallback later in #63); mono immersive passes; an `LB_WINDOW` off the window's aspect was refused at
+  launch, since fixed. ([#42-c29], [#42-c30])
+
+## 2026-11-18 — first headset contact with live stereo; pipelines compiled at draw (#42)
+
+- **Launch check** (`riverwood-walk-avp`, stereo, 1280×720, `LB_FOV=65`): live multiview runs on the device,
+  0 `mvk-error` lines, idle 45.0 fps, capped GPU busy 7.96 ms. Eye tangents (l r t b): left 1.732 1.000 1.000
+  1.192, right mirrored, eyes 66 mm apart (about 105° × 95° per eye). At FOV 65 the eye views were clipped to a
+  77° × 47° window in black. `LB_EYE_LATE` never engaged on the device; the compositor corrected 2.0–11.6° on
+  average. ([#42-c34])
+- **Pipelines at draw time:** in a one-hour Mac stereo soak (dxvk-native #5), 630 graphics pipelines were
+  compiled at draw and 0 ahead; 20 of the 21 in-world stalls over 250 ms coincide with them. Cause open (plan
+  item 5). ([#42-c35])
+
+## 2026-11-19 — headset session: live stereo at the full field of view (#42)
+
+- **What works:** plain multiview stereo (no eye views) with head tracking; `LB_FOV=119.8` at 1600×1100 covers
+  both eyes, and `LB_IMMERSIVE_REFINE=4` removes the depth mesh's shards at foliage edges. The compositor takes
+  3.4–4.2 ms per 90 Hz refresh, every refresh is presented, and the game holds 45 fps (Riverwood).
+- **Head steering** trailed the head by up to 12.5° in pitch, and the vertical-inversion detector flipped 5
+  times in 5 minutes; the compositor corrected 4–11° on average while looking around. #65 fixes both (Mac sweep:
+  5.4° / 8.8° → 2.2° / 3.8°, mean / max).
+- **Eye views break shadows on the headset:** a tilted plane about a foot from the face in one eye, swimming
+  near their objects in the other; correct without eye views. The reading recorded then was shadows rebuilt from
+  depth with the game camera's projection; plan item 3 tests another explanation. Eye views stay off.
+- **The reticle doubles when panning quickly** (the HUD is reprojected with the scene's depth); #66.
+- **Correction:** `LB_SHOT`'s per-layer back-buffer capture returns the same picture for both layers on the
+  headset, while depth layers are right; a fix based on "identical eyes" made things worse and was reverted.
+  ([#42-c37])
+
+## 2026-11-21 — GPU attribution in stereo (the M5; plan item 6)
+
+- **Setup:** main 50f0db9d, pinned registers, multiview stereo 1600×1100, `LB_FOV=119.8`, uncapped
+  (`LB_MAX_FPS=0`), `LB_PASSES=1 LB_PASSES_GPU=1`; three rotating rounds of Riverwood and the boss fight, with
+  warm-ups. Riverwood still runs at 120 fps, held by the macOS compositor (present mode is already IMMEDIATE),
+  with the GPU 74% busy, so its numbers are not fully uncapped; the boss fight runs at about 100 fps.
+- **GPU ms per frame by class** (Riverwood / boss early / boss late): main 2.68 / 3.08 / 3.43; fx 1.26 / 2.40 /
+  2.11; shadow 0.87 / 1.74 / 2.28; post 0.81 / 0.79 / 0.82; mask (`refl`) 0.54 / 0.57 / 0.60; depth 0.46 / 0.44 /
+  0.45; fp 0.07 / 0.09 / 0.09; total 6.70 / 9.10 / 9.78. Shadows and effects grow most in combat.
+- **One-switch candidates:**
+  - `bFloatPointRenderTarget=0` (8-bit main target, confirmed in the log): no saving; total +0.03 / +0.46 /
+    +0.55 ms. The classifier then files the main scene under another class, so only totals compare.
+  - `d3d9.floatEmulation = False`: within noise (−0.02 / −0.29 / +0.02 ms; paired boss differences −0.79 to
+    +0.76 ms).
+  - Depth copy route: no switch to try. The depth class (its draws already skipped by the copy) costs 0.44–0.46 ms
+    everywhere, about 7% of Riverwood's GPU frame; that is the most a direct copy could save.
+- **Render passes:** DXVK stores every attachment. Riverwood has 36 passes per frame, 21 of which load the full
+  two-layer targets; the boss fight has 119, 104 of which load them. The main scene is split into 12 (Riverwood)
+  to 40 (boss) passes in a row on the same RGBA16F and D32S8 two-layer targets, each loading and storing both;
+  shadow passes (55 in a row in the boss fight) keep the main two-layer depth bound and load and store it over the
+  shadow map's area; depth-only two-layer passes load and store the depth. Only the final one-layer composite uses
+  DONTCARE. Without the GPU timers the splits remain: Riverwood keeps the same 36 passes; the boss fight has 83
+  (runs of 27 shadow passes and 11 and 10 main passes on the same attachments) against 119 with timers (runs of
+  55, 20 and 19; the fight differs between runs, so not an exact pair). The splits are the game's or DXVK's;
+  the timers roughly double them in the boss fight.
+- **Verdict:** neither format switch is worth taking. The candidate left is fewer pass breaks and fewer
+  loads and stores of the two-layer targets. One Metal frame capture of the Riverwood walk was taken and kept locally.
+
+## 2026-11-21 — the three LLVM passes pinned registers turn off (the M5; plan item 10b)
+
+- **Setup:** main 50f0db9d without pinned registers, built twice (the three pass-disabling flags on and off);
+  1280×720 mono, uncapped, six rounds in alternating order, Riverwood and the boss fight.
+- **Game work, flags on minus off** (mean of 6 pairs, sd): Riverwood idle +0.018 ms (0.030), +0.5%; Riverwood run
+  +0.010 ms (0.027), +0.3%; boss early −0.205 ms (0.593); boss late +0.023 ms (0.665). The boss pairs (standard
+  error about 0.25 ms) cannot resolve an effect this small; Riverwood is the clean measure.
+- **Verdict:** turning the passes off costs about 0.3–0.5% of game work. A compiler fixed so they could stay on
+  would give back at most that, not enough to carry an LLVM patch for speed.
+
+## 2026-11-21 — cost of the per-eye mask and post targets (the M5; #71, #72)
+
+- **Setup:** #72 (on #71) with dxvk-native #9; stereo 1600×1100, `LB_FOV=119.8`, eye views and late eyes with
+  test eyes, uncapped, `LB_PASSES_GPU=1`; `LB_STEREO_MASK=1 LB_STEREO_POST=1` (what the default does here)
+  against `0 0`, three pairs in alternating order, Riverwood and the boss fight. Late eyes do not apply on the Mac
+  (no head pose).
+- **GPU ms, on minus off** (Riverwood idle / run / boss early / boss late): mask +0.31 / +0.27 / +0.43 / +0.47 (the
+  mono pass is 0.43–0.56, so per eye it costs about 1.7× that); post +0.11 / +0.10 / +0.18 / +0.19. Both move
+  the same way in every pair. Totals are not clean (main falls 0.25–0.44 ms in Riverwood in the same runs; one
+  boss pair is +4.1).
+- **Open:** the boss fight's frame-time p95 is 15–25 ms in all three on runs against 9.5–10.5 off (means +1.9 /
+  +1.2 ms). Riverwood stays at 120 fps. Cause not yet found; #71 and #72 stay draft until it is.
+
+<!-- Issue comments cited above -->
+[#21-c2]: https://github.com/twcclegg/skyrim-apple/issues/21#issuecomment-6869056184
+[#21-c3]: https://github.com/twcclegg/skyrim-apple/issues/21#issuecomment-6869156538
+[#21-c4]: https://github.com/twcclegg/skyrim-apple/issues/21#issuecomment-6869195166
+[#21-c5]: https://github.com/twcclegg/skyrim-apple/issues/21#issuecomment-6869223765
+[#21-c7]: https://github.com/twcclegg/skyrim-apple/issues/21#issuecomment-6869855993
+[#21-c10]: https://github.com/twcclegg/skyrim-apple/issues/21#issuecomment-6873484523
+[#21-c11]: https://github.com/twcclegg/skyrim-apple/issues/21#issuecomment-6873636463
+[#21-c14]: https://github.com/twcclegg/skyrim-apple/issues/21#issuecomment-6874054924
+[#21-c15]: https://github.com/twcclegg/skyrim-apple/issues/21#issuecomment-6875243870
+[#21-c16]: https://github.com/twcclegg/skyrim-apple/issues/21#issuecomment-6877090410
+[#21-c17]: https://github.com/twcclegg/skyrim-apple/issues/21#issuecomment-6881548178
+[#21-c18]: https://github.com/twcclegg/skyrim-apple/issues/21#issuecomment-6883404112
+[#21-c19]: https://github.com/twcclegg/skyrim-apple/issues/21#issuecomment-6884162806
+[#21-c20]: https://github.com/twcclegg/skyrim-apple/issues/21#issuecomment-6885866269
+[#21-c23]: https://github.com/twcclegg/skyrim-apple/issues/21#issuecomment-6890861447
+[#21-c24]: https://github.com/twcclegg/skyrim-apple/issues/21#issuecomment-6896743541
+[#42-c1]: https://github.com/twcclegg/skyrim-apple/issues/42#issuecomment-6906272873
+[#42-c2]: https://github.com/twcclegg/skyrim-apple/issues/42#issuecomment-6906385328
+[#42-c3]: https://github.com/twcclegg/skyrim-apple/issues/42#issuecomment-6906587027
+[#42-c4]: https://github.com/twcclegg/skyrim-apple/issues/42#issuecomment-6912103883
+[#42-c5]: https://github.com/twcclegg/skyrim-apple/issues/42#issuecomment-6913783287
+[#42-c6]: https://github.com/twcclegg/skyrim-apple/issues/42#issuecomment-6914002955
+[#42-c7]: https://github.com/twcclegg/skyrim-apple/issues/42#issuecomment-6917336367
+[#42-c8]: https://github.com/twcclegg/skyrim-apple/issues/42#issuecomment-6933259615
+[#42-c9]: https://github.com/twcclegg/skyrim-apple/issues/42#issuecomment-6934735632
+[#42-c10]: https://github.com/twcclegg/skyrim-apple/issues/42#issuecomment-6936368633
+[#42-c11]: https://github.com/twcclegg/skyrim-apple/issues/42#issuecomment-6936781836
+[#42-c12]: https://github.com/twcclegg/skyrim-apple/issues/42#issuecomment-6937153115
+[#42-c13]: https://github.com/twcclegg/skyrim-apple/issues/42#issuecomment-6937436734
+[#42-c14]: https://github.com/twcclegg/skyrim-apple/issues/42#issuecomment-6938214790
+[#42-c15]: https://github.com/twcclegg/skyrim-apple/issues/42#issuecomment-6938517223
+[#42-c16]: https://github.com/twcclegg/skyrim-apple/issues/42#issuecomment-6938701829
+[#42-c17]: https://github.com/twcclegg/skyrim-apple/issues/42#issuecomment-6938816284
+[#42-c18]: https://github.com/twcclegg/skyrim-apple/issues/42#issuecomment-6939362077
+[#42-c19]: https://github.com/twcclegg/skyrim-apple/issues/42#issuecomment-6939759392
+[#42-c20]: https://github.com/twcclegg/skyrim-apple/issues/42#issuecomment-6940013813
+[#42-c21]: https://github.com/twcclegg/skyrim-apple/issues/42#issuecomment-6940190594
+[#42-c22]: https://github.com/twcclegg/skyrim-apple/issues/42#issuecomment-6941075032
+[#42-c23]: https://github.com/twcclegg/skyrim-apple/issues/42#issuecomment-6941279451
+[#42-c24]: https://github.com/twcclegg/skyrim-apple/issues/42#issuecomment-6941364148
+[#42-c25]: https://github.com/twcclegg/skyrim-apple/issues/42#issuecomment-6941480946
+[#42-c26]: https://github.com/twcclegg/skyrim-apple/issues/42#issuecomment-6942112816
+[#42-c27]: https://github.com/twcclegg/skyrim-apple/issues/42#issuecomment-6943377332
+[#42-c28]: https://github.com/twcclegg/skyrim-apple/issues/42#issuecomment-6950657851
+[#42-c29]: https://github.com/twcclegg/skyrim-apple/issues/42#issuecomment-6950975791
+[#42-c30]: https://github.com/twcclegg/skyrim-apple/issues/42#issuecomment-6951172309
+[#42-c33]: https://github.com/twcclegg/skyrim-apple/issues/42#issuecomment-6986896471
+[#42-c34]: https://github.com/twcclegg/skyrim-apple/issues/42#issuecomment-6989573599
+[#42-c35]: https://github.com/twcclegg/skyrim-apple/issues/42#issuecomment-6989705482
+[#42-c37]: https://github.com/twcclegg/skyrim-apple/issues/42#issuecomment-7027983120
