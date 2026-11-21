@@ -47,6 +47,11 @@ replaced by a copy with `LB_DEPTH_COPY`), `fp` (first-person draws), `fx` (effec
 - Late eyes turned the eyes after the mask was drawn, so the left eye's shadows stayed put while the picture
   turned; #71 turns them at the first mask draw. `LB_HEAD_TEST=5,0` anchors the head to the camera and does not
   turn the eyes; use `LB_HEAD_TEST=sweep LB_HEAD_GAIN=0` to test late eyes.
+- With #71 and #72 no other mono pass misplaces the right eye's picture (2026-11-21, M1, river and Riverwood scenes;
+  right eye at run-to-run noise). The 512x512 fp16 target is a 6-face cube map drawn with axis-aligned 90° views;
+  the 512x512 water reflection (sky only at low settings) is drawn with a square viewport from the game camera; the
+  shadow map is in light space. The one measurable difference left is the shared eye adaptation, computed from
+  the left eye: the right eye is 1.6–3.3% darker than its own truth, global, not localised.
 
 ## 2026-11-10 — setup
 
