@@ -912,6 +912,16 @@ Measured with a scripted scene (`coc riverwood`, `bat fpflame`: iron sword and F
   loads and stores of the two-layer targets, once the untimed log confirms the split is the game's and not the
   timers'. One Metal frame capture of the Riverwood walk was taken and kept locally.
 
+## 2026-11-21 — the three LLVM passes pinned registers turn off (the M5; plan item 10b)
+
+- **Setup:** main 50f0db9d without pinned registers, built twice (the three pass-disabling flags on and off);
+  1280×720 mono, uncapped, six rounds in alternating order, Riverwood and the boss fight.
+- **Game work, flags on minus off** (mean of 6 pairs, sd): Riverwood idle +0.018 ms (0.030), +0.5%; Riverwood run
+  +0.010 ms (0.027), +0.3%; boss early −0.205 ms (0.593); boss late +0.023 ms (0.665). The boss pairs (standard
+  error about 0.25 ms) cannot resolve an effect this small; Riverwood is the clean measure.
+- **Verdict:** turning the passes off costs about 0.3–0.5% of game work. A compiler fixed so they could stay on
+  would give back at most that, not enough to carry an LLVM patch for speed.
+
 <!-- Issue comments cited above -->
 [#21-c2]: https://github.com/twcclegg/skyrim-apple/issues/21#issuecomment-6869056184
 [#21-c3]: https://github.com/twcclegg/skyrim-apple/issues/21#issuecomment-6869156538
