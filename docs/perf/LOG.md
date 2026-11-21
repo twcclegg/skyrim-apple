@@ -906,11 +906,12 @@ Measured with a scripted scene (`coc riverwood`, `bat fpflame`: iron sword and F
   to 40 (boss) passes in a row on the same RGBA16F and D32S8 two-layer targets, each loading and storing both;
   shadow passes (55 in a row in the boss fight) keep the main two-layer depth bound and load and store it over the
   shadow map's area; depth-only two-layer passes load and store the depth. Only the final one-layer composite uses
-  DONTCARE. Open: the GPU timestamps of `LB_PASSES_GPU` may themselves split passes; a render-pass log without
-  timers settles it.
+  DONTCARE. Without the GPU timers the splits remain: Riverwood keeps the same 36 passes; the boss fight has 83
+  (runs of 27 shadow passes and 11 and 10 main passes on the same attachments) against 119 with timers (runs of
+  55, 20 and 19; the fight differs between runs, so not an exact pair). The splits are the game's or DXVK's;
+  the timers roughly double them in the boss fight.
 - **Verdict:** neither format switch is worth taking. The candidate left is fewer pass breaks and fewer
-  loads and stores of the two-layer targets, once the untimed log confirms the split is the game's and not the
-  timers'. One Metal frame capture of the Riverwood walk was taken and kept locally.
+  loads and stores of the two-layer targets. One Metal frame capture of the Riverwood walk was taken and kept locally.
 
 ## 2026-11-21 — the three LLVM passes pinned registers turn off (the M5; plan item 10b)
 
