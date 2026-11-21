@@ -934,8 +934,14 @@ Measured with a scripted scene (`coc riverwood`, `bat fpflame`: iron sword and F
   mono pass is 0.43–0.56, so per eye it costs about 1.7× that); post +0.11 / +0.10 / +0.18 / +0.19. Both move
   the same way in every pair. Totals are not clean (main falls 0.25–0.44 ms in Riverwood in the same runs; one
   boss pair is +4.1).
-- **Open:** the boss fight's frame-time p95 is 15–25 ms in all three on runs against 9.5–10.5 off (means +1.9 /
-  +1.2 ms). Riverwood stays at 120 fps. Cause not yet found; #71 and #72 stay draft until it is.
+- **Boss-fight frame times:** p95 is 15–25 ms in all three on runs against 9.5–10.5 off (means +1.9 / +1.2 ms);
+  Riverwood stays at 120 fps. Split runs (three rounds each, early / late p95): both off 10.3 / 10.7, mask only
+  15.0 / 15.3, post only 19.1 / 17.6, both 15.4 / 15.9. Either switch alone causes it; the post targets the game
+  makes mid-fight (layered as they appear) are not needed for it, and at-draw compiles are the same in every arm
+  (27–157, longest 3–6 ms). Work time stays flat while Present time rises from 0.10 to 0.74–1.00 ms, with slow
+  frames every third frame. Reading, not yet checked: uncapped at about 100 fps the GPU frame is already
+  9.3–9.8 ms, and the extra 0.4–0.6 ms puts the GPU at its limit, so frames wait in Present. A run capped at
+  45 fps decides it.
 
 ## 2026-11-21 — shader bytecode cache (the M5; #69)
 
@@ -950,6 +956,13 @@ Measured with a scripted scene (`coc riverwood`, `bat fpflame`: iron sword and F
   cluster in one warm run (up to 136 ms) with the game thread waiting on DXVK's command-stream thread and only 4
   small compiles nearby: not compile hitches; cause not found.
 - **Verdict:** warm launches compile 4–15× fewer pipelines at draw; cold launches are unchanged, as expected.
+
+## 2026-11-21 — more rounds on the GPU candidates (the M5; plan item 6)
+
+- Same setup as the GPU attribution entry, more rotating rounds (12 boss fight, 9 Riverwood) of base against
+  `d3d9.floatEmulation = False` and `LB_DEPTH_COPY=0`.
+- `floatEmulation = False`: no effect. `LB_DEPTH_COPY=0` (the game's own R32F depth redraw) is worse: the depth
+  class costs 0.46–0.74 ms more, and the boss fight's p95 rises 6–8 ms. The depth copy stays on.
 
 <!-- Issue comments cited above -->
 [#21-c2]: https://github.com/twcclegg/skyrim-apple/issues/21#issuecomment-6869056184
