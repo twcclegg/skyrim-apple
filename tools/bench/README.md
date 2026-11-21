@@ -88,8 +88,10 @@ older logs parse as before.
 
 The windowed lines carry no frame number, so each is placed at the last `ft` frame before it and covers the frames
 of its window; it counts towards a phase when at least half of it lies inside. `overall` covers loading and menus
-too, so its windowed blocks keep only windows in which the game delivered at least 90% of its frame cap
-(`basis: "steady"`), when there are any. A log without `ft` lines (a play session) puts everything in `overall`.
+too (a menu can run at the cap with almost no GPU work), so its windowed blocks keep the windows that count towards
+any of the scenario's phases (`basis: "phases"`); without phases, those in which the game delivered at least 90% of
+its frame cap (`basis: "steady"`), when there are any. A log without `ft` lines (a play session) puts everything in
+`overall`.
 
 `meta` gets the run's `thermal` state (`worst`, `last`, `seen`), `frame_cap_fps` (from the runtime's `present
 pacing` line, not the environment: on a device `launch-env.json` overrides it), `state_cache_entries`,
@@ -107,10 +109,11 @@ questions. `sessions/budget.json` is the frame-budget session: stereo 1600x1100 
 two rounds each in the boss fight and the Whiterun market, after two warm-up runs, then one uncapped run.
 
     export SKYRIM_BENCH_DEVICE=<udid> SKYRIM_BUNDLE_ID=<the installed app's bundle ID>
-    python3 tools/bench/session.py budget check --tag <build>      # stops on an abort or missing stereo lines
-    python3 tools/bench/session.py budget run warmup --tag <build> # untimed: fills DXVK's pipeline cache
-    python3 tools/bench/session.py budget run timed --tag <build>  # --from N / --only N to resume or repeat
-    python3 tools/bench/session.py budget run uncapped --tag <build>
+    python3 tools/bench/session.py budget list                       # the runs, numbered, and the time estimate
+    python3 tools/bench/session.py budget check --build <commit>     # stops on an abort or missing stereo lines
+    python3 tools/bench/session.py budget run warmup --build <commit> # untimed: fills DXVK's pipeline cache
+    python3 tools/bench/session.py budget run timed --build <commit>  # --from N / --only N to resume or repeat
+    python3 tools/bench/session.py budget run uncapped --build <commit>
     python3 tools/bench/session.py budget restore                  # the device's own launch-env.json back
     python3 tools/bench/session.py budget report                   # bench-results/sessions/budget/summary.md
 
@@ -122,10 +125,22 @@ device for play by hand; `--pull-layers` also pulls both eyes' shots and depth f
 same plan on the macOS build as a dry run (its own manifest; there is no compositor there). The session folder
 (`--dir`, default `bench-results/sessions/<plan>`) holds the manifest, the saved `launch-env.json` and the answers.
 
+After each run the driver checks in the log that the arm reached the game, and records any problem in the manifest:
+on a device, every key echoed as `native: launch-env.json: K=V` (none ignored); wherever the arm sets them, the
+compositor's foveation (`immersive: layer N, foveation on|off`) and depth-search steps, the frame cap (`present
+pacing: …`), the depth copy and live stereo (and no stereo lines in a mono arm); with `--build`, the commit in the
+runtime's identity line; and no fatal-looking lines. The launch check stops on any problem; later runs carry on and
+say which run to repeat. Thermal state: after a run at *serious* the driver waits `--cooldown` seconds (default
+300) while the headset rests on AC; *serious* twice in a row, or *critical*, stops the session and prints the
+`--from` to resume with. Before each device run it waits until the headset is unlocked (a locked headset suspends
+the app). The plan's `"minutes"` per scenario give the estimate that `list` prints and each run updates (time spent,
+time left).
+
 `report.py` re-parses runs (a manifest, result directories, or a hand-pulled game log) and writes one Markdown
 report: per run and phase, work mean and p95, frame p95 and frames over 33 ms, held counts, game GPU latency,
 compositor GPU, GPU busy (capped or not), at-draw compiles, hitches and thermal state; then a mean per scenario and
-arm over complete runs below *serious*, without warm-ups. `--json` writes every re-parsed summary.
+arm over complete runs below *serious* that passed their checks, without warm-ups. `--json` writes every re-parsed
+summary.
 
 `test_bench.py` checks all of this on a synthetic log.
 

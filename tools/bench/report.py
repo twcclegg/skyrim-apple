@@ -15,7 +15,7 @@ frame's GPU time, see ipad/immersive_bridge.mm), compositor GPU time per refresh
 whether the frame cap was on: capped busy time on Apple GPUs understates the work, so compare it only with other
 capped runs), pipelines compiled at draw time (count, total and longest ms), hitch-sampler frames (LB_HITCH_MS), and
 the worst thermal state of the run. Then a mean per scenario and arm over complete runs below *serious*, leaving out
-warm-up runs (run 0).
+warm-up runs (run 0) and runs whose manifest record lists failed checks (session.py's check_run).
 """
 import argparse
 import json
@@ -59,7 +59,10 @@ def runs_from(args):
                 continue
             rec = json.loads(line)
             if rec.get("dir") and Path(rec["dir"]).exists():
-                out.append((load(rec["dir"]), rec.get("arm"), rec.get("run")))
+                s = load(rec["dir"])
+                if rec.get("problems") is not None:  # session.py's checks that the arm reached the game
+                    s["meta"]["checks"] = rec["problems"]
+                out.append((s, rec.get("arm"), rec.get("run")))
     for p in args.paths:
         s = load(p)
         m = re.search(r"-r(\d+)$", s["meta"].get("label", ""))
@@ -93,6 +96,12 @@ def row(s, phase):
     }
 
 
+def checks(meta):
+    """The Runs table's checks cell: '-' when the run wasn't checked (no session manifest), else ok or the problems."""
+    c = meta.get("checks")
+    return "-" if c is None else "; ".join(c) if c else "ok"
+
+
 def mean(xs):
     xs = [x for x in xs if x is not None]
     return sum(xs) / len(xs) if xs else None
@@ -102,21 +111,21 @@ def render(runs):
     out = []
     p = out.append
     p("## Runs\n")
-    p("| # | run | scenario | arm | thermal (worst) | frame cap | clean exit |")
-    p("|---|---|---|---|---|---|---|")
+    p("| # | run | scenario | arm | thermal (worst) | frame cap | clean exit | checks |")
+    p("|---|---|---|---|---|---|---|---|")
     for i, (s, arm, _) in enumerate(runs, 1):
         m = s["meta"]
         cap = m.get("frame_cap_fps")
         p(f"| {i} | {m.get('label')} | {m.get('scenario') or '-'} | {arm or '-'} | "
           f"{m.get('thermal', {}).get('worst', 'unknown')} | {'-' if cap is None else 'off' if cap == 0 else cap} | "
-          f"{'yes' if m.get('exited_cleanly') else 'NO'} |")
+          f"{'yes' if m.get('exited_cleanly') else 'NO'} | {checks(m)} |")
 
     p("\n## Per phase\n")
     p("Work and frame times in ms; *held* counts game frames shown for 1/2/3/4+ refreshes (target: all 2); "
       "*game gpu* is the mean GPU latency per game frame (an upper bound); *compositor* is GPU ms per refresh, mean "
       "and the range of its 5 s windows; *gpu busy* is DXVK's per-frame figure and its window range ('c' = capped); "
-      "*at draw* is pipelines compiled at draw time: count / total ms / longest ms. `overall` uses only windows "
-      "where the game held at least 90% of its cap.\n")
+      "*at draw* is pipelines compiled at draw time: count / total ms / longest ms. `overall`'s windows are those "
+      "of the named phases, or without phases those where the game held at least 90% of its cap.\n")
     p("| # | phase | frames | work mean / p95 | frame p95 | >33 ms | held 1/2/3/4+ | game gpu mean / max | "
       "compositor mean (range) | gpu busy ms (range) | at draw | ahead | hitches |")
     p("|---|---|---|---|---|---|---|---|---|---|---|---|---|")
@@ -137,11 +146,13 @@ def render(runs):
     groups = defaultdict(list)
     for s, arm, run in runs:
         m = s["meta"]
-        if not m.get("exited_cleanly") or m.get("thermal", {}).get("worst") in BAD_THERMAL or run == 0:
+        if not m.get("exited_cleanly") or m.get("thermal", {}).get("worst") in BAD_THERMAL or run == 0 \
+                or m.get("checks"):
             continue
         groups[(m.get("scenario") or "-", arm or re.sub(r"-r\d+$", "", m.get("label", "")))].append(s)
     if groups:
-        p("\n## Per scenario and arm (mean of complete runs below serious, warm-ups left out)\n")
+        p("\n## Per scenario and arm (mean of complete runs below serious that passed their checks, warm-ups left "
+          "out)\n")
         p("| scenario | arm | runs | phase | work mean / p95 | frame p95 | >33 ms | held 2 share | game gpu | "
           "compositor | gpu busy | at draw (count / ms) | hitches |")
         p("|---|---|---|---|---|---|---|---|---|---|---|---|---|")

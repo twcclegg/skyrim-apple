@@ -163,6 +163,15 @@ class Device:
         except subprocess.TimeoutExpired as expired:
             return (expired.stdout or b"").decode(errors="replace") + "\nbench: launch timed out\n"
 
+    def unlocked(self):
+        """True or False from devicectl's lock state; None when it can't tell (no answer, another output format)."""
+        try:
+            done = self.devicectl("device", "info", "lockState", "--device", self.udid, timeout=30)
+        except subprocess.TimeoutExpired:
+            return None
+        m = re.search(r"passcodeRequired: (true|false)", done.stdout)
+        return None if done.returncode or not m else m[1] == "false"
+
     def push(self, source, destination):
         """Copies a local file into the app's container (destination relative to it); returns devicectl's result."""
         return self.devicectl("device", "copy", "to", "--device", self.udid, "--domain-type", "appDataContainer",

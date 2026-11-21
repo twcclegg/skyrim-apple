@@ -24,10 +24,12 @@ before it, and its window starts <n> frames earlier (gpu busy, cadence) or at th
 (compositor). A window counts towards a phase when at least half of it lies inside the phase. With no ft lines (a
 play session without LB_FRAMETIMES) everything lands in `overall`.
 
-`overall` also covers loading and menus, where the game runs far below its cap and a window says little about
-the budget. So `overall` keeps only steady windows, those in which the game delivered at least 90% of its frame
-cap, when there are any (`basis: "steady"`; otherwise `basis: "all"`). Named phases are play by construction and
-keep every window, hitches included.
+`overall` also covers loading and menus, where a window says little about the budget: a loading screen runs far
+below the cap, and a menu can run at the cap with almost no GPU work. So when the scenario names phases, `overall`'s
+windowed blocks keep the windows that count towards any phase (`basis: "phases"`). Without phases (a log pulled by
+hand) they keep the steady windows, those in which the game delivered at least 90% of its frame cap, when there are
+any (`basis: "steady"`; otherwise `basis: "all"`). Named phases are play by construction and keep every window,
+hitches included. Compiles and hitches in `overall` cover the whole run.
 """
 import re
 
@@ -196,15 +198,20 @@ def _compositor_block(ws):
             "max_ms": _r(max(w["max"] for w in ws))}
 
 
-def phase_budget(sc, span=None, stalled=(), steady=False):
-    """The budget block for one phase: span is [start, end) in frames, or None for the whole run (overall)."""
+def phase_budget(sc, span=None, stalled=(), steady=False, within=None):
+    """The budget block for one phase: span is [start, end) in frames, or None for the whole run (overall).
+    For overall, `within` (the scenario's phase spans) keeps the windows that count towards any of them; without
+    it, `steady` keeps the windows at 90% or more of the cap."""
     cap = sc["cap"]
     inside = (lambda f: f is not None and span[0] <= f < span[1]) if span else (lambda f: True)
-    gpu = [w for w in sc["gpu"] if _in_window(w, span)]
-    cad = [w for w in sc["cadence"] if _in_window(w, span)]
-    comp = [w for w in sc["compositor"] if _in_window(w, span)]
+    counts = (lambda w: any(_in_window(w, tuple(s)) for s in within)) if within else (lambda w: _in_window(w, span))
+    gpu = [w for w in sc["gpu"] if counts(w)]
+    cad = [w for w in sc["cadence"] if counts(w)]
+    comp = [w for w in sc["compositor"] if counts(w)]
     basis = None
-    if steady:
+    if within:
+        basis = {"gpu_busy": "phases", "cadence": "phases", "compositor_gpu": "phases"}
+    elif steady:
         gpu, b1 = _steady(gpu, cap)
         cad, b2 = _steady(cad, cap)
         comp, b3 = _steady(comp, cap)
@@ -242,7 +249,8 @@ def run_facts(sc):
 
 
 def add_to_summary(summary, text, phases, stalled=(), console=""):
-    """Adds `budget` to every phase of a bench summary (overall over steady windows) and run facts to its meta.
+    """Adds `budget` to every phase of a bench summary (overall over the phases' windows, or the steady ones when
+    there are no phases) and run facts to its meta.
     Windowed lines are taken from the game log; only if it has none are the console's used, for overall alone
     (the console has no ft lines to place them by)."""
     sc = scan(text)
@@ -256,7 +264,8 @@ def add_to_summary(summary, text, phases, stalled=(), console=""):
         if name in ("meta", "gpu") or not isinstance(s, dict):
             continue
         if name == "overall":
-            s["budget"] = phase_budget(sc, None, stalled, steady=True)
+            s["budget"] = phase_budget(sc, None, stalled, steady=True,
+                                       within=list(phases.values()) or None)
         elif name in phases:
             s["budget"] = phase_budget(sc, tuple(phases[name]), stalled)
     summary.setdefault("meta", {}).update(run_facts(sc))

@@ -4,6 +4,7 @@
 No game, device or real log is needed: the log below is made up, in the formats the runtime, DXVK and the
 compositor print.
 """
+import argparse
 import contextlib
 import io
 import json
@@ -85,15 +86,29 @@ class BudgetTest(unittest.TestCase):
         self.assertEqual(fight["cadence"]["game_gpu_latency_max_ms"], 40.0)
         self.assertEqual(fight["compositor_gpu"]["p95_ms"], 5.0)
 
-    def test_overall_keeps_steady_windows(self):
-        b = self.summary["overall"]["budget"]
-        self.assertEqual(b["basis"], {"gpu_busy": "steady", "cadence": "steady", "compositor_gpu": "steady"})
-        self.assertEqual(b["gpu_busy"]["windows"], 2)
+    def with_menu(self):
+        """The synthetic log plus a window before the phases at the frame cap with little GPU work (a menu)."""
+        ft = "ft 80 22.20 0.01 8.00 1500\n"
+        self.assertIn(ft, self.text)
+        return self.text.replace(ft, ft + "dxvk: gpu busy 5%, 2.0 ms per frame over 30 frames (45 fps)\n")
+
+    def test_overall_keeps_phase_windows(self):
+        *_, s, _ = bench.parse_log(self.with_menu(), {"phases": PHASES})
+        b = s["overall"]["budget"]
+        self.assertEqual(b["basis"], {"gpu_busy": "phases", "cadence": "phases", "compositor_gpu": "phases"})
+        self.assertEqual(b["gpu_busy"]["windows"], 2)  # neither the loading window nor the menu
         self.assertEqual(b["gpu_busy"]["ms_range"], [11.0, 13.0])
         self.assertEqual(b["compositor_gpu"]["mean_range_ms"], [3.0, 4.0])
         self.assertEqual(b["cadence"]["game_gpu_latency_mean_ms"], round((14 * 90 + 16 * 88) / 178, 2))
         # the whole-run figure bench.py always had still covers every window
-        self.assertEqual(self.summary["gpu"]["windows"], 3)
+        self.assertEqual(s["gpu"]["windows"], 4)
+
+    def test_overall_without_phases_keeps_steady_windows(self):
+        *_, s, _ = bench.parse_log(self.with_menu())
+        b = s["overall"]["budget"]
+        self.assertEqual(b["basis"], {"gpu_busy": "steady", "cadence": "steady", "compositor_gpu": "steady"})
+        self.assertEqual(b["gpu_busy"]["windows"], 3)  # the menu runs at the cap, so only loading is left out
+        self.assertEqual(b["gpu_busy"]["ms_range"], [2.0, 13.0])
 
     def test_compiles_and_hitches(self):
         fight, idle = self.summary["fight"]["budget"], self.summary["idle"]["budget"]
@@ -116,8 +131,10 @@ class BudgetTest(unittest.TestCase):
         *_, s, _ = bench.parse_log(text, {"phases": PHASES})
         b = s["overall"]["budget"]
         self.assertFalse(b["gpu_busy"]["capped"])
-        self.assertEqual(b["gpu_busy"]["windows"], 3)
-        self.assertEqual(b["basis"]["gpu_busy"], "all")
+        self.assertEqual((b["gpu_busy"]["windows"], b["basis"]["gpu_busy"]), (2, "phases"))
+        *_, s, _ = bench.parse_log(text)
+        b = s["overall"]["budget"]
+        self.assertEqual((b["gpu_busy"]["windows"], b["basis"]["gpu_busy"]), (3, "all"))
 
     def test_log_without_frame_times(self):
         """A play session without LB_FRAMETIMES: everything lands in overall."""
@@ -157,6 +174,119 @@ class ReportTest(unittest.TestCase):
             self.assertIn("| 1 | fight | 99 | 12.00 / 12.0 | 22.2 | 1 | 2/84/1/1 |", text)
             self.assertIn("2 / 42 / 30", text)
             self.assertIn("| synthetic | stereo | 1 | idle |", text)
+            self.assertIn("| yes | - |", text)  # a record without "problems" was not checked
+
+            # a run whose manifest record lists failed checks: shown in the runs table, left out of the means
+            manifest.write_text(json.dumps({"dir": str(run), "arm": "stereo", "run": 1,
+                                            "problems": ["frame cap not 45"]}) + "\n")
+            with contextlib.redirect_stdout(io.StringIO()):
+                report.main(["--manifest", str(manifest), "--out", str(out)])
+            text = out.read_text()
+            self.assertIn("| yes | frame cap not 45 |", text)
+            self.assertNotIn("| synthetic | stereo | 1 | idle |", text)
+
+
+# A device stereo run whose log shows every key of STEREO_ENV arriving: made-up lines in the formats the app
+# (native: launch-env.json, the identity's source_commit), the runtime and the compositor print.
+STEREO_ENV = {"LB_MAX_FPS": "45", "LB_STEREO_MULTIVIEW": "1", "LB_FOVEATION": "1", "LB_IMMERSIVE_REFINE": "2",
+              "LB_DEPTH_COPY": "1"}
+STEREO_LOG = "\n".join([
+    *(f"native: launch-env.json: {k}={v}" for k, v in STEREO_ENV.items()),
+    'native: identity {"source_commit":"0123abcd","platform":"test"}',
+    "present pacing: at most 45 fps (LB_MAX_FPS)",
+    "LB_DEPTH_COPY: the R32F depth pass is a copy of the main pass's depth",
+    "stereo: live single-pass stereo, d 2.240 units",
+    "immersive: layer 81, foveation on, started",
+    "immersive: per-pixel depth search: 2 steps",
+    "immersive: stereo frames: each eye draws its own picture (eye units 2.24)",
+    "ft 1 22.20 0.01 8.00 1500",
+]) + "\n"
+
+
+class CheckRunTest(unittest.TestCase):
+    def check(self, text=STEREO_LOG, env=STEREO_ENV, **kw):
+        kw = {"device": True, "immersive": True, "build": "0123abcd", **kw}
+        return session.check_run(text, env, **kw)
+
+    def test_all_applied(self):
+        self.assertEqual(self.check(), [])
+        self.assertEqual(self.check(build="0123abcd4567"), [])  # a longer commit matches the logged short one
+
+    def test_key_not_echoed_or_ignored(self):
+        text = STEREO_LOG.replace("native: launch-env.json: LB_FOVEATION=1\n", "")
+        self.assertEqual(self.check(text), ["keys not applied: LB_FOVEATION"])
+        text = STEREO_LOG + "native: launch-env.json: ignoring HOME\n"
+        self.assertEqual(self.check(text), ["keys ignored: HOME"])
+
+    def test_compositor_settings(self):
+        text = STEREO_LOG.replace("foveation on", "foveation off").replace("2 steps", "4 steps")
+        self.assertEqual(self.check(text), ["foveation not on (the layer may not support it)",
+                                            "depth search not 2 steps"])
+
+    def test_build(self):
+        self.assertEqual(self.check(build="fedc9876"), ["build 0123abcd, not fedc9876"])
+        text = STEREO_LOG.replace('"source_commit":"0123abcd",', "")
+        self.assertEqual(self.check(text), ["no build commit in the log"])
+        self.assertEqual(self.check(text, build=None), [])
+
+    def test_frame_cap_depth_copy_stereo(self):
+        env = {**STEREO_ENV, "LB_MAX_FPS": "0", "LB_DEPTH_COPY": "0"}
+        text = STEREO_LOG.replace("LB_MAX_FPS=45", "LB_MAX_FPS=0").replace("LB_DEPTH_COPY=1", "LB_DEPTH_COPY=0")
+        self.assertEqual(self.check(text, env), ["frame cap not off", "depth copy on"])
+        text = STEREO_LOG.replace("stereo: live single-pass stereo, d 2.240 units\n", "")
+        self.assertEqual(self.check(text), ["stereo not live"])
+        mono = {k: v for k, v in STEREO_ENV.items() if k != "LB_STEREO_MULTIVIEW"}
+        self.assertEqual(self.check(env=mono), ["stereo on in a mono arm"])
+        self.assertEqual(self.check(STEREO_LOG + "LB_DEPTH_COPY: copy failed (hr 80004005); the pass is drawn\n"),
+                         ["depth copy failed"])
+
+    def test_fatal_and_mac(self):
+        self.assertEqual(self.check(STEREO_LOG + "[mvk-error] VK_ERROR_DEVICE_LOST\n"),
+                         ["fatal-looking lines: [mvk-error]"])
+        # the Mac: keys go in as the environment (nothing echoes them) and there is no compositor
+        text = "\n".join(line for line in STEREO_LOG.splitlines()
+                         if not line.startswith(("native:", "immersive:"))) + "\n"
+        self.assertEqual(self.check(text, device=False), [])
+
+
+class SessionLoopTest(unittest.TestCase):
+    """cmd_run's thermal handling, with bench runs replaced by records of a given thermal state."""
+
+    def run_loop(self, thermals):
+        plan = {"name": "t", "minutes": {"a": 2.0},
+                "arms": {"x": [{"LB_MAX_FPS": "45"}]}, "sequences": {"s": [["a", "x", n] for n in range(1, 6)]}}
+        slept, ran = [], []
+        with tempfile.TemporaryDirectory() as tmp:
+            args = argparse.Namespace(mac="build", game=None, device=None, dir=tmp, tag=None, build=None,
+                                      holding_lock=False, cooldown=7)
+            s = session.Session(plan, args)
+            s.bench_run = lambda scenario, arm, run, name: (
+                ran.append(run) or ({"complete": True, "problems": [], "thermal": thermals[run - 1]}, None, ""))
+            real_sleep, session.time.sleep = session.time.sleep, slept.append
+            try:
+                with contextlib.redirect_stdout(io.StringIO()) as out:
+                    try:
+                        session.cmd_run(s, "s")
+                        stopped = None
+                    except SystemExit:
+                        stopped = out.getvalue().split("STOP: ", 1)[1].strip()
+            finally:
+                session.time.sleep = real_sleep
+        return ran, slept, stopped
+
+    def test_cool_down_then_carry_on(self):
+        ran, slept, stopped = self.run_loop(["nominal", "serious", "fair", "serious", "nominal"])
+        self.assertEqual((ran, slept, stopped), ([1, 2, 3, 4, 5], [7, 7], None))
+
+    def test_serious_twice_stops(self):
+        ran, slept, stopped = self.run_loop(["nominal", "serious", "serious", "nominal", "nominal"])
+        self.assertEqual((ran, slept), ([1, 2, 3], [7]))
+        self.assertIn("--from 4", stopped)
+
+    def test_critical_stops(self):
+        ran, slept, stopped = self.run_loop(["critical", "nominal", "nominal", "nominal", "nominal"])
+        self.assertEqual((ran, slept), ([1], []))
+        self.assertIn("--from 2", stopped)
 
 
 class PlanTest(unittest.TestCase):
@@ -173,6 +303,10 @@ class PlanTest(unittest.TestCase):
         for scenario, arm, _ in timed + session.sequence(plan, "warmup") + session.sequence(plan, "uncapped"):
             self.assertTrue((HERE / "scenarios" / f"{scenario}.json").exists(), scenario)
             session.arm_env(plan, arm)
+        total, unknown = session.estimate(plan, timed)
+        # six boss fights at 4.4 min and six market runs at 4.0; every scenario has an estimate
+        self.assertEqual((round(total, 1), unknown), (50.4, 0))
+        self.assertIsNotNone(session.minutes(plan, plan["check"]["scenario"]))
 
 
 if __name__ == "__main__":
