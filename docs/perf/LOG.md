@@ -940,8 +940,13 @@ Measured with a scripted scene (`coc riverwood`, `bat fpflame`: iron sword and F
   makes mid-fight (layered as they appear) are not needed for it, and at-draw compiles are the same in every arm
   (27–157, longest 3–6 ms). Work time stays flat while Present time rises from 0.10 to 0.74–1.00 ms, with slow
   frames every third frame. Reading, not yet checked: uncapped at about 100 fps the GPU frame is already
-  9.3–9.8 ms, and the extra 0.4–0.6 ms puts the GPU at its limit, so frames wait in Present. A run capped at
-  45 fps decides it.
+  9.3–9.8 ms, and the extra 0.4–0.6 ms puts the GPU at its limit, so frames wait in Present.
+- **Capped at 45 fps** (the headset's rate; boss fight, three rotating rounds): the gap disappears. p95 23.94 /
+  23.95 ms on against 23.88 / 23.87 off, mean 22.3 in both; frames over 33 ms 4 / 0 / 4 against 4 / 2 / 1; Present
+  0.05 ms in both. GPU ms, on minus off: mask +0.71 / +0.63, post +0.17 / +0.17. Capped GPU times are about twice the
+  uncapped ones (total 17.4 against 9.3 ms), consistent with a lower GPU clock under the cap (not measured), so
+  they don't compare with uncapped figures. **Verdict:** the uncapped rise was GPU saturation, not a fault in
+  #71 or #72; their cost is GPU time (0.4–0.6 ms uncapped).
 
 ## 2026-11-21 — shader bytecode cache (the M5; #69)
 
