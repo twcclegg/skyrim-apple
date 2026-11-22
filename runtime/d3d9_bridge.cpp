@@ -2442,7 +2442,9 @@ static void stereo_mask_present(bool reset) {
  * of such a target is caught a frame later, once its source has two layers. The luminance chain that sets the eye
  * adaptation reduces the scene to 1x1 through one-layer targets that only mono passes read, so it stays one
  * value for both eyes, from the left eye's picture, as before.
- * Same switch as the mask: by default with eye views only; LB_STEREO_POST=1 also with plain multiview, =0 never. */
+ * Same switch and test as the mask: by default once eye views are set up (not once their matrices are live, so the
+ * world's first frames, still under a menu, do not draw these passes mono); LB_STEREO_POST=1 also with plain
+ * multiview, =0 never. */
 static IDirect3DSurface9 *g_post_seen[8];  // one-layer targets drawn from two-layer textures (refs held)
 static bool g_post_wanted[8];              // ... and read by a two-layer pass since: layer at the next Present
 static int g_post_n;
@@ -2465,7 +2467,7 @@ static void stereo_post_draw(void) {
     if (!t.rt || !g_pass_device) return;
     static int want = -1;  // 0 never, 1 always, 2 with eye views
     if (want < 0) { const char *e = getenv("LB_STEREO_POST"); want = e && *e ? (atoi(e) ? 1 : 0) : 2; }
-    if (!want || (want == 2 && !g_live_m_valid)) return;
+    if (!want || (want == 2 && !stereo_matrix_mode())) return;
     static IDirect3DDevice9 *checked;
     static bool mv;
     if (checked != g_pass_device) { checked = g_pass_device; mv = dxvk_stereo_multiview_enabled(g_pass_device) != 0; }
