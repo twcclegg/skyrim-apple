@@ -2413,6 +2413,10 @@ static bool stereo_live_multiview(void) {
  * (dxvk_stereo_make_layered): from the next frame the pass draws both views, each with its eye's matrices, and the
  * main pass samples each eye's own layer. Only targets the pass detector saw drawn as the mask, never by size.
  * By default only with per-eye matrices (eye views; plain multiview's mono mask is off by the eye separation only).
+ * The test is that eye views are set up (stereo_matrix_mode), not that the eyes' matrices are live: those stay off
+ * while any menu is open, the loading screen included, so the world's first frames (about 40 on the Mac) drew the
+ * mask mono and compiled mono pipelines for it that were not needed again. Layered while a menu is open, the
+ * mask is drawn per eye with the plain offset the menus use, until the matrices come on.
  * LB_STEREO_MASK=1 also with plain multiview offsets, =0 never. Costs about one more mask pass of GPU time. */
 extern "C" int dxvk_stereo_multiview_enabled(void *device);         // dxvk_stereo.h
 extern "C" long dxvk_stereo_make_layered(void *device, void *surface);
@@ -2422,7 +2426,7 @@ static void stereo_mask_seen(void) {
     if (g_mask_done || g_mask_pending[0] || !g_pass_device) return;
     static int want = -1;  // 0 never, 1 always, 2 with eye views
     if (want < 0) { const char *e = getenv("LB_STEREO_MASK"); want = e && *e ? (atoi(e) ? 1 : 0) : 2; }
-    if (!want || (want == 2 && !g_live_m_valid)) return;  // eye views may start later
+    if (!want || (want == 2 && !stereo_matrix_mode())) return;  // eye views may start later
     if (!dxvk_stereo_multiview_enabled(g_pass_device)) { g_mask_done = true; return; }
     IDirect3DSurface9 *rt = nullptr, *ds = nullptr;
     g_pass_device->GetRenderTarget(0, &rt);
@@ -2475,16 +2479,38 @@ static void stereo_mask_present(bool reset) {
  * distance blur. Under eye views the eyes' frusta differ so much that this lays a glare and haze over the right eye
  * where the left eye has bright sky (plain multiview's eyes are only a parallax shift apart).
  * The rule follows the data, not the size: a quad (<= 2 primitives) drawn into a one-layer target with no
- * depth-stencil that samples a two-layer texture is noted (made from the eyes' pictures); if a later quad drawn
- * into a two-layer target samples it (read back per eye), it is given a second layer at the next Present
- * (dxvk_stereo_make_layered), and from then on its passes draw both views, each from its own eye's layer. A blur
- * of such a target is caught a frame later, once its source has two layers. The luminance chain that sets the eye
- * adaptation reduces the scene to 1x1 through one-layer targets that only mono passes read, so it stays one
- * value for both eyes, from the left eye's picture, as before.
- * Same switch as the mask: by default with eye views only; LB_STEREO_POST=1 also with plain multiview, =0 never. */
-static IDirect3DSurface9 *g_post_seen[8];  // one-layer targets drawn from two-layer textures (refs held)
-static bool g_post_wanted[8];              // ... and read by a two-layer pass since: layer at the next Present
-static int g_post_n;
+ * depth-stencil that samples a two-layer texture is noted (made from the eyes' pictures), and so is a quad drawn
+ * into such a target from one already noted of the same size and format (the blurs, which ping-pong between the
+ * two targets): it joins that target's chain. If a later quad drawn into a two-layer target samples a noted target
+ * (read back per eye), its whole chain is given a second layer at the next Present (dxvk_stereo_make_layered), and
+ * from then on its passes draw both views, each from its own eye's layer. Layering the chain at one Present leaves
+ * no frame in which a two-layer target is drawn from a one-layer one (the right eye's blur from the left eye's
+ * picture, and pipelines compiled for that frame only). The luminance chain that sets the eye adaptation reduces
+ * the scene to 1x1 through smaller one-layer targets (so in no chain of the bloom's) that only mono passes read,
+ * so it stays one value for both eyes, from the left eye's picture, as before.
+ * Once a chain has been layered, its size and format are a known kind: an effect that later draws into a new
+ * one-layer target of that kind from a two-layer texture (the game makes such targets mid-fight) has it layered
+ * before that first draw, so it never draws mono and no mono pipelines are compiled for it. Its old contents are
+ * lost, which for a target first drawn now is nothing. Forgotten at a Reset, with everything else.
+ * Same switch and test as the mask: by default once eye views are set up (not once their matrices are live, so the
+ * world's first frames, still under a menu, do not draw these passes mono); LB_STEREO_POST=1 also with plain
+ * multiview, =0 never. */
+struct PostSeen {
+    IDirect3DSurface9 *s;  // ref held
+    uint32_t w, h, fmt;
+    int chain;             // targets drawn from each other at the same size and format share it
+    bool wanted;           // read by a two-layer pass since noted: layer its chain at the next Present
+};
+static PostSeen g_post_seen[16];
+static int g_post_n, g_post_chains;
+struct PostKind { uint32_t w, h, fmt; };
+static PostKind g_post_kinds[4];  // size and format of the targets layered so far, since the last Reset
+static int g_post_kinds_n;
+static bool post_known_kind(const PassTarget &t) {
+    for (int k = 0; k < g_post_kinds_n; k++)
+        if (g_post_kinds[k].w == t.w && g_post_kinds[k].h == t.h && g_post_kinds[k].fmt == t.fmt) return true;
+    return false;
+}
 // The level-0 surfaces of the 2D textures bound to samplers 0-7, refs held; returns how many.
 static int bound_texture_surfaces(IDirect3DDevice9 *d, IDirect3DSurface9 *out[8]) {
     int n = 0;
@@ -2498,56 +2524,91 @@ static int bound_texture_surfaces(IDirect3DDevice9 *d, IDirect3DSurface9 *out[8]
     }
     return n;
 }
+static int post_find(const void *s) {
+    for (int j = 0; j < g_post_n; j++)
+        if ((const void *)g_post_seen[j].s == s) return j;
+    return -1;
+}
+// Notes the current target in `chain` (a new one if < 0); a target already noted has its chain merged into it.
+static void post_note(const PassTarget &t, int chain) {
+    const int j = post_find(t.rt);
+    if (j >= 0) {
+        const int old = g_post_seen[j].chain;
+        if (chain >= 0 && old != chain)
+            for (int i = 0; i < g_post_n; i++)
+                if (g_post_seen[i].chain == old) g_post_seen[i].chain = chain;
+        return;
+    }
+    if (g_post_n >= (int)(sizeof g_post_seen / sizeof g_post_seen[0])) return;
+    PostSeen &e = g_post_seen[g_post_n++];
+    e.s = static_cast<IDirect3DSurface9 *>(t.rt);
+    e.s->AddRef();
+    e.w = t.w;
+    e.h = t.h;
+    e.fmt = t.fmt;
+    e.chain = chain >= 0 ? chain : g_post_chains++;
+    e.wanted = false;
+}
 // At each draw of <= 2 primitives.
 static void stereo_post_draw(void) {
     const PassTarget &t = g_pass_target;
     if (!t.rt || !g_pass_device) return;
     static int want = -1;  // 0 never, 1 always, 2 with eye views
     if (want < 0) { const char *e = getenv("LB_STEREO_POST"); want = e && *e ? (atoi(e) ? 1 : 0) : 2; }
-    if (!want || (want == 2 && !g_live_m_valid)) return;
+    if (!want || (want == 2 && !stereo_matrix_mode())) return;
     static IDirect3DDevice9 *checked;
     static bool mv;
     if (checked != g_pass_device) { checked = g_pass_device; mv = dxvk_stereo_multiview_enabled(g_pass_device) != 0; }
     if (!mv) return;
     const int rl = dxvk_stereo_surface_layers(t.rt);
-    const bool producer = rl == 1 && !t.ds && !t.bb;
+    bool producer = rl == 1 && !t.ds && !t.bb;
     if (!producer && rl != 2) return;
     IDirect3DSurface9 *tex[8];
     const int n = bound_texture_surfaces(g_pass_device, tex);
+    if (producer && g_post_kinds_n && post_find(t.rt) < 0 && post_known_kind(t)) {
+        bool from2 = false;
+        for (int i = 0; i < n; i++) from2 |= dxvk_stereo_surface_layers(tex[i]) == 2;
+        if (from2 && dxvk_stereo_make_layered(g_pass_device, t.rt) == 0) {
+            LOG("stereo: post target %ux%u (format %u) drawn per eye from its first draw (two layers)", t.w, t.h, t.fmt);
+            producer = false;  // now a two-layer pass: what it reads from a chain is wanted
+        }
+    }
     for (int i = 0; i < n; i++) {
         const int tl = dxvk_stereo_surface_layers(tex[i]);
+        const int j = tl == 1 ? post_find(tex[i]) : -1;
         if (producer && tl == 2) {
-            bool known = false;
-            for (int j = 0; j < g_post_n; j++) known |= (void *)g_post_seen[j] == t.rt;
-            if (!known && g_post_n < 8) {
-                g_post_seen[g_post_n] = static_cast<IDirect3DSurface9 *>(t.rt);
-                g_post_seen[g_post_n++]->AddRef();
-            }
-        } else if (!producer && tl == 1) {
-            for (int j = 0; j < g_post_n; j++)
-                if (g_post_seen[j] == tex[i]) g_post_wanted[j] = true;
+            post_note(t, -1);
+        } else if (producer && j >= 0 && g_post_seen[j].w == t.w && g_post_seen[j].h == t.h
+                   && g_post_seen[j].fmt == t.fmt) {
+            post_note(t, g_post_seen[j].chain);
+        } else if (!producer && j >= 0) {
+            g_post_seen[j].wanted = true;
         }
     }
     for (int i = 0; i < n; i++) tex[i]->Release();
 }
 // At Present (layer what is wanted), or at a Reset (forget everything: the game may make its targets again).
 static void stereo_post_present(bool reset) {
+    if (reset) g_post_kinds_n = 0;
+    for (int j = 0; j < g_post_n; j++)
+        if (g_post_seen[j].wanted)
+            for (int i = 0; i < g_post_n; i++)
+                if (g_post_seen[i].chain == g_post_seen[j].chain) g_post_seen[i].wanted = true;
     for (int j = 0; j < g_post_n;) {
-        if (!reset && g_post_wanted[j]) {
-            D3DSURFACE_DESC rd = {};
-            g_post_seen[j]->GetDesc(&rd);
-            const long hr = dxvk_stereo_make_layered(g_pass_device, g_post_seen[j]);
-            if (hr == 0) LOG("stereo: post target %ux%u (format %u) now drawn per eye (two layers)", rd.Width, rd.Height,
-                             (unsigned)rd.Format);
-            else LOG("stereo: post target %ux%u left mono: layering failed (hr %08lx)", rd.Width, rd.Height, (unsigned long)hr);
+        PostSeen &e = g_post_seen[j];
+        if (!reset && e.wanted) {
+            const long hr = dxvk_stereo_make_layered(g_pass_device, e.s);
+            if (hr == 0) {
+                LOG("stereo: post target %ux%u (format %u) now drawn per eye (two layers)", e.w, e.h, e.fmt);
+                const PassTarget k = {nullptr, e.w, e.h, e.fmt, false, false};
+                if (!post_known_kind(k) && g_post_kinds_n < (int)(sizeof g_post_kinds / sizeof g_post_kinds[0]))
+                    g_post_kinds[g_post_kinds_n++] = {e.w, e.h, e.fmt};
+            } else LOG("stereo: post target %ux%u left mono: layering failed (hr %08lx)", e.w, e.h, (unsigned long)hr);
         }
-        if (reset || g_post_wanted[j]) {  // done with it: once layered, it is only ever a source
-            g_post_seen[j]->Release();
-            g_post_n--;
-            g_post_seen[j] = g_post_seen[g_post_n];
-            g_post_wanted[j] = g_post_wanted[g_post_n];
-            g_post_seen[g_post_n] = nullptr;
-            g_post_wanted[g_post_n] = false;
+        if (reset || e.wanted) {  // done with it: once layered, it is only ever a source
+            e.s->Release();
+            e = g_post_seen[--g_post_n];
+            g_post_seen[g_post_n] = PostSeen();
         } else {
             j++;
         }
