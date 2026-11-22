@@ -2370,6 +2370,10 @@ static bool stereo_live_multiview(void) {
  * (dxvk_stereo_make_layered): from the next frame the pass draws both views, each with its eye's matrices, and the
  * main pass samples each eye's own layer. Only targets the pass detector saw drawn as the mask, never by size.
  * By default only with per-eye matrices (eye views; plain multiview's mono mask is off by the eye separation only).
+ * The test is that eye views are set up (stereo_matrix_mode), not that the eyes' matrices are live: those stay off
+ * while any menu is open, the loading screen included, so the world's first frames (about 40 on the Mac) drew the
+ * mask mono and compiled mono pipelines for it that were not needed again. Layered while a menu is open, the
+ * mask is drawn per eye with the plain offset the menus use, until the matrices come on.
  * LB_STEREO_MASK=1 also with plain multiview offsets, =0 never. Costs about one more mask pass of GPU time. */
 extern "C" int dxvk_stereo_multiview_enabled(void *device);         // dxvk_stereo.h
 extern "C" long dxvk_stereo_make_layered(void *device, void *surface);
@@ -2379,7 +2383,7 @@ static void stereo_mask_seen(void) {
     if (g_mask_done || g_mask_pending[0] || !g_pass_device) return;
     static int want = -1;  // 0 never, 1 always, 2 with eye views
     if (want < 0) { const char *e = getenv("LB_STEREO_MASK"); want = e && *e ? (atoi(e) ? 1 : 0) : 2; }
-    if (!want || (want == 2 && !g_live_m_valid)) return;  // eye views may start later
+    if (!want || (want == 2 && !stereo_matrix_mode())) return;  // eye views may start later
     if (!dxvk_stereo_multiview_enabled(g_pass_device)) { g_mask_done = true; return; }
     IDirect3DSurface9 *rt = nullptr, *ds = nullptr;
     g_pass_device->GetRenderTarget(0, &rt);
