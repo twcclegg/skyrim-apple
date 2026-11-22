@@ -381,6 +381,7 @@ static void passes_init(IDirect3DDevice9 *d);  // LB_PASSES, below
 static void d3d_passes_reset(IDirect3DDevice9 *d);
 static void stereo_mask_present(bool reset);  // eye views' per-eye targets, below
 static void stereo_post_present(bool reset);
+static void stereo_reads_reset(void);  // LB_STEREO_READS, below
 
 void B_IDirect3D9_CreateDevice(CPU *c) {
     auto *d3d = (IDirect3D9 *)com_host(ARG(0));
@@ -437,6 +438,7 @@ void B_IDirect3DDevice9_Reset(CPU *c) {
     // referenced, and a failed Reset must not leave them held. They are looked for again afterwards.
     stereo_mask_present(true);
     stereo_post_present(true);
+    stereo_reads_reset();
     rt_host_affinity_begin();
     HRESULT hr = d->Reset(&pp);
     rt_host_affinity_end();
@@ -2578,8 +2580,8 @@ static void stereo_post_present(bool reset) {
  * declares it; the four vertex samplers always count. layers is read at Present, after stereo_post_present has
  * layered what it wanted this frame. At most 64 mvread/mvwrite, 128 mvread1 and 64 mvread2 entries a frame.
  * Each surface recorded is held (a ref) until the frame's Present, so an address names one surface for the whole
- * frame and nothing reads a surface the game has released; the pixel shaders whose declarations are cached are held
- * for the run, for the same reason.
+ * frame and nothing reads a surface the game has released (a device Reset drops them first, unlogged); the pixel
+ * shaders whose declarations are cached are held for the run, for the same reason.
  * Off by default, and then it costs one branch per draw and per Present. Set, it turns the pass hooks on (the classes
  * are theirs) and logs "LB_STEREO_READS: read graph of one-layer targets from frame <frame>". The picture is not
  * changed. With LB_STEREO_POST=0 the bloom and distance-blur targets (above) show as mvread lines with from2=1; that
@@ -2766,6 +2768,15 @@ static void stereo_reads_present(void) {
         LOG("%s", line);
         reads_drop(r.s);
     }
+    g_reads.clear();
+}
+// At a Reset: let go of the surfaces recorded so far this frame, unlogged (Reset wants none referenced).
+static void stereo_reads_reset(void) {
+    for (const Read2Rec &r : g_reads2) reads_drop(r.s);
+    for (const Read1Rec &r : g_reads1) { reads_drop(r.s); reads_drop(r.rt); }
+    for (const ReadRec &r : g_reads) reads_drop(r.s);
+    g_reads2.clear();
+    g_reads1.clear();
     g_reads.clear();
 }
 
@@ -3183,6 +3194,7 @@ static void stereo_post_present(bool) {}
 static void stereo_reads_init(void) {}
 static void stereo_reads_draw(int, uint32_t) {}
 static void stereo_reads_present(void) {}
+static void stereo_reads_reset(void) {}
 static bool stereo_skip_fp(void) { return false; }
 static void vr180_before_present(IDirect3DDevice9 *) {}
 static void vr180_after_present(void) {}
