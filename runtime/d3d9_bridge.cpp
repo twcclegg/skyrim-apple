@@ -575,6 +575,7 @@ struct PassFrame {
     PassTotals cls[PASS_COUNT];
     int rt_changes;
     bool seen_main, seen_depth, seen_bb;  // a main / depth / back buffer draw happened this frame
+    bool bb_post;                         // every draw since the back buffer was bound was of the post class
     // First-person detection (d3d_first_person, below)
     bool fp_late;                         // in the late pass: after its Clear of depth only, until its projection ends
     bool fp_late_confirmed;               // ... and its projection was seen to be the first-person one
@@ -649,14 +650,32 @@ bool d3d_first_person(void) { return g_pass_frame.fp; }
 extern "C" int skyrim_first_person_pass(void) { return fp_kind(); }
 extern "C" void skyrim_first_person_listen(void (*fn)(int kind)) { g_fp_listener = fn; }
 
+// Whether the texture bound to stage 0 is a render target: an earlier pass's output, not a texture the game loaded.
+static bool stage0_render_target(void) {
+    IDirect3DBaseTexture9 *base = nullptr;
+    if (!g_pass_device || FAILED(g_pass_device->GetTexture(0, &base)) || !base) return false;
+    D3DSURFACE_DESC desc = {};
+    const bool rt = base->GetType() == D3DRTYPE_TEXTURE &&
+                    SUCCEEDED(static_cast<IDirect3DTexture9 *>(base)->GetLevelDesc(0, &desc)) &&
+                    (desc.Usage & D3DUSAGE_RENDERTARGET);
+    base->Release();
+    return rt;
+}
+
 // The class of a draw, from the targets bound and what the frame drew before. Sizes are relative to the back
 // buffer (CreateDevice/Reset), never absolute. First match wins. "Seen" means it matches the Riverwood frame
 // traced with LB_D3DTRACE (docs/perf/LOG.md, 2026-11-10); everything else is unverified, check it with LB_PASSES=2.
-//   ui      a menu drawn into the second screen's image (hud_screen.cpp, Android dual screen only), or a draw into
-//           the back buffer after the first since it was bound: the HUD and menus over the final image (seen: 17
-//           draws after the final image in Riverwood)
+//   ui      a menu drawn into the second screen's image (hud_screen.cpp, Android dual screen only), or any other
+//           draw into the back buffer: the HUD and menus over the final image (seen: 17 draws after the final image
+//           in Riverwood)
 //   post    the first draw into the back buffer since it was bound, if it is a quad (<= 2 primitives): the final
-//           image (seen in Riverwood; the game also draws one quad into the back buffer earlier in the frame)
+//           image (seen in Riverwood; the game also draws one quad into the back buffer earlier in the frame); and
+//           each quad right after it, while every draw since the binding has been one, that samples a render target
+//           in stage 0: an image-space effect blended over the final image (seen in the boss fight: a blur of a
+//           quarter-size target, pixel shader constants Image/BlurOffsets/BlurScale/ColorRange, drawn second; as
+//           interface it got the interface's per-eye offset and showed as a shifted copy of the picture). Interface
+//           draws sample their own textures, not render targets (none seen there in the boss fight's HUD, console,
+//           main menu and loading screen)
 //   fp      a first-person draw (d3d_first_person, above; seen in Riverwood with empty hands, a sword and Flames),
 //           whatever the target: the late pass, and its prepass and mask draws otherwise counted as main and refl
 //   depth   an R32F colour target of back-buffer size: the scene's depth drawn again (seen, 638 draws)
@@ -682,7 +701,8 @@ static int pass_class(uint32_t prims) {
     if (t.bb) {
         bool first = !f.seen_bb;
         f.seen_bb = true;
-        return first && prims <= 2 ? PASS_POST : PASS_UI;
+        f.bb_post = prims <= 2 && (first || (f.bb_post && stage0_render_target()));
+        return f.bb_post ? PASS_POST : PASS_UI;
     }
     if (bb_size && t.fmt == D3DFMT_R32F) {
         f.seen_depth = true;
