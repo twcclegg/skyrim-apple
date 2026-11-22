@@ -379,6 +379,8 @@ void B_IDirect3D9_GetAdapterDisplayMode(CPU *c) {
 static void fp_init(IDirect3DDevice9 *d);  // first-person depth, below
 static void passes_init(IDirect3DDevice9 *d);  // LB_PASSES, below
 static void d3d_passes_reset(IDirect3DDevice9 *d);
+static void stereo_mask_present(bool reset);  // eye views' per-eye targets, below
+static void stereo_post_present(bool reset);
 
 void B_IDirect3D9_CreateDevice(CPU *c) {
     auto *d3d = (IDirect3D9 *)com_host(ARG(0));
@@ -431,6 +433,10 @@ void B_IDirect3DDevice9_Reset(CPU *c) {
     D3DPRESENT_PARAMETERS pp;
     pp_from_guest(ARG(1), &pp);
     { extern void hud_screen_reset(void); hud_screen_reset(); }
+    // Drop the refs the stereo passes hold on the game's targets first: Reset wants no default-pool resource
+    // referenced, and a failed Reset must not leave them held. They are looked for again afterwards.
+    stereo_mask_present(true);
+    stereo_post_present(true);
     rt_host_affinity_begin();
     HRESULT hr = d->Reset(&pp);
     rt_host_affinity_end();
@@ -921,8 +927,6 @@ void d3d_passes_target(IDirect3DDevice9 *d) {
 // is in progress whatever the frame did before it.
 static void d3d_passes_reset(IDirect3DDevice9 *d) {
     g_pass_frame.fp_late = g_pass_frame.fp_proj = false;
-    stereo_mask_present(true);
-    stereo_post_present(true);
     d3d_passes_target(d);
 }
 
