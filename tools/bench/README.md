@@ -49,6 +49,26 @@ and `zero` as `gpu.total`, `gpu.marks` and `gpu.zero`. GPU idle inside a frame c
 in; the Present blit after the last timestamp does not count. `LB_PASSES_GPU=2` also logs every span of one frame
 in 300 (`passgpudbg <frame> <span> <class> <ms>`).
 
+`--env LB_PASS_STATS=shadow,fx` (any of the class names above, comma-separated) says what the draws of those
+classes are, for work that grows with the scene such as shadow casters and effects. It turns the pass hooks on by
+itself (`LB_PASSES` is not needed) and logs two kinds of lines, which `bench.py` does not parse:
+
+    passvp <frame> <class> groups=<n> runs=<n> <w>x<h>/<fmt> vp=<x>,<y>,<w>,<h> <draws>/<prims> ...
+    passkind <first>-<last> <class> vs=<hash> ps=<hash> decl=<usages> stride=<n> at=<0|1> blend=<0|src.dst> tex0=<0|1> draws=<n> prims=<n> frames=<n>
+
+`passvp`, once per frame and class: each render target and viewport the class drew into, in order of first use,
+with its draws and primitives; `runs` counts how often the draws moved from one of them to another. `passkind`:
+the draws of frames `first` to `last` grouped by what they draw with, most primitives first, written every 300
+frames or at each frame of `LB_PASS_STATS_AT=F[,F...]` (frames as in the `pass` line), then reset. `vs` and `ps`
+hash the shader bytecode, so they are stable across runs; `decl` lists the vertex declaration's usages in order (P
+position, W blend weights, I blend indices, N normal, S point size, T texcoord, G tangent, B binormal, C colour; `|`
+starts another stream), which tells skinned meshes (W, I) from static ones; `at` is alpha test and `blend` the
+blend factors when blending is on. Off by default. When it is on, every draw of the named classes reads back
+shaders, declaration, stream, texture and render states from the device, so don't time runs with it. Unset, it
+costs one bit test per draw and per Present while the pass hooks are on for another reason, and nothing
+otherwise. A value naming no class (such as `1`) turns nothing on; the log's `LB_PASS_STATS=` line shows the class
+mask it read.
+
 ## GPU busy time and per-pass-class counts
 
 Both are optional; a log without them parses as before.

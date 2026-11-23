@@ -710,6 +710,152 @@ static void passdbg_flush(void) {
     g_pass_run = {-1, 0, 0, {}};
 }
 
+// LB_PASS_STATS=shadow,fx (class names; any of k_pass_names) says what the draws of those classes are, to count the
+// work that grows with the scene (shadow casters, effects). Diagnostic only: every draw of those classes reads back
+// state from the device. Two kinds of lines:
+//   passvp <frame> <class> groups=<n> runs=<n> [<w>x<h>/<fmt> vp=<x>,<y>,<w>,<h> <draws>/<prims>]...
+//     once per frame and class: each render target 0 and viewport the class drew into (in order of first use), and
+//     runs, the number of times the draws moved from one of them to another
+//   passkind <first>-<last> <class> vs=<hash> ps=<hash> decl=<usages> stride=<n> at=<0|1> blend=<0|src.dst>
+//            tex0=<0|1> draws=<n> prims=<n> frames=<n>
+//     the draws of frames <first> to <last> grouped by what they draw with, written at each frame of
+//     LB_PASS_STATS_AT=F[,F...] (frames as in the "pass" line), or every 300 frames without it, then reset.
+//     vs/ps hash the shader bytecode (stable across runs); decl lists the vertex declaration's usages in order
+//     (P position, W blend weights, I blend indices, N normal, S point size, T texcoord, G tangent, B binormal,
+//     C colour; | starts another stream), so skinned meshes (W, I) are told from static ones; at is alpha test,
+//     blend the blend factors when blending is on.
+static uint32_t g_pass_stats_mask;
+static std::vector<int> g_pass_stats_at;
+static int g_pass_stats_from = -1;
+struct PassVp { void *rt; uint32_t w, h, fmt; D3DVIEWPORT9 vp; int draws; uint32_t prims; };
+struct PassStatFrame { std::vector<PassVp> vps; int runs = 0, last = -1; };
+static PassStatFrame g_pass_stat_frame[PASS_COUNT];
+struct PassKind { int draws = 0; uint32_t prims = 0; int frames = 0, last_frame = -1; };
+static std::map<std::string, PassKind> g_pass_kinds[PASS_COUNT];
+
+static uint32_t pass_stats_hash(const void *p, size_t n) {
+    uint32_t h = 2166136261u;
+    for (size_t i = 0; i < n; i++) h = (h ^ ((const uint8_t *)p)[i]) * 16777619u;
+    return h;
+}
+template <class S> static uint32_t pass_stats_shader(S *s) {
+    static std::unordered_map<void *, uint32_t> cache;
+    if (!s) return 0;
+    auto it = cache.find(s);
+    if (it != cache.end()) return it->second;
+    UINT n = 0;
+    uint32_t h = 1;
+    if (SUCCEEDED(s->GetFunction(nullptr, &n)) && n) {
+        std::vector<uint8_t> code(n);
+        if (SUCCEEDED(s->GetFunction(code.data(), &n))) h = pass_stats_hash(code.data(), n);
+    }
+    return cache[s] = h;
+}
+static const char *pass_stats_decl(IDirect3DVertexDeclaration9 *d) {
+    static std::unordered_map<void *, std::string> cache;
+    if (!d) return "-";
+    auto it = cache.find(d);
+    if (it != cache.end()) return it->second.c_str();
+    D3DVERTEXELEMENT9 e[MAXD3DDECLLENGTH + 1];
+    UINT n = MAXD3DDECLLENGTH + 1;
+    std::string s;
+    if (SUCCEEDED(d->GetDeclaration(e, &n)))
+        for (UINT i = 0; i < n && e[i].Stream != 0xFF; i++) {
+            static const char k[] = "PWINSTGBTTCTDX";  // by D3DDECLUSAGE (TESSFACTOR, POSITIONT, FOG: T; DEPTH D; SAMPLE X)
+            if (e[i].Stream && (s.empty() || s.back() != '|')) s += '|';
+            s += e[i].Usage < sizeof k - 1 ? k[e[i].Usage] : '?';
+        }
+    return (cache[d] = s.empty() ? "?" : s).c_str();
+}
+
+static void pass_stats_draw(int k, uint32_t prims) {
+    IDirect3DDevice9 *d = g_pass_device;
+    if (!d) return;
+    const PassTarget &t = g_pass_target;
+    D3DVIEWPORT9 vp = {};
+    d->GetViewport(&vp);
+    PassStatFrame &f = g_pass_stat_frame[k];
+    int g = -1;
+    for (size_t i = 0; i < f.vps.size(); i++) {
+        const PassVp &v = f.vps[i];
+        if (v.rt == t.rt && v.vp.X == vp.X && v.vp.Y == vp.Y && v.vp.Width == vp.Width && v.vp.Height == vp.Height) {
+            g = (int)i;
+            break;
+        }
+    }
+    if (g < 0) {
+        f.vps.push_back({t.rt, t.w, t.h, t.fmt, vp, 0, 0});
+        g = (int)f.vps.size() - 1;
+    }
+    if (g != f.last) f.runs++;
+    f.last = g;
+    f.vps[g].draws++;
+    f.vps[g].prims += prims;
+
+    IDirect3DVertexShader9 *vs = nullptr;
+    IDirect3DPixelShader9 *ps = nullptr;
+    IDirect3DVertexDeclaration9 *decl = nullptr;
+    IDirect3DVertexBuffer9 *vb = nullptr;
+    IDirect3DBaseTexture9 *tex = nullptr;
+    UINT off = 0, stride = 0;
+    DWORD at = 0, ab = 0, src = 0, dst = 0;
+    d->GetVertexShader(&vs);
+    d->GetPixelShader(&ps);
+    d->GetVertexDeclaration(&decl);
+    d->GetStreamSource(0, &vb, &off, &stride);
+    d->GetTexture(0, &tex);
+    d->GetRenderState(D3DRS_ALPHATESTENABLE, &at);
+    d->GetRenderState(D3DRS_ALPHABLENDENABLE, &ab);
+    if (ab) {
+        d->GetRenderState(D3DRS_SRCBLEND, &src);
+        d->GetRenderState(D3DRS_DESTBLEND, &dst);
+    }
+    char blend[24] = "0", key[192];
+    if (ab) snprintf(blend, sizeof blend, "%u.%u", (unsigned)src, (unsigned)dst);
+    snprintf(key, sizeof key, "vs=%08x ps=%08x decl=%s stride=%u at=%d blend=%s tex0=%d", pass_stats_shader(vs),
+             pass_stats_shader(ps), pass_stats_decl(decl), vb ? stride : 0, at ? 1 : 0, blend, tex ? 1 : 0);
+    if (vs) vs->Release();
+    if (ps) ps->Release();
+    if (decl) decl->Release();
+    if (vb) vb->Release();
+    if (tex) tex->Release();
+    PassKind &p = g_pass_kinds[k][key];
+    const int frame = platform_frame_count();
+    p.draws++;
+    p.prims += prims;
+    if (p.last_frame != frame) { p.frames++; p.last_frame = frame; }
+}
+
+static void pass_stats_present(int frame) {
+    if (g_pass_stats_from < 0) g_pass_stats_from = frame;
+    for (int k = 0; k < PASS_COUNT; k++) {
+        if (!(g_pass_stats_mask & (1u << k))) continue;
+        PassStatFrame &f = g_pass_stat_frame[k];
+        std::string line;
+        char buf[128];
+        for (const PassVp &v : f.vps) {
+            snprintf(buf, sizeof buf, " %ux%u/%u vp=%u,%u,%u,%u %d/%u", v.w, v.h, v.fmt, (unsigned)v.vp.X,
+                     (unsigned)v.vp.Y, (unsigned)v.vp.Width, (unsigned)v.vp.Height, v.draws, v.prims);
+            line += buf;
+        }
+        LOG("passvp %d %s groups=%zu runs=%d%s", frame, k_pass_names[k], f.vps.size(), f.runs, line.c_str());
+        f = PassStatFrame();
+    }
+    const bool dump = g_pass_stats_at.empty() ? frame % 300 == 0
+                    : std::find(g_pass_stats_at.begin(), g_pass_stats_at.end(), frame) != g_pass_stats_at.end();
+    if (!dump) return;
+    for (int k = 0; k < PASS_COUNT; k++) {
+        if (!(g_pass_stats_mask & (1u << k))) continue;
+        std::vector<std::pair<std::string, PassKind>> rows(g_pass_kinds[k].begin(), g_pass_kinds[k].end());
+        std::sort(rows.begin(), rows.end(), [](const auto &a, const auto &b) { return a.second.prims > b.second.prims; });
+        for (const auto &r : rows)
+            LOG("passkind %d-%d %s %s draws=%d prims=%u frames=%d", g_pass_stats_from, frame, k_pass_names[k],
+                r.first.c_str(), r.second.draws, r.second.prims, r.second.frames);
+        g_pass_kinds[k].clear();
+    }
+    g_pass_stats_from = frame + 1;
+}
+
 // LB_PASSES_GPU=1 (with LB_PASSES) adds GPU milliseconds per class from Direct3D 9 timestamp queries, which DXVK
 // turns into vkCmdWriteTimestamp (MoltenVK: Metal counter sample buffers). A timestamp ("mark") is issued at the
 // first change of target or draw of a frame, at each change of render target 0 or depth-stencil, at each change of
@@ -864,6 +1010,7 @@ void d3d_passes_draw(uint32_t prims) {
     if (k == PASS_MAIN && g_depth_copy == 1 && !g_main_ds && g_pass_device) g_pass_device->GetDepthStencilSurface(&g_main_ds);
     if (k == PASS_MAIN) stereo_late_eyes();
     if (g_passes_gpu) gpu_draw(k);
+    if (g_pass_stats_mask & (1u << k)) pass_stats_draw(k, prims);
     PassFrame &f = g_pass_frame;
     f.cls[k].draws++;
     f.cls[k].prims += prims;
@@ -982,7 +1129,18 @@ static void passes_init(IDirect3DDevice9 *d) {
         }
         const bool fp_wanted = (fp && atoi(fp)) || getenv("LB_FP_SKIP") || (eye && atof(eye) != 0) || g_fp_flame
                             || g_skip_class_mask || g_depth_copy == 1;
-        g_d3d_passes = g_passes_log || fp_wanted;
+        if (const char *ps = getenv("LB_PASS_STATS")) {  // diagnostics: what the draws of these classes are
+            for (int c = 0; c < PASS_COUNT; c++)
+                if (strstr(ps, k_pass_names[c])) g_pass_stats_mask |= 1u << c;
+            for (const char *at = getenv("LB_PASS_STATS_AT"); at && *at;) {
+                g_pass_stats_at.push_back(atoi(at));
+                at = strchr(at, ',');
+                if (at) at++;
+            }
+            LOG("LB_PASS_STATS=%s: classes mask %x, kinds written at %zu frames%s", ps, g_pass_stats_mask,
+                g_pass_stats_at.size(), g_pass_stats_at.empty() ? " (every 300)" : "");
+        }
+        g_d3d_passes = g_passes_log || fp_wanted || g_pass_stats_mask;
         // without an LB_D3DTRACE range, LB_PASSES=2 looks at the first frame
         g_passdbg = g_passes_log == 2 && !getenv("LB_D3DTRACE");
         if (g_passes_log) LOG("LB_PASSES=%d: draws per pass class logged at each Present", g_passes_log);
@@ -1025,6 +1183,7 @@ static void passes_present(void) {
     if (!g_d3d_passes) return;
     g_pass_frame.fp_late = g_pass_frame.fp_proj = false;
     fp_update();
+    if (g_pass_stats_mask) pass_stats_present(platform_frame_count());
     if (!g_passes_log) { g_pass_frame = PassFrame(); return; }
     passdbg_flush();
     const PassFrame &f = g_pass_frame;
