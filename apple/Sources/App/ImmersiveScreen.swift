@@ -130,6 +130,9 @@ private struct QuadUniforms {
     /// meters travels with the camera (the player's own hands and weapon) and is placed by heldModel, not model;
     /// the change is spread over the next half as far again. 0: everything is placed by model.
     var heldWithin: Float
+    /// The per-pixel search stops as soon as a step moves the game pixel shown by less than this many game pixels
+    /// without leaving the depth texel it read (LB_IMMERSIVE_REFINE_EXIT); 0 = every pixel runs every step.
+    var refineExit: Float
 }
 
 /// Runs on its own thread for as long as the layer lives: presents at the display's rate, showing the newest finished
@@ -141,7 +144,7 @@ final class ImmersiveCompositor: @unchecked Sendable {
     struct Uniforms {
         float4x4 viewProjection; float4x4 model; float4x4 heldModel; float2 halfSize; float2 screenCentre; uint decode; uint hasDepth;
         uint2 grid; float eyeBack; float nearUnits; float unitsPerMeter; float depthScale; float maxBehind; float backplate;
-        float tear; float trueDepth; float sharpen; float4 eyeRefine; float heldWithin;
+        float tear; float trueDepth; float sharpen; float4 eyeRefine; float heldWithin; float refineExit;
     };
     struct Out { float4 position [[position]]; float2 uv; float3 local; };
     // A grid over the game image. With depth, each vertex moves along the ray from the game's camera (eyeBack in
@@ -254,6 +257,7 @@ final class ImmersiveCompositor: @unchecked Sendable {
         float3 a = eye - origin, d = normalize(in.local - eye);
         float ad = dot(a, d), aa = dot(a, a), rBefore = 0;
         float2 uv = in.uv, before = uv;
+        float2 texels = float2(depth.get_width(), depth.get_height());
         for (int i = 0; i < int(u.eyeRefine.w); i++) {
             before = uv;
             rBefore = pixel_radial(uv, u, depth);
@@ -261,6 +265,16 @@ final class ImmersiveCompositor: @unchecked Sendable {
             float3 on = fromOrigin * (u.eyeBack / max(-fromOrigin.z, 1e-6));
             uv = saturate(float2(((on.x - u.screenCentre.x) / u.halfSize.x + 1) * 0.5,
                                  (1 - (on.y - u.screenCentre.y) / u.halfSize.y) * 0.5));
+            if (u.refineExit > 0) {
+                // Settled (LB_IMMERSIVE_REFINE_EXIT): the step moved less than refineExit game pixels and stayed on
+                // the depth texel it read, so another step would read the same depth again and move less still,
+                // and the test below would find no jump. Most pixels (those on a surface) leave here after one
+                // depth fetch. The distance alone is not enough: a short step that crosses onto the far side of
+                // a depth edge is one the next step would move by many pixels.
+                float2 moved = (uv - before) * texels;
+                if (dot(moved, moved) < u.refineExit * u.refineExit && all(floor(uv * texels) == floor(before * texels)))
+                    return uv;
+            }
         }
         // A ray that keeps jumping between a near and a far surface sees neither's own pixel: it looks past the
         // near surface's edge at something the game's camera did not see. Show the far one there.
@@ -596,6 +610,16 @@ final class ImmersiveCompositor: @unchecked Sendable {
         return max(0, min(scale, 4))
     }()
 
+    /// LB_IMMERSIVE_REFINE_EXIT=<game pixels> (for example 0.25): the per-pixel depth search leaves a pixel as soon
+    /// as a step moves it by less than this without leaving the depth texel it read, instead of running every
+    /// step and the final test on every pixel. Unset or 0: off. tools/compositor_reference.py compares the two.
+    private lazy var refineExit: Float = {
+        let pixels = min(getenv("LB_IMMERSIVE_REFINE_EXIT").flatMap { Float(String(cString: $0)) } ?? 0, 4)
+        guard pixels > 0 else { return 0 }
+        log("per-pixel depth search: stops once a step is under \(pixels) game pixels on the same depth texel")
+        return pixels
+    }()
+
     private func finish() {
         skyrim_sdl_set_window_ghost(0)
         DispatchQueue.main.async { NotificationCenter.default.post(name: .skyrimImmersiveRunning, object: false) }
@@ -922,7 +946,8 @@ final class ImmersiveCompositor: @unchecked Sendable {
                                                 tear: settings.tear, trueDepth: tracked && useDepth ? 1 : 0,
                                                 sharpen: sharpen,
                                                 eyeRefine: SIMD4(simd_make_float3(model.inverse * originFromEye.columns.3), useDepth ? refineSteps : 0),
-                                                heldWithin: heldModel != nil && useDepth ? motionNear : 0)
+                                                heldWithin: heldModel != nil && useDepth ? motionNear : 0,
+                                                refineExit: useDepth && refineSteps > 0 ? refineExit : 0)
                     encoder.setRenderPipelineState(pipeline)
                     encoder.setDepthStencilState(depth)
                     encoder.setCullMode(.none)

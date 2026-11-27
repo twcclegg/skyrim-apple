@@ -127,6 +127,18 @@ Two lines report GPU cost on the headset. Neither had ever been read from a head
 Read them together: if the game latency is far above the compositor's GPU time, the game's frame is the slow part,
 on the GPU or on DXVK's command thread; the line alone does not say which.
 
+## Compositor cost switches
+
+The compositor redraws both eyes at every refresh from the newest game frame (`ImmersiveScreen.swift`). These
+switches cut what one refresh costs without meaning to change the picture; each is off unless set, and with all
+of them unset the compositor draws as before. `tools/compositor_reference.py` (numpy, no GPU) compares each with
+the unswitched path on a capture; `tools/immersive_shader_check.swift` times them on a Mac. None has been timed
+or looked at on the headset yet.
+
+| Switch | What it does |
+|---|---|
+| `LB_IMMERSIVE_REFINE_EXIT=px` | The per-pixel depth search (`LB_IMMERSIVE_REFINE` steps) leaves a pixel as soon as a step moves the game pixel it shows by less than px game pixels (try 0.25) without leaving the depth texel that step read. Without it every pixel runs every step and one more depth fetch for the final test. In the reference, on two captures with foliage and the eye 10 to 100 mm from where the frame's rays start, 58 to 89% of pixels left after one fetch, depth fetches per pixel went from 5 to between 1.15 and 1.61 at 4 steps (3 to between 1.13 and 1.49 at 2), and at most 0.001% of pixels showed a game pixel more than a quarter pixel away from the one they show without the switch. Logged as `per-pixel depth search: stops once a step is under …`. |
+
 ## Live stereo switches (headset session stereo-1)
 
 Live single-pass stereo is what option B above became: DXVK renders each scene draw into two image layers with
