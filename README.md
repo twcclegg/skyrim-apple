@@ -8,6 +8,12 @@ The original **2011 Windows version of Skyrim**, running locally on Apple Silico
 
 *An actual GPU frame from the physical iPad build, not a simulator or streamed PC session.*
 
+## The goal of this fork: Skyrim running on Apple Vision Pro
+
+**The test:** one person, one M2 Apple Vision Pro, optionally wall power, inside a Faraday cage. Nothing else.
+
+The game runs on the headset itself. Nothing is streamed to it, and no Mac, PC or cloud machine does any of the work while someone plays. Other machines only build and test. Contributors and AI agents: see [AGENTS.md](AGENTS.md).
+
 ## Platform status
 
 | Platform | Current status |
