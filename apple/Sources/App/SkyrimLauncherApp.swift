@@ -35,7 +35,7 @@ struct SkyrimLauncherApp: App {
                 #if os(visionOS) && SKYRIM_NATIVE_RUNTIME
                 // Tells SDL which window scene is the game's, before an ImmersiveSpace adds a second one.
                 .background(GameSceneReporter())
-                .modifier(ImmersiveGhost())
+                .modifier(ImmersiveGhost(model: model))
                 #endif
                 .preferredColorScheme(.dark)
         }
@@ -95,18 +95,17 @@ struct SkyrimLauncherApp: App {
 }
 
 #if os(visionOS) && SKYRIM_NATIVE_RUNTIME
-/// While the immersive layer runs, the launcher window (which also holds SDL's game window) turns nearly invisible
-/// and loses its glass, so it doesn't cover the immersive picture; it stays in place as the trackpad's pointer
-/// surface (docs/VISIONOS_POINTER_PLAN.md).
+/// While immersive play is being shown, the launcher window (which also holds SDL's game window) turns nearly
+/// invisible and loses its glass, so it doesn't cover the immersive picture; it stays in place as the trackpad's
+/// pointer surface (docs/VISIONOS_POINTER_PLAN.md). A paused game brings the window back in full, inside the space
+/// too: its Paused screen holds Resume, which at 2% opacity nobody could find (ImmersivePolicy).
 private struct ImmersiveGhost: ViewModifier {
-    @State private var immersive = false
+    @ObservedObject var model: LauncherModel
     func body(content: Content) -> some View {
+        let ghost = ImmersivePolicy.ghostsLauncher(spaceRunning: model.immersiveSpaceRunning, paused: model.isPaused)
         content
-            .opacity(immersive ? 0.02 : 1)
-            .glassBackgroundEffect(displayMode: immersive ? .never : .always)
-            .onReceive(NotificationCenter.default.publisher(for: .skyrimImmersiveRunning)) { note in
-                immersive = (note.object as? Bool) ?? false
-            }
+            .opacity(ghost ? 0.02 : 1)
+            .glassBackgroundEffect(displayMode: ghost ? .never : .always)
     }
 }
 #endif

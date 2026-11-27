@@ -11,6 +11,7 @@ struct LibraryView: View {
     @State private var confirmQuit = false
     #if os(visionOS) && SKYRIM_NATIVE_RUNTIME
     @Environment(\.openImmersiveSpace) private var openImmersiveSpace
+    @Environment(\.dismissImmersiveSpace) private var dismissImmersiveSpace
     #if os(visionOS) && SKYRIM_NATIVE_RUNTIME
     @Environment(\.openWindow) private var openWindow
     @Environment(\.dismissWindow) private var dismissWindow
@@ -89,7 +90,39 @@ struct LibraryView: View {
             if UserDefaults.standard.bool(forKey: "SkyrimLauncherOpenSettings") { showSettings = true }
             await model.saves.refresh()
         }
+        #if os(visionOS) && SKYRIM_NATIVE_RUNTIME
+        .task { await benchReenter() }
+        #endif
     }
+
+    #if os(visionOS) && SKYRIM_NATIVE_RUNTIME
+    /// Test hook: `-SkyrimBenchReenter <seconds>` on a bench run that plays immersive (`-SkyrimBenchAutoPlay YES
+    /// -SkyrimBenchImmersive YES`). That long after the game and the immersive layer are both running, it closes
+    /// the space, waits for the layer to end, and opens the space again, so the second attach of the compositor
+    /// to a running game can be checked from the log without anyone wearing the headset. An unattended run is
+    /// never paused for leaving the space (ImmersivePolicy), so the game keeps producing frames throughout.
+    private func benchReenter() async {
+        let after = UserDefaults.standard.double(forKey: "SkyrimBenchReenter")
+        guard LauncherModel.benchImmersive, after > 0 else { return }
+        while !(model.session == .running && model.immersiveSpaceRunning) {
+            do { try await Task.sleep(for: .milliseconds(250)) } catch { return }
+        }
+        do { try await Task.sleep(for: .seconds(after)) } catch { return }
+        fputs("bench: re-entry: closing the immersive space\n", stderr)
+        await dismissImmersiveSpace()
+        while model.immersiveSpaceRunning {
+            do { try await Task.sleep(for: .milliseconds(250)) } catch { return }
+        }
+        fputs("bench: re-entry: the layer ended, game session \(model.session)\n", stderr)
+        do { try await Task.sleep(for: .seconds(3)) } catch { return }
+        let result = await openImmersiveSpace(id: ImmersiveScreen.spaceID)
+        fputs("bench: re-entry: immersive space reopened: \(result)\n", stderr)
+        while !model.immersiveSpaceRunning {
+            do { try await Task.sleep(for: .milliseconds(250)) } catch { return }
+        }
+        fputs("bench: re-entry: the layer is running again\n", stderr)
+    }
+    #endif
 
     // MARK: Layout
 
@@ -279,6 +312,12 @@ struct LibraryView: View {
             }
             #endif
             if model.primaryAction == .running {
+                #if os(visionOS) && SKYRIM_NATIVE_RUNTIME
+                // A game running in the flat window: started there, or resumed there after leaving the space.
+                if ImmersivePolicy.offersReturn(gameActive: model.isGameActive, spaceRunning: model.immersiveSpaceRunning) {
+                    ReturnToImmersiveButton(model: model)
+                }
+                #endif
                 Button { model.pause(reason: "Paused from the launcher") } label: {
                     Label("Pause", systemImage: "pause.fill")
                         .font(.system(size: 12, weight: .semibold))
@@ -436,6 +475,13 @@ struct PauseOverlay: View {
                     }
                     .buttonStyle(.plain)
                     .disabled(!assessment.canResume)
+                    #if os(visionOS) && SKYRIM_NATIVE_RUNTIME
+                    // Paused outside the space (the usual case: the Digital Crown closed it). Resume above carries
+                    // on in the flat window; this goes back into the headset view.
+                    if ImmersivePolicy.offersReturn(gameActive: model.isGameActive, spaceRunning: model.immersiveSpaceRunning) {
+                        ReturnToImmersiveButton(model: model)
+                    }
+                    #endif
                     #if os(macOS)
                     Button("Quit Game", role: .destructive, action: requestQuit)
                         .buttonStyle(.plain)
@@ -452,3 +498,41 @@ struct PauseOverlay: View {
         }
     }
 }
+
+#if os(visionOS) && SKYRIM_NATIVE_RUNTIME
+/// Opens the immersive space again for a game that already exists; a new compositor then attaches to it. A paused
+/// game resumes once the space is open, if the input policy allows it; otherwise it stays paused inside the space
+/// with the Paused screen visible, and Resume unlocks there.
+struct ReturnToImmersiveButton: View {
+    @ObservedObject var model: LauncherModel
+    @Environment(\.openImmersiveSpace) private var openImmersiveSpace
+    @State private var opening = false
+
+    var body: some View {
+        Button {
+            guard !opening else { return }
+            opening = true
+            Task {
+                let result = await openImmersiveSpace(id: ImmersiveScreen.spaceID)
+                opening = false
+                switch result {
+                case .opened:
+                    fputs("immersive: space reopened for the running game\n", stderr)
+                    model.resume()
+                case .userCancelled:
+                    break
+                default:
+                    fputs("immersive: space did not reopen: \(result)\n", stderr)
+                    model.errorMessage = "The immersive view could not be opened. The game is still here; try again."
+                }
+            }
+        } label: {
+            Label("Return to Immersive", systemImage: "visionpro")
+                .font(.system(size: 12, weight: .semibold))
+                .frame(maxWidth: .infinity, minHeight: 30)
+        }
+        .buttonStyle(.bordered)
+        .disabled(opening)
+    }
+}
+#endif

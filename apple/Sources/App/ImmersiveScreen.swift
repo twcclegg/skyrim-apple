@@ -546,6 +546,12 @@ final class ImmersiveCompositor: @unchecked Sendable {
         return settings
     }
 
+    /// One compositor at a time owns the game's frames. The space can be closed and opened again while the game
+    /// runs ("Return to Immersive"), and each opening makes a new compositor; the new one waits here until the old
+    /// one has finished, so the old one's skyrim_immersive_stop() can't land after the new one's start and switch
+    /// its frames off. The wait is bounded: an old compositor that never ends must not keep the new one dark.
+    private static let lifetime = NSLock()
+
     private func run() {
         do {
             try makePipeline()
@@ -553,6 +559,9 @@ final class ImmersiveCompositor: @unchecked Sendable {
             log("no pipeline: \(error)")
             return
         }
+        let alone = Self.lifetime.lock(before: Date(timeIntervalSinceNow: 5))
+        defer { if alone { Self.lifetime.unlock() } }
+        if !alone { log("the previous compositor has not finished after 5 s; starting anyway") }
         skyrim_immersive_start()
         skyrim_sdl_set_window_ghost(1)
         DispatchQueue.main.async { NotificationCenter.default.post(name: .skyrimImmersiveRunning, object: true) }
