@@ -8,9 +8,17 @@
 //   swiftc -O tools/immersive_shader_check.swift -o /tmp/immersive_shader_check
 //   /tmp/immersive_shader_check shot-N.bmp depth-N.f32 out_prefix [--head] [--refine 2] [--ipd-scale 1] [--viewer-x 0]
 //       [--scale 0.15] [--head-scale 1] [--tear 0.08] [--time-size 1888x1792] [--tangent 0.849]
+//       [--exit 0.25] [--grid 161x91] [--seed] [--compare-seed] [--runs 30] [--warmup 1] [--stage-time]
 // Writes out_prefix-sbs.png (left | right, 1280x720 each) and prints the share of pixels the mesh left undrawn.
 // --tangent: the game camera's right frustum tangent (tan of the horizontal half-angle), as camera[] carries it;
 // 0.849 is the default 65-degree 4:3 field of view at 16:9.
+// The compositor cost switches (docs/perf/IMMERSIVE_OPTIONS.md): --exit is LB_IMMERSIVE_REFINE_EXIT, --grid is
+// LB_IMMERSIVE_GRID (default one vertex every 4 game pixels), --seed is LB_IMMERSIVE_SEED (with --refine above 0:
+// the seed pass once, then the indexed mesh; the seed pass is timed on its own). --compare-seed draws both ways and
+// exits 1 unless the two pictures are identical to the bit. --runs and --warmup: timed draws, and untimed ones
+// before them (for steady numbers try --runs 300 --warmup 100). --stage-time also times the vertex and fragment
+// stages of each eye's pass apart, with timestamps at the stage boundaries.
+// Like the layer, it draws into bgra8Unorm_srgb with the game image read as sRGB, and stores the depth attachment.
 import AppKit
 import Foundation
 import Metal
@@ -20,7 +28,9 @@ import simd
 struct QuadUniforms {
     var viewProjection: simd_float4x4
     var model: simd_float4x4
+    var heldModel: simd_float4x4
     var halfSize: SIMD2<Float>
+    var screenCentre: SIMD2<Float>
     var decode: UInt32
     var hasDepth: UInt32
     var grid: SIMD2<UInt32>
@@ -32,7 +42,10 @@ struct QuadUniforms {
     var backplate: Float
     var tear: Float
     var trueDepth: Float
+    var sharpen: Float
     var eyeRefine: SIMD4<Float>
+    var heldWithin: Float
+    var refineExit: Float
 }
 
 func fail(_ text: String) -> Never {
@@ -45,8 +58,8 @@ var options: [String: String] = [:]
 var arguments = Array(CommandLine.arguments.dropFirst())
 while !arguments.isEmpty {
     let argument = arguments.removeFirst()
-    if argument == "--head" {
-        options["head"] = "1"
+    if ["--head", "--seed", "--compare-seed", "--stage-time"].contains(argument) {
+        options[String(argument.dropFirst(2))] = "1"
     } else if argument.hasPrefix("--") {
         guard !arguments.isEmpty else { fail("\(argument) needs a value") }
         options[String(argument.dropFirst(2))] = arguments.removeFirst()
@@ -82,6 +95,7 @@ let context = CGContext(data: &pixels, width: width, height: height, bitsPerComp
                         bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue)!
 context.draw(bitmap, in: CGRect(x: 0, y: 0, width: width, height: height))
 let imageDescription = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .bgra8Unorm, width: width, height: height, mipmapped: false)
+imageDescription.pixelFormat = .bgra8Unorm_srgb
 let image = device.makeTexture(descriptor: imageDescription)!
 image.replace(region: MTLRegionMake2D(0, 0, width, height), mipmapLevel: 0, withBytes: pixels, bytesPerRow: width * 4)
 let depthDescription = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .r32Float, width: width, height: height, mipmapped: false)
@@ -93,10 +107,25 @@ depthFile.withUnsafeBytes {
 let pipelineDescription = MTLRenderPipelineDescriptor()
 pipelineDescription.vertexFunction = library.makeFunction(name: "screen_vertex")
 pipelineDescription.fragmentFunction = library.makeFunction(name: "screen_fragment")
-pipelineDescription.colorAttachments[0].pixelFormat = .bgra8Unorm
+pipelineDescription.colorAttachments[0].pixelFormat = .bgra8Unorm_srgb
 pipelineDescription.depthAttachmentPixelFormat = .depth32Float
 let pipeline: any MTLRenderPipelineState
 do { pipeline = try device.makeRenderPipelineState(descriptor: pipelineDescription) } catch { fail("no pipeline: \(error)") }
+// LB_IMMERSIVE_SEED's two pipelines: the seed pass and the indexed mesh.
+let seedDescription = MTLRenderPipelineDescriptor()
+seedDescription.vertexFunction = library.makeFunction(name: "seed_vertex")
+seedDescription.fragmentFunction = library.makeFunction(name: "seed_fragment")
+seedDescription.colorAttachments[0].pixelFormat = .r32Float
+let seededDescription = MTLRenderPipelineDescriptor()
+seededDescription.vertexFunction = library.makeFunction(name: "screen_vertex_seeded")
+seededDescription.fragmentFunction = library.makeFunction(name: "screen_fragment")
+seededDescription.colorAttachments[0].pixelFormat = .bgra8Unorm_srgb
+seededDescription.depthAttachmentPixelFormat = .depth32Float
+let seedPipeline: any MTLRenderPipelineState, seededPipeline: any MTLRenderPipelineState
+do {
+    seedPipeline = try device.makeRenderPipelineState(descriptor: seedDescription)
+    seededPipeline = try device.makeRenderPipelineState(descriptor: seededDescription)
+} catch { fail("no seed pipeline: \(error)") }
 let stencilDescription = MTLDepthStencilDescriptor()
 stencilDescription.depthCompareFunction = .greater
 stencilDescription.isDepthWriteEnabled = true
@@ -111,6 +140,12 @@ let eyeBack: Float = head ? 2.0 : 3.0
 let halfSize = head ? eyeBack * frustum : SIMD2<Float>(1.4, 1.4 / aspect)
 let cameraTangents = head ? frustum : tan(35 * Float.pi / 180) * SIMD2<Float>(1, 1 / aspect)
 let gridCells: UInt32 = 4
+let gridOption = options["grid"].map { $0.split(separator: "x").compactMap { UInt32($0) } }
+if let gridOption, gridOption.count != 2 || gridOption.contains(where: { $0 < 2 }) { fail("--grid takes COLUMNSxROWS") }
+let grid = gridOption.map { SIMD2($0[0], $0[1]) } ?? SIMD2(UInt32(width) / gridCells + 1, UInt32(height) / gridCells + 1)
+let refineExit = refine > 0 ? number("exit", 0) : 0
+let useSeed = options["seed"] != nil && refine > 0, compareSeed = options["compare-seed"] != nil
+if (options["seed"] != nil || compareSeed) && refine <= 0 { fail("--seed and --compare-seed need --refine above 0 (as in the app)") }
 
 func uniforms(side: Float) -> QuadUniforms {
     let eye = SIMD3<Float>(viewerX + side * 0.032 * separationScale, 0, eyeBack)
@@ -119,12 +154,82 @@ func uniforms(side: Float) -> QuadUniforms {
     // Right-up-back, reversed depth with the far plane at infinity (the layer's convention).
     let projection = simd_float4x4(SIMD4(1 / cameraTangents.x, 0, 0, 0), SIMD4(0, 1 / cameraTangents.y, 0, 0),
                                    SIMD4(0, 0, 0, -1), SIMD4(0, 0, 0.05, 0))
-    return QuadUniforms(viewProjection: projection * view, model: matrix_identity_float4x4, halfSize: halfSize, decode: 0, hasDepth: 1,
-                        grid: SIMD2(UInt32(width) / gridCells + 1, UInt32(height) / gridCells + 1), eyeBack: eyeBack,
+    return QuadUniforms(viewProjection: projection * view, model: matrix_identity_float4x4, heldModel: matrix_identity_float4x4,
+                        halfSize: halfSize, screenCentre: SIMD2(0, 0), decode: 0, hasDepth: 1,
+                        grid: grid, eyeBack: eyeBack,
                         nearUnits: number("near", 15), unitsPerMeter: number("units", 70),
                         depthScale: head ? number("head-scale", 1) : number("scale", 0.15),
                         maxBehind: head ? 300 : number("max-behind", 30), backplate: 0, tear: number("tear", 0.08),
-                        trueDepth: head ? 1 : 0, eyeRefine: SIMD4(eye, refine))
+                        trueDepth: head ? 1 : 0, sharpen: 0, eyeRefine: SIMD4(eye, refine), heldWithin: 0, refineExit: refineExit)
+}
+
+// The grid's triangles in screen_vertex's order, for the indexed mesh.
+let gridIndices: [UInt32] = {
+    let corners = [(0, 0), (1, 0), (0, 1), (1, 0), (1, 1), (0, 1)]
+    var indices: [UInt32] = []
+    for y in 0..<Int(grid.y - 1) {
+        for x in 0..<Int(grid.x - 1) {
+            for corner in corners { indices.append(UInt32((y + corner.1) * Int(grid.x) + x + corner.0)) }
+        }
+    }
+    return indices
+}()
+let shortIndices = Int(grid.x * grid.y) < 0xFFFF
+let indexBuffer: any MTLBuffer = shortIndices
+    ? gridIndices.map { UInt16($0) }.withUnsafeBytes { device.makeBuffer(bytes: $0.baseAddress!, length: $0.count)! }
+    : gridIndices.withUnsafeBytes { device.makeBuffer(bytes: $0.baseAddress!, length: $0.count)! }
+
+/// The seed pass: the depth each grid vertex needs, as seed_fragment works it out. Returns it and its GPU time.
+func makeSeed() -> (texture: any MTLTexture, gpuSeconds: Double) {
+    let description = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .r32Float, width: Int(grid.x), height: Int(grid.y), mipmapped: false)
+    description.usage = [.renderTarget, .shaderRead]
+    description.storageMode = .private
+    let seed = device.makeTexture(descriptor: description)!
+    let pass = MTLRenderPassDescriptor()
+    pass.colorAttachments[0].texture = seed
+    pass.colorAttachments[0].loadAction = .dontCare
+    pass.colorAttachments[0].storeAction = .store
+    let commands = queue.makeCommandBuffer()!
+    let encoder = commands.makeRenderCommandEncoder(descriptor: pass)!
+    var size = grid
+    encoder.setRenderPipelineState(seedPipeline)
+    encoder.setFragmentBytes(&size, length: MemoryLayout<SIMD2<UInt32>>.stride, index: 0)
+    encoder.setFragmentTexture(gameDepth, index: 1)
+    encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
+    encoder.endEncoding()
+    commands.commit()
+    commands.waitUntilCompleted()
+    return (seed, commands.gpuEndTime - commands.gpuStartTime)
+}
+let seed = useSeed || compareSeed ? makeSeed() : nil
+
+// --stage-time: timestamps at the stage boundaries of each eye's pass (four a pass).
+let stageTime = options["stage-time"] != nil
+let stageBuffer: (any MTLCounterSampleBuffer)? = {
+    guard stageTime else { return nil }
+    guard device.supportsCounterSampling(.atStageBoundary),
+          let set = device.counterSets?.first(where: { $0.name == MTLCommonCounterSet.timestamp.rawValue }) else {
+        fail("--stage-time: this GPU takes no timestamps at stage boundaries")
+    }
+    let description = MTLCounterSampleBufferDescriptor()
+    description.counterSet = set
+    description.storageMode = .shared
+    description.sampleCount = 8
+    do { return try device.makeCounterSampleBuffer(descriptor: description) } catch { fail("--stage-time: \(error)") }
+}()
+/// The vertex and fragment stage ticks of the last draw, summed over both eyes; nil if unreadable.
+func stageTicks() -> (vertex: Double, fragment: Double)? {
+    guard let stageBuffer, let data = try? stageBuffer.resolveCounterRange(0..<8) else { return nil }
+    return data.withUnsafeBytes { raw -> (vertex: Double, fragment: Double)? in
+        let t = raw.bindMemory(to: MTLCounterResultTimestamp.self).map { $0.timestamp }
+        guard t.count >= 8, !t.contains(where: { $0 == 0 || $0 == UInt64.max }) else { return nil }
+        var vertex = 0.0, fragment = 0.0
+        for pass in 0..<2 {
+            guard t[pass * 4 + 1] >= t[pass * 4], t[pass * 4 + 3] >= t[pass * 4 + 2] else { return nil }
+            vertex += Double(t[pass * 4 + 1] - t[pass * 4]); fragment += Double(t[pass * 4 + 3] - t[pass * 4 + 2])
+        }
+        return (vertex, fragment)
+    }
 }
 
 func target(_ format: MTLPixelFormat, _ w: Int, _ h: Int) -> any MTLTexture {
@@ -135,11 +240,12 @@ func target(_ format: MTLPixelFormat, _ w: Int, _ h: Int) -> any MTLTexture {
 }
 
 /// Draws both eyes into textures of the given size and returns them with the GPU time of the command buffer.
-func draw(_ w: Int, _ h: Int) -> (eyes: [any MTLTexture], gpuSeconds: Double) {
+/// seeded: the mesh from the seed, indexed (LB_IMMERSIVE_SEED).
+func draw(_ w: Int, _ h: Int, seeded: Bool = useSeed) -> (eyes: [any MTLTexture], gpuSeconds: Double) {
     let commands = queue.makeCommandBuffer()!
     var eyes: [any MTLTexture] = []
     for side: Float in [-1, 1] {
-        let colour = target(.bgra8Unorm, w, h)
+        let colour = target(.bgra8Unorm_srgb, w, h)
         let pass = MTLRenderPassDescriptor()
         pass.colorAttachments[0].texture = colour
         pass.colorAttachments[0].loadAction = .clear
@@ -148,7 +254,15 @@ func draw(_ w: Int, _ h: Int) -> (eyes: [any MTLTexture], gpuSeconds: Double) {
         pass.depthAttachment.texture = target(.depth32Float, w, h)
         pass.depthAttachment.loadAction = .clear
         pass.depthAttachment.clearDepth = 0
-        pass.depthAttachment.storeAction = .dontCare
+        pass.depthAttachment.storeAction = .store
+        if let stageBuffer, let attachment = pass.sampleBufferAttachments[0] {
+            let first = side < 0 ? 0 : 4
+            attachment.sampleBuffer = stageBuffer
+            attachment.startOfVertexSampleIndex = first
+            attachment.endOfVertexSampleIndex = first + 1
+            attachment.startOfFragmentSampleIndex = first + 2
+            attachment.endOfFragmentSampleIndex = first + 3
+        }
         let encoder = commands.makeRenderCommandEncoder(descriptor: pass)!
         var values = uniforms(side: side)
         encoder.setRenderPipelineState(pipeline)
@@ -159,7 +273,14 @@ func draw(_ w: Int, _ h: Int) -> (eyes: [any MTLTexture], gpuSeconds: Double) {
         encoder.setFragmentTexture(image, index: 0)
         encoder.setVertexTexture(gameDepth, index: 1)
         encoder.setFragmentTexture(gameDepth, index: 1)
-        encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: Int((values.grid.x - 1) * (values.grid.y - 1) * 6))
+        if seeded, let seed {
+            encoder.setRenderPipelineState(seededPipeline)
+            encoder.setVertexTexture(seed.texture, index: 1)
+            encoder.drawIndexedPrimitives(type: .triangle, indexCount: gridIndices.count, indexType: shortIndices ? .uint16 : .uint32,
+                                          indexBuffer: indexBuffer, indexBufferOffset: 0)
+        } else {
+            encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: Int((values.grid.x - 1) * (values.grid.y - 1) * 6))
+        }
         encoder.endEncoding()
         eyes.append(colour)
     }
@@ -192,10 +313,49 @@ let outContext = CGContext(data: &sideBySide, width: outWidth * 2, height: outHe
 let png = NSBitmapImageRep(cgImage: outContext.makeImage()!).representation(using: .png, properties: [:])!
 try png.write(to: URL(fileURLWithPath: positional[2] + "-sbs.png"))
 
+// --compare-seed: the seeded, indexed mesh must give the same picture to the bit as the unindexed one.
+var seedDifferent = -1
+if compareSeed {
+    let plain = draw(outWidth, outHeight, seeded: false).eyes, seeded = draw(outWidth, outHeight, seeded: true).eyes
+    seedDifferent = 0
+    for (a, b) in zip(plain, seeded) {
+        var one = [UInt8](repeating: 0, count: outWidth * outHeight * 4), two = one
+        a.getBytes(&one, bytesPerRow: outWidth * 4, from: MTLRegionMake2D(0, 0, outWidth, outHeight), mipmapLevel: 0)
+        b.getBytes(&two, bytesPerRow: outWidth * 4, from: MTLRegionMake2D(0, 0, outWidth, outHeight), mipmapLevel: 0)
+        for index in 0..<(outWidth * outHeight) where one[index * 4..<index * 4 + 4] != two[index * 4..<index * 4 + 4] { seedDifferent += 1 }
+    }
+}
+
 let size = (options["time-size"] ?? "1888x1792").split(separator: "x").compactMap { Int($0) }
 guard size.count == 2 else { fail("--time-size takes WIDTHxHEIGHT") }
-_ = draw(size[0], size[1])
-let times = (0..<30).map { _ in draw(size[0], size[1]).gpuSeconds * 1000 }.sorted()
+let runs = max(1, Int(number("runs", 30))), warmup = max(0, Int(number("warmup", 1)))
+for _ in 0..<warmup { _ = draw(size[0], size[1]) }
+let clockStart = (gpu: stageTime ? device.sampleTimestamps().gpu : 0, wall: ProcessInfo.processInfo.systemUptime)
+var stages: [(vertex: Double, fragment: Double)] = []
+let times = (0..<runs).map { _ -> Double in
+    let seconds = draw(size[0], size[1]).gpuSeconds * 1000
+    if let ticks = stageTicks() { stages.append(ticks) }
+    return seconds
+}.sorted()
 print(String(format: "%@, refine %.0f: gaps in the mesh %.2f%% of the picture; GPU for both eyes at %dx%d on %@: median %.2f ms (%.2f-%.2f)",
              head ? "head" : "window", refine, 100 * Double(undrawn) / Double(outWidth * outHeight * 2), size[0], size[1],
              device.name, times[times.count / 2], times.first!, times.last!))
+print(String(format: "grid %dx%d, exit %.2f, %@, %d timed draws after %d", grid.x, grid.y, refineExit,
+             useSeed ? "seeded indexed mesh" : "unindexed mesh", runs, warmup))
+if let seed { print(String(format: "seed pass %.3f ms (once per game frame)", seed.gpuSeconds * 1000)) }
+if stageTime {
+    let ticks = Double(device.sampleTimestamps().gpu &- clockStart.gpu)
+    let msPerTick = ticks > 0 ? (ProcessInfo.processInfo.systemUptime - clockStart.wall) * 1000 / ticks : 0
+    if stages.isEmpty {
+        print("stage times: no readable timestamps")
+    } else {
+        let vertex = stages.map { $0.vertex * msPerTick }.sorted(), fragment = stages.map { $0.fragment * msPerTick }.sorted()
+        print(String(format: "stages, both eyes: vertex median %.3f ms (%.3f-%.3f), fragment median %.3f ms (%.3f-%.3f), %d of %d draws read",
+                     vertex[vertex.count / 2], vertex.first!, vertex.last!, fragment[fragment.count / 2], fragment.first!, fragment.last!,
+                     stages.count, runs))
+    }
+}
+if compareSeed {
+    print("seeded indexed mesh against unindexed: \(seedDifferent) pixels differ" + (seedDifferent == 0 ? " (identical)" : ""))
+    if seedDifferent != 0 { exit(1) }
+}
