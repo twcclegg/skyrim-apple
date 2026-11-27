@@ -79,6 +79,99 @@ final class GPUTimeTally: @unchecked Sendable {
     }
 }
 
+/// LB_IMMERSIVE_PASS_TIME=1: the GPU time of the eyes' passes, vertex and fragment stages apart, from timestamps
+/// taken at the stage boundaries of each pass (a counter sample buffer). Each frame takes the next of `frames`
+/// slots of `perFrame` samples, four a pass; the completion handler reads them back and tallies the frame's sum.
+/// Timestamps are GPU ticks: converted to seconds by comparing two GPU timestamp readings with the wall clock.
+final class PassTimer: @unchecked Sendable {
+    private static let frames = 8, perFrame = 16
+    private let buffer: any MTLCounterSampleBuffer
+    private let device: any MTLDevice
+    private var slot = 0, used = 0
+    private let lock = NSLock()
+    private var vertex = 0.0, fragment = 0.0, vertexMax = 0.0, fragmentMax = 0.0, count = 0, misses = 0
+    private var clockStart: (gpu: UInt64, wall: Double)
+
+    /// nil when the GPU can't take timestamps at stage boundaries.
+    init?(device: any MTLDevice) {
+        guard device.supportsCounterSampling(.atStageBoundary),
+              let set = device.counterSets?.first(where: { $0.name == MTLCommonCounterSet.timestamp.rawValue }) else { return nil }
+        let description = MTLCounterSampleBufferDescriptor()
+        description.counterSet = set
+        description.storageMode = .shared
+        description.sampleCount = Self.frames * Self.perFrame
+        guard let buffer = try? device.makeCounterSampleBuffer(descriptor: description) else { return nil }
+        self.buffer = buffer
+        self.device = device
+        clockStart = (device.sampleTimestamps().gpu, CACurrentMediaTime())
+    }
+
+    /// Starts a frame's samples; returns its slot for `finish`.
+    func beginFrame() -> Int {
+        slot = (slot + 1) % Self.frames
+        used = 0
+        return slot
+    }
+
+    /// Has the pass write its four timestamps, while the frame's slot has room. Returns the passes so far.
+    func attach(_ pass: MTLRenderPassDescriptor) -> Int {
+        guard used + 4 <= Self.perFrame, let attachment = pass.sampleBufferAttachments[0] else { return used / 4 }
+        let first = slot * Self.perFrame + used
+        attachment.sampleBuffer = buffer
+        attachment.startOfVertexSampleIndex = first
+        attachment.endOfVertexSampleIndex = first + 1
+        attachment.startOfFragmentSampleIndex = first + 2
+        attachment.endOfFragmentSampleIndex = first + 3
+        used += 4
+        return used / 4
+    }
+
+    /// From the command buffer's completion handler: reads the frame's timestamps and tallies its stage times.
+    func finish(slot: Int, passes: Int) {
+        guard passes > 0 else { return }
+        let first = slot * Self.perFrame
+        guard let data = try? buffer.resolveCounterRange(first..<(first + passes * 4)) else {
+            lock.lock(); misses += 1; lock.unlock()
+            return
+        }
+        var vertexTicks: UInt64 = 0, fragmentTicks: UInt64 = 0, bad = false
+        data.withUnsafeBytes { raw in
+            let stamps = raw.bindMemory(to: MTLCounterResultTimestamp.self)
+            guard stamps.count >= passes * 4 else { bad = true; return }
+            for pass in 0..<passes {
+                let t = (0..<4).map { stamps[pass * 4 + $0].timestamp }
+                if t.contains(where: { $0 == 0 || $0 == UInt64.max }) || t[1] < t[0] || t[3] < t[2] { bad = true; return }
+                vertexTicks += t[1] - t[0]
+                fragmentTicks += t[3] - t[2]
+            }
+        }
+        lock.lock()
+        if bad {
+            misses += 1
+        } else {
+            let v = Double(vertexTicks), f = Double(fragmentTicks)
+            vertex += v; fragment += f; count += 1
+            vertexMax = max(vertexMax, v); fragmentMax = max(fragmentMax, f)
+        }
+        lock.unlock()
+    }
+
+    /// Mean and largest stage times per frame since the last call, in seconds; frames whose samples failed.
+    func take() -> (vertex: Double, fragment: Double, vertexMax: Double, fragmentMax: Double, frames: Int, misses: Int) {
+        let now = (gpu: device.sampleTimestamps().gpu, wall: CACurrentMediaTime())
+        let ticks = now.gpu > clockStart.gpu ? Double(now.gpu - clockStart.gpu) : 0
+        let secondsPerTick = ticks > 0 ? (now.wall - clockStart.wall) / ticks : 0
+        clockStart = now
+        lock.lock(); defer {
+            vertex = 0; fragment = 0; vertexMax = 0; fragmentMax = 0; count = 0; misses = 0
+            lock.unlock()
+        }
+        let n = Double(max(count, 1))
+        return (vertex / n * secondsPerTick, fragment / n * secondsPerTick, vertexMax * secondsPerTick,
+                fragmentMax * secondsPerTick, count, misses)
+    }
+}
+
 enum SpatialEventLog {
     nonisolated(unsafe) private static var counts: [String: Int] = [:]
     private static let lock = NSLock()
@@ -829,6 +922,59 @@ final class ImmersiveCompositor: @unchecked Sendable {
     private var shownGapSum: Double = 0, shownGapCount = 0
     private var displayPeriod: Double?
 
+    /// LB_IMMERSIVE_PASS_TIME=1: the eyes' passes' vertex and fragment stage times in the 5 s log (PassTimer).
+    /// Read once the game is presenting.
+    private var passTimerSetting: Bool?
+    private var passTimer: PassTimer?
+    private var passTiming: Bool {
+        if let passTimerSetting { return passTimerSetting }
+        guard checkedDevice else { return false }
+        let wanted = getenv("LB_IMMERSIVE_PASS_TIME").map { String(cString: $0) == "1" } ?? false
+        if wanted {
+            passTimer = PassTimer(device: device)
+            log(passTimer != nil ? "pass time on: vertex and fragment stage timestamps on each eye's pass"
+                                 : "pass time: this GPU takes no timestamps at stage boundaries")
+        }
+        passTimerSetting = wanted && passTimer != nil
+        return passTimerSetting!
+    }
+    /// What the drawables and rate maps last logged looked like, so each is logged when it changes (at most 8 times).
+    private var loggedDrawable = "", loggedDrawableCount = 0
+    private var loggedRateMaps = "", loggedRateMapCount = 0
+    /// How far the eye was from where the mesh's rays start (meters), over the drawn eyes: how much the per-pixel
+    /// search had to correct, to read next to the cost switches.
+    private var eyeOffsetSum: Double = 0, eyeOffsetMax: Double = 0, eyeOffsetCount = 0
+
+    /// Logs the drawable's texture and viewport sizes and its rasterization rate maps, when they change.
+    private func logDrawable(_ drawable: LayerRenderer.Drawable) {
+        if loggedDrawableCount < 8 {
+            let colour = drawable.colorTextures.map { "\($0.width)x\($0.height)x\($0.arrayLength)" }.joined(separator: " ")
+            let depth = drawable.depthTextures.map { "\($0.width)x\($0.height)" }.joined(separator: " ")
+            let viewports = drawable.views.map { "\(Int($0.textureMap.viewport.width))x\(Int($0.textureMap.viewport.height))" }.joined(separator: " ")
+            let text = "drawable: colour \(colour), depth \(depth), \(drawable.views.count) views, viewports \(viewports)"
+            if text != loggedDrawable {
+                loggedDrawable = text
+                loggedDrawableCount += 1
+                log(text)
+            }
+        }
+        let maps = drawable.rasterizationRateMaps
+        if !maps.isEmpty, loggedRateMapCount < 8 {
+            let text = "rate maps: " + maps.map { map in
+                let layers = (0..<map.layerCount).map { layer -> String in
+                    let size = map.physicalSize(layer: layer)
+                    return "\(size.width)x\(size.height)"
+                }.joined(separator: " ")
+                return "screen \(map.screenSize.width)x\(map.screenSize.height), physical \(layers)"
+            }.joined(separator: "; ")
+            if text != loggedRateMaps {
+                loggedRateMaps = text
+                loggedRateMapCount += 1
+                log(text)
+            }
+        }
+    }
+
     private func finish() {
         skyrim_sdl_set_window_ghost(0)
         DispatchQueue.main.async { NotificationCenter.default.post(name: .skyrimImmersiveRunning, object: false) }
@@ -1049,8 +1195,13 @@ final class ImmersiveCompositor: @unchecked Sendable {
             displayPeriod = shownGapSum / Double(shownGapCount)
         }
 
+        let timer = passTiming ? passTimer : nil
+        let timerSlot = timer?.beginFrame() ?? 0
+        var timedPasses = 0
+
         var publishedHead = false
         for drawable in drawables {
+            logDrawable(drawable)
             let shownAt = LayerRenderer.Clock.Instant.epoch.duration(to: drawable.frameTiming.presentationTime)
             let seconds = Double(shownAt.components.seconds) + Double(shownAt.components.attoseconds) * 1e-18
             let anchor = tracking.queryDeviceAnchor(atTimestamp: seconds)
@@ -1109,6 +1260,7 @@ final class ImmersiveCompositor: @unchecked Sendable {
                 pass.depthAttachment.storeAction = .store
                 let rateMaps = drawable.rasterizationRateMaps
                 if !rateMaps.isEmpty { pass.rasterizationRateMap = rateMaps[min(index, rateMaps.count - 1)] }
+                if let timer { timedPasses = timer.attach(pass) }
                 guard let encoder = commands.makeRenderCommandEncoder(descriptor: pass) else { continue }
                 encoder.setViewport(view.textureMap.viewport)
                 if let monoTexture = texture, let monoImage = image, let centreModel = model, let pipeline, let depth {
@@ -1182,6 +1334,10 @@ final class ImmersiveCompositor: @unchecked Sendable {
                                                 eyeRefine: SIMD4(simd_make_float3(model.inverse * originFromEye.columns.3), useDepth ? refineSteps : 0),
                                                 heldWithin: heldModel != nil && useDepth ? motionNear : 0,
                                                 refineExit: useDepth && refineSteps > 0 ? refineExit : 0)
+                    if useDepth {
+                        let offset = Double(simd_length(simd_make_float3(uniforms.eyeRefine) - SIMD3(0, 0, eyeBack)))
+                        eyeOffsetSum += offset; eyeOffsetMax = max(eyeOffsetMax, offset); eyeOffsetCount += 1
+                    }
                     encoder.setRenderPipelineState(pipeline)
                     encoder.setDepthStencilState(depth)
                     encoder.setCullMode(.none)
@@ -1218,8 +1374,9 @@ final class ImmersiveCompositor: @unchecked Sendable {
             }
             drawable.encodePresent(commandBuffer: commands)
         }
-        commands.addCompletedHandler { [gpuTime] buffer in
+        commands.addCompletedHandler { [gpuTime, timer, timerSlot, timedPasses] buffer in
             gpuTime.add(buffer.gpuEndTime - buffer.gpuStartTime)
+            timer?.finish(slot: timerSlot, passes: timedPasses)
             giveBack()
         }
         commands.commit()
@@ -1235,6 +1392,17 @@ final class ImmersiveCompositor: @unchecked Sendable {
             let gpu = gpuTime.take()
             if gpu.count > 0 {
                 log(String(format: "compositor gpu %.2f ms per frame, p95 %.2f ms, max %.2f ms", gpu.total * 1000 / Double(gpu.count), gpu.p95 * 1000, gpu.max * 1000))
+            }
+            if let passTimer, passTimerSetting == true {
+                let t = passTimer.take()
+                if t.frames > 0 || t.misses > 0 {
+                    log(String(format: "compositor passes: vertex %.2f ms, fragment %.2f ms per frame (mean), max %.2f / %.2f ms, %d frames, %d unreadable",
+                               t.vertex * 1000, t.fragment * 1000, t.vertexMax * 1000, t.fragmentMax * 1000, t.frames, t.misses))
+                }
+            }
+            if eyeOffsetCount > 0 {
+                log(String(format: "eye from the rays' origin: %.1f mm (mean), max %.1f mm", eyeOffsetSum / Double(eyeOffsetCount) * 1000, eyeOffsetMax * 1000))
+                eyeOffsetSum = 0; eyeOffsetMax = 0; eyeOffsetCount = 0
             }
             if repeats > 0, shownGapCount > 0 {
                 let gap = shownGapSum / Double(shownGapCount)

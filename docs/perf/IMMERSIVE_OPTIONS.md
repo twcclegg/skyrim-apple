@@ -127,6 +127,23 @@ Two lines report GPU cost on the headset. Neither had ever been read from a head
 Read them together: if the game latency is far above the compositor's GPU time, the game's frame is the slow part,
 on the GPU or on DXVK's command thread; the line alone does not say which.
 
+For the compositor cost switches below, four more lines from `ImmersiveScreen.swift`:
+
+- `immersive: drawable: colour WxHxL …, depth WxH …, N views, viewports WxH …`, when it changes (at most 8 times):
+  the size of what the compositor actually draws into, per texture (L is the texture's array length) and view.
+- `immersive: rate maps: screen WxH, physical WxH WxH; …`, when foveation is on (`LB_FOVEATION=1`) and the maps
+  change (at most 8 times): each rasterization rate map's screen size and the physical size of each of its layers,
+  which is what the fragment stage pays for.
+- `immersive: compositor passes: vertex X ms, fragment Y ms per frame (mean), max V / F ms, N frames, M unreadable`,
+  every 5 s, only with `LB_IMMERSIVE_PASS_TIME=1`: the eyes' passes timed at the stage boundaries with a Metal
+  counter sample buffer, summed over a frame's passes. GPU ticks are converted with two GPU timestamp readings
+  against the wall clock. On a tile-based GPU the two stages of a pass overlap, so they need not add up to the
+  pass, and the whole-buffer line above stays the total. Logs `pass time: this GPU takes no timestamps at stage
+  boundaries` if it can't.
+- `immersive: eye from the rays' origin: X mm (mean), max Y mm`, every 5 s while depth is on: how far the eye is
+  from where the mesh's rays start, which is what the per-pixel search corrects and where a coarser grid
+  (`LB_IMMERSIVE_GRID`) shows its differences (larger above about 30 mm in the reference).
+
 ## Compositor cost switches
 
 The compositor redraws both eyes at every refresh from the newest game frame (`ImmersiveScreen.swift`). These
