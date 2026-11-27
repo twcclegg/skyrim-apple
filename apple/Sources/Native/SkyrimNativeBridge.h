@@ -60,6 +60,10 @@ void skyrim_immersive_release(void *state, uint32_t slot);
 /* runtime/d3d9_bridge.cpp: once per display refresh, after skyrim_immersive_acquire. With LB_MAX_FPS at the refresh
  * rate divided by a whole number (45 at 90 Hz), the game paces its frames on these ticks instead of its own clock. */
 void skyrim_display_tick(void);
+/* runtime/comfort_ini.c: before the game starts, say that this launch plays in the immersive space. The game is then
+ * given the comfort defaults (no VATS kill-cam, no idle orbit camera, no radial blur) through LB_INI, unless
+ * LB_COMFORT_INI=0 or the player set the same keys there. Windowed launches never call it. */
+void skyrim_comfort_ini_immersive(int on);
 /* runtime/platform_sdl.c head steering: the head's yaw (clockwise) and pitch (up) in radians relative to its
  * starting direction, from the compositor thread; on = 0 stops steering. */
 void skyrim_head_set(float yaw, float pitch, int on);

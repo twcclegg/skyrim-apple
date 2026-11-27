@@ -250,7 +250,10 @@ struct LibraryView: View {
             if model.primaryAction == .play && model.canPlay {
                 Button {
                     Task {
-                        if case .opened = await openImmersiveSpace(id: ImmersiveScreen.spaceID) { startPlay() }
+                        if case .opened = await openImmersiveSpace(id: ImmersiveScreen.spaceID) {
+                            NativeRuntime.markImmersiveLaunch()
+                            startPlay()
+                        }
                     }
                 } label: {
                     Label("Play Immersive", systemImage: "visionpro")
@@ -268,6 +271,7 @@ struct LibraryView: View {
                         let result = await openImmersiveSpace(id: ImmersiveScreen.spaceID)
                         if case .opened = result {
                             fputs("bench: immersive space opened (attempt \(attempt))\n", stderr)
+                            NativeRuntime.markImmersiveLaunch()
                             startPlay()
                             return
                         }
