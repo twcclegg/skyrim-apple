@@ -561,6 +561,8 @@ static void hud_layer_present(IDirect3DDevice9 *d) {
     g_hud_used = false;
 }
 static bool g_ui_shift_on;
+static bool g_ui_overlay_on;              // the interface's offset on perspective vertices too (stereo_ui_overlay)
+static void stereo_ui_overlay(bool on);  // below
 static uint32_t g_skip_class_mask;  // LB_SKIP_CLASS=depth,shadow,...: skip every draw of those classes (timing only)
 static int g_bisect_from = -1, g_draw_no;
 static bool g_bisect_window;  // inside LB_BISECT's 160 frames (g_bisect is also set for LB_SKIP_DRAWS / LB_FP_SKIP)
@@ -656,10 +658,12 @@ struct PassFrame {
     PassTotals cls[PASS_COUNT];
     int rt_changes;
     bool seen_main, seen_depth, seen_bb;  // a main / depth / back buffer draw happened this frame
+    bool bb_post;                         // every draw since the back buffer was bound was of the post class
     // First-person detection (d3d_first_person, below)
     bool fp_late;                         // in the late pass: after its Clear of depth only, until its projection ends
     bool fp_late_confirmed;               // ... and its projection was seen to be the first-person one
     bool fp_proj;                         // the projection set last is the first-person one
+    bool overlay_proj;                    // ... a perspective one of neither the world camera nor the first person
     bool fp;                              // fp_late || fp_proj, and a target that allows it
     bool fp_last_draw;                    // the frame's previous draw was a first-person one
     int fp_runs, fp_kind_draws[FP_KINDS]; // runs of consecutive first-person draws; draws by kind (index = kind)
@@ -734,14 +738,32 @@ bool d3d_first_person(void) { return g_pass_frame.fp; }
 extern "C" int skyrim_first_person_pass(void) { return fp_kind(); }
 extern "C" void skyrim_first_person_listen(void (*fn)(int kind)) { g_fp_listener = fn; }
 
+// Whether the texture bound to stage 0 is a render target: an earlier pass's output, not a texture the game loaded.
+static bool stage0_render_target(void) {
+    IDirect3DBaseTexture9 *base = nullptr;
+    if (!g_pass_device || FAILED(g_pass_device->GetTexture(0, &base)) || !base) return false;
+    D3DSURFACE_DESC desc = {};
+    const bool rt = base->GetType() == D3DRTYPE_TEXTURE &&
+                    SUCCEEDED(static_cast<IDirect3DTexture9 *>(base)->GetLevelDesc(0, &desc)) &&
+                    (desc.Usage & D3DUSAGE_RENDERTARGET);
+    base->Release();
+    return rt;
+}
+
 // The class of a draw, from the targets bound and what the frame drew before. Sizes are relative to the back
 // buffer (CreateDevice/Reset), never absolute. First match wins. "Seen" means it matches the Riverwood frame
 // traced with LB_D3DTRACE (docs/perf/LOG.md, 2026-11-10); everything else is unverified, check it with LB_PASSES=2.
-//   ui      a menu drawn into the second screen's image (hud_screen.cpp, Android dual screen only), or a draw into
-//           the back buffer after the first since it was bound: the HUD and menus over the final image (seen: 17
-//           draws after the final image in Riverwood)
+//   ui      a menu drawn into the second screen's image (hud_screen.cpp, Android dual screen only), or any other
+//           draw into the back buffer: the HUD and menus over the final image (seen: 17 draws after the final image
+//           in Riverwood), and the screen blood (live stereo places it as the HUD: stereo_ui_overlay)
 //   post    the first draw into the back buffer since it was bound, if it is a quad (<= 2 primitives): the final
-//           image (seen in Riverwood; the game also draws one quad into the back buffer earlier in the frame)
+//           image (seen in Riverwood; the game also draws one quad into the back buffer earlier in the frame); and
+//           each quad right after it, while every draw since the binding has been one, that samples a render target
+//           in stage 0: an image-space effect blended over the final image (seen in the boss fight: a blur of a
+//           quarter-size target, pixel shader constants Image/BlurOffsets/BlurScale/ColorRange, drawn second; as
+//           interface it got the interface's per-eye offset and showed as a shifted copy of the picture). Interface
+//           draws sample their own textures, not render targets (none seen there in the boss fight's HUD, console,
+//           main menu and loading screen)
 //   fp      a first-person draw (d3d_first_person, above; seen in Riverwood with empty hands, a sword and Flames),
 //           whatever the target: the late pass, and its prepass and mask draws otherwise counted as main and mask
 //   depth   an R32F colour target of back-buffer size: the scene's depth drawn again (seen, 638 draws)
@@ -770,7 +792,8 @@ static int pass_class(uint32_t prims) {
     if (t.bb) {
         bool first = !f.seen_bb;
         f.seen_bb = true;
-        return first && prims <= 2 ? PASS_POST : PASS_UI;
+        f.bb_post = prims <= 2 && (first || (f.bb_post && stage0_render_target()));
+        return f.bb_post ? PASS_POST : PASS_UI;
     }
     if (bb_size && t.fmt == D3DFMT_R32F) {
         f.seen_depth = true;
@@ -949,6 +972,8 @@ void d3d_passes_draw(uint32_t prims) {
                     on1[4] = {g_ui_shift_on ? g_ui_k[1][0] : 0.0f, g_ui_shift_on ? g_ui_k[1][1] : 0.0f, 0, 0};
         dxvk_stereo_set_view_ui_offsets(on0, on1);
     }
+    const bool overlay = g_ui_shift_on && k == PASS_UI && g_pass_frame.overlay_proj;
+    if (overlay != g_ui_overlay_on) stereo_ui_overlay(overlay);
     if (k == PASS_MAIN && g_depth_copy == 1 && !g_main_ds && g_pass_device) g_pass_device->GetDepthStencilSurface(&g_main_ds);
     if (k == PASS_MASK) stereo_mask_seen();
     if (prims <= 2) stereo_post_draw();
@@ -1002,7 +1027,7 @@ void d3d_passes_target(IDirect3DDevice9 *d) {
 // After a successful Reset: the device is back to the back buffer and an identity projection, so no first-person pass
 // is in progress whatever the frame did before it.
 static void d3d_passes_reset(IDirect3DDevice9 *d) {
-    g_pass_frame.fp_late = g_pass_frame.fp_proj = false;
+    g_pass_frame.fp_late = g_pass_frame.fp_proj = g_pass_frame.overlay_proj = false;
     d3d_passes_target(d);
 }
 
@@ -1049,6 +1074,7 @@ void d3d_passes_projection(const float *m) {
         f.fp_late = false;
     }
     f.fp_proj = same(near_plane, g_fp_near) && !same(near_plane, world);
+    f.overlay_proj = world > 0 && near_plane > 0 && !same(near_plane, world) && !same(near_plane, g_fp_near);
     fp_update();
 }
 
@@ -1111,11 +1137,12 @@ static void passes_present(void) {
         dxvk_stereo_set_view_ui_offsets(zero, zero);
         g_ui_shift_on = false;
     }
+    if (g_ui_overlay_on) stereo_ui_overlay(false);
     if (g_main_ds) { g_main_ds->Release(); g_main_ds = nullptr; }
     stereo_mask_present(false);
     stereo_post_present(false);
     if (!g_d3d_passes) return;
-    g_pass_frame.fp_late = g_pass_frame.fp_proj = false;
+    g_pass_frame.fp_late = g_pass_frame.fp_proj = g_pass_frame.overlay_proj = false;
     fp_update();
     if (!g_passes_log) { g_pass_frame = PassFrame(); return; }
     passdbg_flush();
@@ -2430,6 +2457,41 @@ static void stereo_fp_changed(int kind) {
 }
 static bool stereo_skip_fp(void) { return g_stereo.skip_fp; }
 
+/* Live stereo: interface draws made while the projection set last is a camera of its own (overlay_proj, from
+ * d3d_passes_projection: perspective, with neither the world camera's near plane nor the first person's) get the
+ * interface's offset on every vertex. DXVK gives that offset only to vertices with w within 1e-5 of 1; the others
+ * count as perspective and go through the eyes' matrices, which undo the world camera's projection. The screen blood
+ * is drawn so: its quads (pixel shader constants BloodColor, BloodAlpha) and the glint drawn just before them
+ * (FlareColor, FlareHDR: the same quads, scaled slightly about the sun's place on the screen) come from a camera
+ * with near plane 1, at w = 1.00001. Through the world's inverse they came out at the world camera's near plane,
+ * about 20 cm in front of the eyes, and magnified by the game's field of view over the eye's. The interface draws
+ * after them in the frame (the HUD) see the same projection, but their vertices are at w = 1, which the matrices
+ * leave alone. As matrices: clip x and y move by the offset times w (the same offset on the screen whatever w is),
+ * and the perspective shift is off while they draw. Off again, the frame's matrices and shift are put back. */
+static void stereo_ui_overlay(bool on) {
+    g_ui_overlay_on = on;
+    static const float identity[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
+    if (on) {
+        float m[2][16];
+        for (int e = 0; e < 2; e++) {
+            memcpy(m[e], identity, sizeof identity);
+            m[e][12] = -g_ui_k[e][0];
+            m[e][13] = -g_ui_k[e][1];
+        }
+        dxvk_stereo_set_view_clip_matrices(m[0], m[1]);
+        dxvk_stereo_set_clip_shift(0.0f);
+        return;
+    }
+    const StereoState &st = g_stereo;
+    if (g_live_m_valid) {
+        const bool fp = fp_kind() != FP_NONE && g_live_m_fp_valid;
+        dxvk_stereo_set_view_clip_matrices(fp ? g_live_m_fp[0] : g_live_m_world[0], fp ? g_live_m_fp[1] : g_live_m_world[1]);
+    } else {
+        dxvk_stereo_set_view_clip_matrices(identity, identity);
+    }
+    dxvk_stereo_set_clip_shift(st.fp_only && fp_kind() == FP_NONE ? 0.0f : st.k_applied);
+}
+
 static bool stereo_live_multiview(void) {
     static int on = -1;
     if (on < 0) { const char *e = getenv("LB_STEREO_MULTIVIEW"); on = e && !strcmp(e, "1"); }
@@ -3060,6 +3122,7 @@ static void stereo_mask_present(bool) {}
 static void stereo_post_draw(void) {}
 static void stereo_post_present(bool) {}
 static bool stereo_skip_fp(void) { return false; }
+static void stereo_ui_overlay(bool on) { g_ui_overlay_on = on; }
 static void vr180_before_present(IDirect3DDevice9 *) {}
 static void vr180_after_present(void) {}
 void vr180_scene_hook(void) {}
