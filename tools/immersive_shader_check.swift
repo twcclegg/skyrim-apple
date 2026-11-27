@@ -313,17 +313,42 @@ let outContext = CGContext(data: &sideBySide, width: outWidth * 2, height: outHe
 let png = NSBitmapImageRep(cgImage: outContext.makeImage()!).representation(using: .png, properties: [:])!
 try png.write(to: URL(fileURLWithPath: positional[2] + "-sbs.png"))
 
-// --compare-seed: the seeded, indexed mesh must give the same picture to the bit as the unindexed one.
-var seedDifferent = -1
+// --compare-seed: the seeded, indexed mesh against the unindexed one. The arithmetic is the same, but the Metal
+// compiler's fast math may round it differently in the two vertex functions, moving a vertex by a fraction of an ulp
+// and so the coverage of a few edge pixels. That is fine; a fault (a seed from the wrong texel, a cell the index
+// buffer leaves out) shows as many pixels, large differences, or a gap the unindexed mesh doesn't have. So: count
+// every differing pixel, how far apart they are (the largest colour difference), how many differ by more than 8/255,
+// and the coverage changes each way, and write <out>-seeddiff.png (differing pixels white, both eyes side by side).
+// The unindexed mesh shades each shared vertex once per triangle, so it can crack where the indexed mesh can't:
+// "drawn only seeded" is not a failure. Exit 1 on more than 0.01% of pixels over 8/255, or any gap only seeded has.
+var seedDifferent = -1, seedLarge = 0, seedMax = 0, seedOnlyPlain = 0, seedOnlySeeded = 0
 if compareSeed {
     let plain = draw(outWidth, outHeight, seeded: false).eyes, seeded = draw(outWidth, outHeight, seeded: true).eyes
     seedDifferent = 0
-    for (a, b) in zip(plain, seeded) {
+    var mask = [UInt8](repeating: 0, count: outWidth * 2 * outHeight * 4)
+    for (eyeIndex, (a, b)) in zip(plain, seeded).enumerated() {
         var one = [UInt8](repeating: 0, count: outWidth * outHeight * 4), two = one
         a.getBytes(&one, bytesPerRow: outWidth * 4, from: MTLRegionMake2D(0, 0, outWidth, outHeight), mipmapLevel: 0)
         b.getBytes(&two, bytesPerRow: outWidth * 4, from: MTLRegionMake2D(0, 0, outWidth, outHeight), mipmapLevel: 0)
-        for index in 0..<(outWidth * outHeight) where one[index * 4..<index * 4 + 4] != two[index * 4..<index * 4 + 4] { seedDifferent += 1 }
+        for index in 0..<(outWidth * outHeight) where one[index * 4..<index * 4 + 4] != two[index * 4..<index * 4 + 4] {
+            seedDifferent += 1
+            var largest = 0
+            for channel in 0..<3 { largest = max(largest, abs(Int(one[index * 4 + channel]) - Int(two[index * 4 + channel]))) }
+            seedMax = max(seedMax, largest)
+            if largest > 8 { seedLarge += 1 }
+            let drawnPlain = one[index * 4 + 3] != 0, drawnSeeded = two[index * 4 + 3] != 0
+            if drawnPlain && !drawnSeeded { seedOnlyPlain += 1 }
+            if drawnSeeded && !drawnPlain { seedOnlySeeded += 1 }
+            let (y, x) = (index / outWidth, index % outWidth), to = (y * outWidth * 2 + eyeIndex * outWidth + x) * 4
+            mask[to] = 255; mask[to + 1] = 255; mask[to + 2] = 255
+        }
     }
+    for index in 0..<(outWidth * 2 * outHeight) { mask[index * 4 + 3] = 255 }
+    let maskContext = CGContext(data: &mask, width: outWidth * 2, height: outHeight, bitsPerComponent: 8, bytesPerRow: outWidth * 2 * 4,
+                                space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                bitmapInfo: CGImageAlphaInfo.noneSkipFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue)!
+    let maskPNG = NSBitmapImageRep(cgImage: maskContext.makeImage()!).representation(using: .png, properties: [:])!
+    try maskPNG.write(to: URL(fileURLWithPath: positional[2] + "-seeddiff.png"))
 }
 
 let size = (options["time-size"] ?? "1888x1792").split(separator: "x").compactMap { Int($0) }
@@ -356,6 +381,14 @@ if stageTime {
     }
 }
 if compareSeed {
-    print("seeded indexed mesh against unindexed: \(seedDifferent) pixels differ" + (seedDifferent == 0 ? " (identical)" : ""))
-    if seedDifferent != 0 { exit(1) }
+    let pixels = outWidth * outHeight * 2
+    if seedDifferent == 0 {
+        print("seeded indexed mesh against unindexed: identical")
+    } else {
+        print(String(format: "seeded indexed mesh against unindexed: %d pixels differ (%.4f%%), largest colour difference %d/255, "
+                     + "%d over 8/255, drawn only unindexed %d, drawn only seeded %d; mask in %@-seeddiff.png",
+                     seedDifferent, 100 * Double(seedDifferent) / Double(pixels), seedMax, seedLarge, seedOnlyPlain,
+                     seedOnlySeeded, positional[2]))
+    }
+    if Double(seedLarge) > 0.0001 * Double(pixels) || seedOnlyPlain > 0 { exit(1) }
 }
