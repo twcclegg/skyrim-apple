@@ -796,6 +796,39 @@ final class ImmersiveCompositor: @unchecked Sendable {
         return pixels
     }()
 
+    /// LB_FRAME_REPEAT=1: the layer shows each compositor frame for two display refreshes
+    /// (LayerRenderer.minimumFrameRepeatCount = 1), so the compositor draws at half the display rate: 45 Hz on a
+    /// 90 Hz display, every pass half as often. Only 1 is taken: the bridge's display tick (skyrim_display_tick)
+    /// paces the game by whole compositor frames, and at 45 Hz a 45 fps game is one tick a frame; at 2 (30 Hz) it
+    /// would no longer fit a whole number and fall back to its timer. Read and applied once the game is presenting
+    /// (launch-env.json arrives after this layer opens). Unset: the layer's default (no repeat).
+    private var frameRepeatSetting: Int?
+    private var frameRepeat: Int {
+        if let frameRepeatSetting { return frameRepeatSetting }
+        guard checkedDevice else { return 0 }
+        let raw = getenv("LB_FRAME_REPEAT").map { String(cString: $0) } ?? ""
+        let value = raw == "1" ? 1 : 0
+        if !raw.isEmpty, value == 0 { log("frame repeat: LB_FRAME_REPEAT=\(raw) not taken (only 1)") }
+        if value == 1 {
+            layer.minimumFrameRepeatCount = 1
+            shownGapSum = 0; shownGapCount = 0  // the check counts only frames after this
+            log("frame repeat: each frame shown for 2 refreshes (layer asks for at least \(layer.minimumFrameRepeatCount))")
+        }
+        frameRepeatSetting = value
+        return value
+    }
+    /// An easing factor tuned per compositor frame at the full display rate, for the rate the compositor runs at:
+    /// the same easing per second. Exactly f with no frame repeat.
+    private func perFrame(_ f: Float) -> Float {
+        let repeats = frameRepeat
+        return repeats == 0 ? f : 1 - pow(1 - f, Float(repeats + 1))
+    }
+    /// Pacing check for LB_FRAME_REPEAT: the time between the presentation times of successive compositor frames,
+    /// before the repeat is applied (the display's own period) and after, for the 5 s log.
+    private var lastShownAt: Double?
+    private var shownGapSum: Double = 0, shownGapCount = 0
+    private var displayPeriod: Double?
+
     private func finish() {
         skyrim_sdl_set_window_ghost(0)
         DispatchQueue.main.async { NotificationCenter.default.post(name: .skyrimImmersiveRunning, object: false) }
@@ -835,7 +868,7 @@ final class ImmersiveCompositor: @unchecked Sendable {
             let rotation = simd_quatf(simd_float3x3(SIMD3(head.columns.0.x, head.columns.0.y, head.columns.0.z),
                                                     SIMD3(head.columns.1.x, head.columns.1.y, head.columns.1.z),
                                                     SIMD3(head.columns.2.x, head.columns.2.y, head.columns.2.z)))
-            let eased = followRotation.map { simd_slerp($0, rotation, 0.15) } ?? rotation
+            let eased = followRotation.map { simd_slerp($0, rotation, perFrame(0.15)) } ?? rotation
             followRotation = eased
             let m = simd_float3x3(eased)
             let position = SIMD3<Float>(head.columns.3.x, head.columns.3.y, head.columns.3.z)
@@ -855,7 +888,7 @@ final class ImmersiveCompositor: @unchecked Sendable {
                 var eased = followYaw ?? yaw
                 var turn = yaw - eased
                 turn -= 2 * .pi * (turn / (2 * .pi)).rounded()
-                eased += turn * 0.08  // per compositor frame: about 0.15 s to catch up at 90 Hz
+                eased += turn * perFrame(0.08)  // per compositor frame: about 0.15 s to catch up at 90 Hz
                 followYaw = eased
             }
             forward = SIMD3<Float>(sin(followYaw!), 0, -cos(followYaw!))
@@ -999,6 +1032,21 @@ final class ImmersiveCompositor: @unchecked Sendable {
         if let depthTexture, seedMesh, refineSteps > 0, readDepthSettings().on {
             seedTextures[0] = seed(0, from: depthTexture, grid: grid, commands: commands)
             if let depthTextureEye2 { seedTextures[1] = seed(1, from: depthTextureEye2, grid: grid, commands: commands) }
+        }
+
+        if let first = drawables.first {
+            let shownAt = LayerRenderer.Clock.Instant.epoch.duration(to: first.frameTiming.presentationTime)
+            let seconds = Double(shownAt.components.seconds) + Double(shownAt.components.attoseconds) * 1e-18
+            if let lastShownAt, seconds > lastShownAt, seconds - lastShownAt < 0.1 {
+                shownGapSum += seconds - lastShownAt
+                shownGapCount += 1
+            }
+            lastShownAt = seconds
+        }
+        let repeats = frameRepeat
+        if repeats == 0, frameRepeatSetting == nil, shownGapCount >= 90 {
+            // Before the repeat is applied: the display's period, the yardstick for the check below.
+            displayPeriod = shownGapSum / Double(shownGapCount)
         }
 
         var publishedHead = false
@@ -1188,6 +1236,17 @@ final class ImmersiveCompositor: @unchecked Sendable {
             if gpu.count > 0 {
                 log(String(format: "compositor gpu %.2f ms per frame, p95 %.2f ms, max %.2f ms", gpu.total * 1000 / Double(gpu.count), gpu.p95 * 1000, gpu.max * 1000))
             }
+            if repeats > 0, shownGapCount > 0 {
+                let gap = shownGapSum / Double(shownGapCount)
+                var line = String(format: "frame repeat: frames %.2f ms apart (mean)", gap * 1000)
+                if let displayPeriod, displayPeriod > 0 {
+                    let ratio = gap / displayPeriod
+                    line += String(format: ", %.2fx the display's %.2f ms", ratio, displayPeriod * 1000)
+                    if abs(ratio - Double(repeats + 1)) > 0.25 { line += String(format: " (expected %dx: not paced as asked)", repeats + 1) }
+                }
+                log(line)
+            }
+            if frameRepeatSetting != nil || displayPeriod != nil { shownGapSum = 0; shownGapCount = 0 }
             if residualCount > 0 {
                 log(String(format: "eye views: shown %.2f deg from where the picture was rendered looking (mean), max %.2f",
                            residualSum / Double(residualCount), residualMax))
