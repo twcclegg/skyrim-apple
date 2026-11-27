@@ -382,6 +382,22 @@ final class ImmersiveCompositor: @unchecked Sendable {
     private let gpuTime = GPUTimeTally()
     /// Grid size: one vertex every 4 game pixels.
     private static let gridColumns: UInt32 = 321, gridRows: UInt32 = 181
+    /// LB_IMMERSIVE_GRID=<columns>x<rows> (for example 161x91): the depth mesh's size instead of 321x181. Fewer
+    /// vertices cost less in the vertex stage; the per-pixel search (LB_IMMERSIVE_REFINE) settles each pixel's depth
+    /// either way, but at a coarser grid a thin object's outline can come out a little different (see
+    /// docs/perf/IMMERSIVE_OPTIONS.md). Read when the first game frame is drawn. Unset or unreadable: 321x181.
+    private lazy var grid: SIMD2<UInt32> = {
+        let fallback = SIMD2(Self.gridColumns, Self.gridRows)
+        guard let raw = getenv("LB_IMMERSIVE_GRID") else { return fallback }
+        let parts = String(cString: raw).split(separator: "x").compactMap { UInt32($0) }
+        guard parts.count == 2 else {
+            log("mesh grid: LB_IMMERSIVE_GRID not <columns>x<rows>; \(fallback.x)x\(fallback.y)")
+            return fallback
+        }
+        let size = SIMD2(max(9, min(parts[0], 1281)), max(9, min(parts[1], 721)))
+        log("mesh grid \(size.x)x\(size.y)")
+        return size
+    }()
     private var depthSettings: (scale: Float, maxBehind: Float, near: Float, units: Float, tear: Float, on: Bool)?
     private var loggedDepth = false
     private var loggedStereo = false
@@ -981,7 +997,6 @@ final class ImmersiveCompositor: @unchecked Sendable {
         // new, ahead of the eyes' passes that read it.
         var seedTextures: [(any MTLTexture)?] = [nil, nil]
         if let depthTexture, seedMesh, refineSteps > 0, readDepthSettings().on {
-            let grid = SIMD2(Self.gridColumns, Self.gridRows)
             seedTextures[0] = seed(0, from: depthTexture, grid: grid, commands: commands)
             if let depthTextureEye2 { seedTextures[1] = seed(1, from: depthTextureEye2, grid: grid, commands: commands) }
         }
@@ -1110,7 +1125,7 @@ final class ImmersiveCompositor: @unchecked Sendable {
                                                 halfSize: rectHalf, screenCentre: rectCentre,
                                                 decode: game.needs_srgb_decode != 0 ? 1 : 0,
                                                 hasDepth: useDepth ? 1 : 0,
-                                                grid: SIMD2(Self.gridColumns, Self.gridRows),
+                                                grid: grid,
                                                 eyeBack: eyeBack, nearUnits: settings.near, unitsPerMeter: settings.units,
                                                 depthScale: tracked ? headDepthScale : settings.scale,
                                                 maxBehind: tracked ? 300 : settings.maxBehind, backplate: 0,
@@ -1127,7 +1142,7 @@ final class ImmersiveCompositor: @unchecked Sendable {
                     encoder.setFragmentTexture(image, index: 0)
                     encoder.setVertexTexture(useDepth ? depthTexture : texture, index: 1)
                     encoder.setFragmentTexture(useDepth ? depthTexture : texture, index: 1)
-                    let vertexCount = Int((Self.gridColumns - 1) * (Self.gridRows - 1) * 6)
+                    let vertexCount = Int((grid.x - 1) * (grid.y - 1) * 6)
                     let seedTexture = useDepth ? seedTextures[stereoEye && index == 1 && depthTextureEye2 != nil ? 1 : 0] : nil
                     if let seedTexture, let seededPipeline, let gridIndices, refineSteps > 0 {
                         // LB_IMMERSIVE_SEED: the same triangles, each vertex shaded once, its depth read from the seed.
