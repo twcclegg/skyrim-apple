@@ -7,8 +7,11 @@ Results go on issue #42, one comment, with the commits in the first line.
 ## Build
 
 - skyrim-apple `headset/fresh-eyes-1`: main (with #83 re-entry and #84 comfort settings) plus #66 + #85 (HUD layer
-  and its scale), #87 (compositor cost switches), #69 + #74 (shader bytecode cache, pipeline misses).
-- dxvk-native `headset/fresh-eyes-1` (650d0364): #8, #10, #11 and #7, the DXVK halves of the above.
+  and its scale), #87 (compositor cost switches), #69 + #74 (shader bytecode cache, pipeline misses), and the
+  eye-view fixes the last staged build carried: #71 + #72 (per-eye shadow mask, bloom and distance blur) and
+  #76 with #75 (screen blood and the image-space blur quad). Without those the play probe would show artefacts
+  already fixed and colour the comfort answers.
+- dxvk-native `headset/fresh-eyes-1` (8ab830c7): #8, #10, #11, #7 and #9, the DXVK halves of the above.
 
 Every new switch is off unless set below, except two DXVK defaults from #69 and #74: the bytecode cache and
 pipeline normalization (`DXVK_SHADER_BYTECODE_CACHE=0` and `DXVK_PIPELINE_NORMALIZE=0` turn them off).
