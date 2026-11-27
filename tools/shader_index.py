@@ -3,7 +3,7 @@
 
     python3 -I shader_index.py index    GAME_DIR [--json OUT.json]
     python3 -I shader_index.py verify   GAME_DIR|INDEX.json CACHE.dxvk-cache... [--min-entries PCT] [--show]
-    python3 -I shader_index.py siblings GAME_DIR|INDEX.json EARLIER.dxvk-cache LATER.dxvk-cache
+    python3 -I shader_index.py siblings GAME_DIR|INDEX.json EARLIER.dxvk-cache LATER.dxvk-cache [--raw]
     python3 -I shader_index.py dxso     GAME_DIR CACHE.dxvk-cache... --out FILE.dxso-cache [--all]
 
 DXVK names a D3D9 shader by the SHA-1 of its bytecode, version token through END token. The game never
@@ -29,7 +29,11 @@ verify    reads state caches (twcclegg/dxvk-native format, v8-v11) and reports h
 siblings  the light-count test: for every entry the later cache has and the earlier lacks whose pixel shader
           the earlier never saw, is there an earlier entry with the same vertex shader, a pixel shader of the
           same lighting pack, and the same state apart from the binding mask (and, counted separately, the
-          spec constants)?
+          spec constants)? State Vulkan ignores is cleared in both caches first (no depth attachment: depth
+          and stencil state; depth or stencil test off: their ops; blending off or no colour attachment: that
+          attachment's blend factors), the attachment-based part of dxvkNormalizePipelineState
+          (twcclegg/dxvk-native#10), as tools/cache-overlap.py --normalize does. Without it, a cache written by
+          a build with that normalisation shares no entry with one written before it. --raw compares bytes.
 dxso      writes the shaders that the given state caches name (or --all) as a bytecode cache in the format of
           twcclegg/dxvk-native#8 (<exe>.dxso-cache), which that build's startup path creates shaders from.
           THE OUTPUT CONTAINS THE GAME'S SHADER CODE: it is refused inside a git work tree. Keep it private.
@@ -303,15 +307,43 @@ def read_state_cache(path):
     return version, entries, invalid
 
 
-def split_state(state, version):
-    """(state with the binding mask zeroed, the same with the spec constants cut off too), graphics entries."""
-    mask_at = 19 + (1 if version >= 11 else 0)   # samples, depth format + layout, 8 x (format, layout), view mask
+VK_FORMAT_UNDEFINED = 0
+
+
+def graphics_state(state, version, normalize=True):
+    """(render pass, binding mask, the remaining state words, spec constants) of a graphics entry's state bytes.
+
+    With normalize, the bits Vulkan ignores given the render pass and the rest of the state are cleared."""
+    rp_len = 19 + (1 if version >= 11 else 0)     # samples, depth format + layout, 8 x (format, layout), view mask
     mask_len = 48 if version >= 9 else 16
-    blanked = state[:mask_at] + bytes(mask_len) + state[mask_at + mask_len:]
-    counts_at = mask_at + mask_len + 2           # after the input assembly word
-    attributes, bindings = state[counts_at], state[counts_at + 1]
-    spec_at = counts_at + 2 + 60 + 4 * attributes + (4 if version >= 10 else 8) * bindings
-    return blanked, blanked[:spec_at]
+    rp, mask = state[:rp_len], state[rp_len:rp_len + mask_len]
+    p = rp_len + mask_len
+    ia, attributes, bindings, rs, ms, ms_mask, ds, om, front, back = struct.unpack_from("<HBBIHHHHII", state, p)
+    p += 24
+    swizzle = state[p:p + 8]
+    blend = list(struct.unpack_from("<8I", state, p + 8))
+    p += 40
+    end = p + 4 * attributes + (4 if version >= 10 else 8) * bindings
+    vertex, spec = state[p:end], state[end:]
+    if normalize:
+        no_depth = rp[1] == VK_FORMAT_UNDEFINED
+        depth_test, stencil_test = ds & 1, ds >> 3 & 1
+        if no_depth:
+            ds &= ~0x7F                               # depth test, write, bounds, stencil test, compare op
+        if no_depth or not depth_test:
+            ds &= ~0x72                               # depth write, compare op
+        if no_depth or not stencil_test:
+            front = back = 0
+        if not om & 1:
+            om &= ~0x1E                               # logic op
+        swizzle = bytearray(swizzle)
+        for i in range(8):
+            if rp[3 + 2 * i] == VK_FORMAT_UNDEFINED:
+                blend[i], swizzle[i] = 0, 0
+            elif not blend[i] & 1:
+                blend[i] &= ~0x07FFFFFE                # factors and ops; enable and write mask stay
+        swizzle = bytes(swizzle)
+    return rp, mask, (ia, attributes, bindings, rs, ms, ms_mask, ds, om, front, back, swizzle, tuple(blend), vertex), spec
 
 
 # --- commands ------------------------------------------------------------------------------------------------
@@ -401,22 +433,30 @@ def cmd_siblings(args):
     version_b, later, _ = read_state_cache(args.later)
     if version_a != version_b:
         raise FormatError("the two caches differ in version (v%d, v%d)" % (version_a, version_b))
-    have = {(tuple(sorted(s.items())), state) for s, state in earlier}
+    as_written = len({(tuple(sorted(sh.items())), st) for sh, st in earlier}
+                     & {(tuple(sorted(sh.items())), st) for sh, st in later})
+    try:
+        earlier = [(s, graphics_state(state, version_a, not args.raw)) for s, state in earlier if "cs" not in s]
+        later = [(s, graphics_state(state, version_b, not args.raw)) for s, state in later if "cs" not in s]
+    except struct.error:
+        raise FormatError("an entry's state is shorter than its version allows")
+    ident = lambda s, g: (tuple(sorted(s.items())), g)
+    have = {ident(s, g) for s, g in earlier}
     seen_ps = {s.get("ps") for s, _ in earlier}
-    by_group = collections.defaultdict(list)       # (vertex shader, pack) -> [(variants, masked, masked + no spec)]
-    for shaders, state in earlier:
+    by_group = collections.defaultdict(list)       # (vertex shader, pack) -> [(variants, state)]
+    for shaders, g in earlier:
         for pack, variants in packs.get(shaders.get("ps"), {}).items():
-            by_group[(shaders.get("vs"), pack)].append((variants,) + split_state(state, version_a))
-    new = [(s, state) for s, state in later if (tuple(sorted(s.items())), state) not in have]
-    new_ps = [(s, state) for s, state in new if "ps" in s and s["ps"] not in seen_ps]
-    lighting = [(s, state) for s, state in new_ps if s["ps"] in packs]
+            by_group[(shaders.get("vs"), pack)].append((variants, g))
+    new = [(s, g) for s, g in later if ident(s, g) not in have]
+    new_ps = [(s, g) for s, g in new if "ps" in s and s["ps"] not in seen_ps]
+    lighting = [(s, g) for s, g in new_ps if s["ps"] in packs]
     result, steps = collections.Counter(), collections.Counter()
-    for shaders, state in lighting:
-        masked, loose = split_state(state, version_b)
+    for shaders, (rp, _, words, spec) in lighting:
         best, step = len(SIBLING_RANKS) - 1, None
         for pack, variants in packs[shaders["ps"]].items():
-            for other, other_masked, other_loose in by_group.get((shaders["vs"], pack), ()):
-                rank = 0 if other_masked == masked else 1 if other_loose == loose else 2
+            for other, (other_rp, _, other_words, other_spec) in by_group.get((shaders["vs"], pack), ()):
+                same = other_rp == rp and other_words == words
+                rank = 0 if same and other_spec == spec else 1 if same else 2
                 distance = min((abs((v >> 4 & 7) - (o >> 4 & 7)), abs((v >> 7 & 7) - (o >> 7 & 7)))
                                for v in variants for o in other)
                 if (rank, distance) < (best, step or (8, 8)):
@@ -424,7 +464,12 @@ def cmd_siblings(args):
         result[SIBLING_RANKS[best]] += 1
         if best < 2:
             steps[step] += 1
-    print("earlier: %d entries, later: %d; in later only: %d" % (len(earlier), len(later), len(new)))
+    print("earlier: %d entries, later: %d; in both as written: %d; in later only: %d%s" % (
+        len(earlier), len(later), as_written, len(new), " (state compared as written)" if args.raw else
+        " (state Vulkan ignores cleared first)"))
+    if not as_written and earlier and later:
+        print("  no entry in common as written: the caches probably come from builds that write state differently"
+              + ("; drop --raw" if args.raw else ""))
     print("  with a pixel shader the earlier cache never saw: %d (%d lighting, %d other)"
           % (len(new_ps), len(lighting), len(new_ps) - len(lighting)))
     for name, count in sorted(result.items()):
@@ -508,6 +553,7 @@ def main(argv=None):
     siblings.add_argument("index")
     siblings.add_argument("earlier")
     siblings.add_argument("later")
+    siblings.add_argument("--raw", action="store_true", help="compare state bytes as written, no normalising")
     dxso = commands.add_parser("dxso")
     dxso.add_argument("game")
     dxso.add_argument("caches", nargs="*")

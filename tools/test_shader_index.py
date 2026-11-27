@@ -57,13 +57,16 @@ def bsa(files, compress=False):
     return head + names + body
 
 
-def entry(version, vs, ps, mask=b"\1", fill=7, spec=(), bad_hash=False):
-    """One graphics entry of a state cache: shader keys, render pass, binding mask, state, spec constants."""
+def entry(version, vs, ps, mask=b"\1", fill=7, spec=(), bad_hash=False, blend=None, colour=0):
+    """One graphics entry of a state cache: shader keys, render pass, binding mask, state, spec constants.
+
+    blend: the 8 blend words in place of fill bytes; colour: render target 0's format (0 = no attachment)."""
     blob = b""
     for bits, digest in ((1, vs), (16, ps)):
         blob += struct.pack("<I", bits) + bytes.fromhex(digest)
-    blob += bytes([1, 0, 0]) + bytes(16) + (b"\3" if version >= 11 else b"")
-    blob += mask.ljust(48, b"\0") + struct.pack("<HBB", 3, 1, 1) + bytes([fill]) * 60
+    blob += bytes([1, 0, 0, colour]) + bytes(15) + (b"\3" if version >= 11 else b"")
+    words = bytes([fill]) * 28 + (struct.pack("<8I", *blend) if blend else bytes([fill]) * 32)
+    blob += mask.ljust(48, b"\0") + struct.pack("<HBB", 3, 1, 1) + words
     blob += struct.pack("<II", 0x1234, 0x5678)
     blob += struct.pack("<I", sum(1 << i for i, _ in spec)) + b"".join(struct.pack("<I", v) for _, v in spec)
     digest = hashlib.sha1(blob).digest()
@@ -238,6 +241,29 @@ class ShaderIndexTest(unittest.TestCase):
             self.assertIn("light-count siblings: 2 of 5 new lighting entries (40%), 2 of all 6", text)
         self.assertEqual(run("siblings", self.game, self.write("a.dxvk-cache", cache(10, [])),
                              self.write("b.dxvk-cache", cache(11, [])))[0], 1)
+
+    def test_siblings_normalize(self):
+        """A build that clears ignored state on write still finds siblings in a cache from one that didn't."""
+        vs = key(self.vs[0])
+        ps = {v: key(code) for v, code in self.variants.items()}
+        off = [0x7FFFFFE] + [0] * 7                   # blending off, factors left behind, no write mask
+        earlier = cache(11, [entry(11, vs, ps[0x10], colour=97, blend=off)])
+        later = cache(11, [entry(11, vs, ps[0x20], colour=97, blend=[0] * 8),          # factors cleared
+                           entry(11, vs, ps[0x00], colour=97, blend=[1] + [0] * 7)])   # blending on: other state
+        a, b = self.write("a.dxvk-cache", earlier), self.write("b.dxvk-cache", later)
+        status, text = run("siblings", self.game, a, b)
+        self.assertEqual(status, 0, text)
+        self.assertIn("in both as written: 0", text)
+        self.assertIn("no entry in common as written", text)
+        self.assertIn("light-count siblings: 1 of 2 new lighting entries (50%)", text)
+        status, text = run("siblings", self.game, a, b, "--raw")
+        self.assertEqual(status, 0, text)
+        self.assertIn("light-count siblings: 0 of 2", text)
+        self.assertIn("drop --raw", text)
+        short = struct.pack("<I", 1) + bytes.fromhex(vs) + struct.pack("<I", 16) + bytes.fromhex(ps[0x20]) + bytes(30)
+        short = struct.pack("<I", 0x11 | (len(short) << 8)) + hashlib.sha1(short).digest() + short
+        status, text = run("siblings", self.game, a, self.write("c.dxvk-cache", cache(11, [short])))
+        self.assertEqual(status, 1, text)                                          # state too short for v11
 
     def test_bytecode_cache(self):
         first, second = self.caches()
