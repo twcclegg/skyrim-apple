@@ -92,6 +92,12 @@ enum SpatialEventLog {
     }
 }
 
+private struct HudUniforms {
+    var mvp: simd_float4x4
+    var rect: SIMD4<Float>
+    var z: Float
+}
+
 private struct QuadUniforms {
     var viewProjection: simd_float4x4
     var model: simd_float4x4
@@ -296,6 +302,23 @@ final class ImmersiveCompositor: @unchecked Sendable {
         if (u.decode) c = select(pow((c + 0.055) / 1.055, 2.4), c / 12.92, c <= 0.04045);
         return float4(c, 1);
     }
+    // LB_HUD_LAYER: the interface as a flat quad (rect: centre xy, half size zw, on the plane z of the frame's space).
+    struct HudUniforms { float4x4 mvp; float4 rect; float z; };
+    struct HudOut { float4 position [[position]]; float2 uv; };
+    vertex HudOut hud_vertex(uint id [[vertex_id]], constant HudUniforms &h [[buffer(0)]]) {
+        float2 uv = float2(id & 1, id >> 1);
+        HudOut o;
+        o.uv = uv;
+        o.position = h.mvp * float4(h.rect.x + (uv.x * 2 - 1) * h.rect.z, h.rect.y + (1 - uv.y * 2) * h.rect.w, h.z, 1);
+        return o;
+    }
+    // The game blended the interface onto transparent black: colour times coverage a, and alpha a * a (the same
+    // blend applied to alpha). Premultiplied colour over the scene with coverage sqrt(alpha).
+    fragment float4 hud_fragment(HudOut in [[stage_in]], texture2d<float> hud [[texture(0)]]) {
+        constexpr sampler linear_clamp(filter::linear, address::clamp_to_edge);
+        float4 c = hud.sample(linear_clamp, in.uv);
+        return float4(c.rgb, sqrt(saturate(c.a)));
+    }
     """
 
     /// Distance to the screen and its width, in meters.
@@ -307,6 +330,16 @@ final class ImmersiveCompositor: @unchecked Sendable {
     private let queue: any MTLCommandQueue
     private var pipeline: (any MTLRenderPipelineState)?
     private var depth: (any MTLDepthStencilState)?
+    private var hudPipeline: (any MTLRenderPipelineState)?
+    private var hudDepth: (any MTLDepthStencilState)?
+    /// LB_HUD_DISTANCE: metres ahead of the frame's camera at which the interface layer (LB_HUD_LAYER) is shown.
+    private lazy var hudDistance: Float = getenv("LB_HUD_DISTANCE").flatMap { Float(String(cString: $0)) }.map { max(0.3, $0) } ?? 2.0
+    /// LB_HUD_SCALE (0.28) and LB_HUD_OFFSET (degrees right,up; 0,0): the interface layer's size as a fraction of the
+    /// game's field of view and where its centre goes, while a frame is placed by its camera. The game lays the HUD
+    /// out against the edges of a frame 124 by 104 degrees across; at 1 it is shown there (HUDLayerPlacement).
+    private lazy var hudPlacement = HUDLayerPlacement(scaleSetting: getenv("LB_HUD_SCALE").map { String(cString: $0) },
+                                                      offsetSetting: getenv("LB_HUD_OFFSET").map { String(cString: $0) })
+    private var hudLogged: [Float] = []
     private let session = ARKitSession()
     private let tracking = WorldTrackingProvider()
     private var screen: simd_float4x4?
@@ -526,6 +559,21 @@ final class ImmersiveCompositor: @unchecked Sendable {
         stencil.depthCompareFunction = .greater
         stencil.isDepthWriteEnabled = true
         depth = device.makeDepthStencilState(descriptor: stencil)
+        let hud = MTLRenderPipelineDescriptor()
+        hud.vertexFunction = library.makeFunction(name: "hud_vertex")
+        hud.fragmentFunction = library.makeFunction(name: "hud_fragment")
+        hud.colorAttachments[0].pixelFormat = layer.configuration.colorFormat
+        hud.colorAttachments[0].isBlendingEnabled = true
+        hud.colorAttachments[0].sourceRGBBlendFactor = .one
+        hud.colorAttachments[0].destinationRGBBlendFactor = .oneMinusSourceAlpha
+        hud.colorAttachments[0].sourceAlphaBlendFactor = .one
+        hud.colorAttachments[0].destinationAlphaBlendFactor = .oneMinusSourceAlpha
+        hud.depthAttachmentPixelFormat = layer.configuration.depthFormat
+        hudPipeline = try device.makeRenderPipelineState(descriptor: hud)
+        let always = MTLDepthStencilDescriptor()
+        always.depthCompareFunction = .always
+        always.isDepthWriteEnabled = false
+        hudDepth = device.makeDepthStencilState(descriptor: always)
     }
 
     /// Depth tuning from the launch environment (LB_ prefix, Documents/SkyrimNative/launch-env.json), read once the
@@ -811,11 +859,13 @@ final class ImmersiveCompositor: @unchecked Sendable {
             var model = anchor != nil ? place(head: head, distance: atFOV ? Self.viewPlane : Self.distance) : screen
             var halfSize: SIMD2<Float>? = nil
             var heldModel: simd_float4x4? = nil
+            var hudCamera: [Float]? = nil  // LB_HUD_LAYER: the frame's camera when the frame is placed by it
             if atFOV, anchor != nil {
                 // Locked to the head and as wide as the game's field of view: the frame fills the angles it was
                 // rendered for whichever way the head faces, at true depth.
                 let c = withUnsafeBytes(of: game.camera) { Array($0.bindMemory(to: Float.self)) }
                 halfSize = SIMD2(Self.viewPlane * c[13], Self.viewPlane * c[14])
+                hudCamera = c
             }
             if anchor == nil { dropEyes() }
             if headMode, anchor != nil {
@@ -837,6 +887,7 @@ final class ImmersiveCompositor: @unchecked Sendable {
                         heldModel = poses.held
                         // Frustum tangents right and top: the frame covers exactly the angles it was rendered for.
                         halfSize = SIMD2(Self.viewPlane * c[13], Self.viewPlane * c[14])
+                        hudCamera = c
                     }
                 }
                 // Menus and loading come without a camera: show them on a screen placed ahead of where the head
@@ -954,6 +1005,50 @@ final class ImmersiveCompositor: @unchecked Sendable {
                         encoder.setFragmentBytes(&plate, length: MemoryLayout<QuadUniforms>.stride, index: 0)
                         encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: vertexCount)
                     }
+                }
+                if let hudPointer = game.hud_texture, let hudPipeline, let hudDepth, let place = heldModel ?? model,
+                   let hud = Unmanaged<AnyObject>.fromOpaque(hudPointer).takeUnretainedValue() as? any MTLTexture {
+                    // LB_HUD_LAYER: the interface as a flat layer, never moved by the depth mesh. With a camera, a
+                    // plane hudDistance ahead of it, placed as the frame is but without the movement shift: the
+                    // game's field of view scaled about its centre (LB_HUD_SCALE; the reticle is at the centre, so
+                    // it stays on the aim point) and kept where both eyes see it. Without one (menus), over the
+                    // screen the picture is shown on, just in front of it, at its full size.
+                    var rect: SIMD4<Float>
+                    var z: Float
+                    if let c = hudCamera {
+                        let d = hudDistance
+                        let field = HUDLayerPlacement.Tangents(left: c[12], right: c[13], top: c[14], bottom: c[15])
+                        // visionOS gives each tangent as a positive extent from the view axis.
+                        let bothEyes = HUDLayerPlacement.Tangents.shared(drawable.views.map {
+                            HUDLayerPlacement.Tangents(left: -abs($0.tangents[0]), right: abs($0.tangents[1]),
+                                                       top: abs($0.tangents[2]), bottom: -abs($0.tangents[3]))
+                        })
+                        let placed = hudPlacement.rect(frame: field, bothEyes: bothEyes)
+                        rect = SIMD4(d * placed.centreX, d * placed.centreY, d * placed.halfWidth, d * placed.halfHeight)
+                        z = Self.viewPlane - d  // the plane's space has the eye at z = viewPlane, looking to -z
+                        // Said once, and again when the field of view or the eyes' extents change.
+                        let eyes = bothEyes ?? HUDLayerPlacement.Tangents(left: 0, right: 0, top: 0, bottom: 0)
+                        let key: [Float] = [field.left, field.right, field.top, field.bottom,
+                                            eyes.left, eyes.right, eyes.top, eyes.bottom, Float(hud.width)]
+                        if key.count != hudLogged.count || !zip(key, hudLogged).allSatisfy({ abs($0 - $1) < 1e-3 }) {
+                            hudLogged = key
+                            log("hud layer: " + hudPlacement.summary(frame: field, bothEyes: bothEyes, pixelWidth: hud.width, distance: d))
+                        }
+                    } else {
+                        let aspect = game.height > 0 ? Float(game.width) / Float(game.height) : 16.0 / 9.0
+                        let half = halfSize ?? SIMD2(Self.width / 2, Self.width / 2 / aspect)
+                        rect = SIMD4(0, 0, half.x, half.y)
+                        z = 0.002
+                    }
+                    var eyeFromDevice = view.transform
+                    eyeFromDevice.columns.3 = eyesCentre + (eyeFromDevice.columns.3 - eyesCentre) * eyeSeparationScale
+                    let viewProjection = drawable.computeProjection(convention: .rightUpBack, viewIndex: index) * (head * eyeFromDevice).inverse
+                    var hudUniforms = HudUniforms(mvp: viewProjection * place, rect: rect, z: z)
+                    encoder.setRenderPipelineState(hudPipeline)
+                    encoder.setDepthStencilState(hudDepth)
+                    encoder.setVertexBytes(&hudUniforms, length: MemoryLayout<HudUniforms>.stride, index: 0)
+                    encoder.setFragmentTexture(hud, index: 0)
+                    encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
                 }
                 encoder.endEncoding()
             }

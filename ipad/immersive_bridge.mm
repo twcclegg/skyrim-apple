@@ -38,6 +38,7 @@ typedef struct skyrim_immersive_frame {
     int eye_views;             /* 1: each layer was rendered through that eye's own frustum and pose (below) */
     float eye_tangents[2][4];  /* l r t b at unit distance, per eye */
     float eye_pose[2][16];     /* the eye in the game camera's frame: column-major, metres, x right y up z back */
+    void *hud_texture;         /* LB_HUD_LAYER: the interface on its own (sRGB view, premultiplied); NULL otherwise */
 } skyrim_immersive_frame;
 int skyrim_frame_camera(float out[18]);  /* runtime/d3d9_bridge.cpp */
 int skyrim_frame_eyes(float tangents[8], float eye_pose[32]);
@@ -52,6 +53,7 @@ struct Entry {
     uint64_t image = 0;
     uint64_t frame = 0;
     uint64_t depth = 0;
+    uint64_t hud = 0;           /* LB_HUD_LAYER: the interface's tap image, 0 when none */
     uint32_t slot = 0, width = 0, height = 0, format = 0, layers = 1, depth_layers = 0;
     float camera[18] = {};
     bool has_camera = false;
@@ -82,6 +84,7 @@ std::atomic<uint32_t> g_mailbox_drops;  /* frames pushed out of a full mailbox b
 void *g_cache_state;
 std::unordered_map<uint64_t, Cached> g_cache;
 std::unordered_map<uint64_t, CachedDepth> g_depth_cache;  /* R32Float, sampled as it is */
+std::unordered_map<uint64_t, id<MTLTexture>> g_hud_cache;  /* LB_HUD_LAYER, through an sRGB view */
 PFN_vkExportMetalObjectsEXT g_export;
 
 uint64_t now_ns() { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW); }
@@ -98,6 +101,7 @@ Entry entry_of(const dxvk_present_tap_frame *frame) {
     entry.height = frame->height;
     entry.format = frame->vk_format;
     entry.depth = frame->depth_vk_image;
+    entry.hud = frame->hud_vk_image;
     entry.layers = frame->layers ? frame->layers : 1;
     entry.depth_layers = frame->depth_layers;
     entry.has_camera = skyrim_frame_camera(entry.camera) != 0;  /* called inside this frame's Present */
@@ -131,6 +135,7 @@ const Cached &cached(const Entry &entry) {
     if (entry.state != g_cache_state) {
         g_cache.clear();
         g_depth_cache.clear();
+        g_hud_cache.clear();
         g_cache_state = entry.state;
     }
     auto found = g_cache.find(entry.image);
@@ -171,6 +176,25 @@ const Cached &cached(const Entry &entry) {
                 (unsigned long)exported.pixelFormat, result.decode ? 0 : 1);
     }
     return g_cache[entry.image] = result;
+}
+
+id<MTLTexture> hud_texture(const Entry &entry) {
+    if (!entry.hud || !g_export) return nil;
+    auto found = g_hud_cache.find(entry.hud);
+    if (found != g_hud_cache.end()) return found->second;
+    VkExportMetalTextureInfoEXT texture = {VK_STRUCTURE_TYPE_EXPORT_METAL_TEXTURE_INFO_EXT};
+    texture.image = (VkImage)(uintptr_t)entry.hud;
+    texture.plane = VK_IMAGE_ASPECT_PLANE_0_BIT;
+    VkExportMetalObjectsInfoEXT info = {VK_STRUCTURE_TYPE_EXPORT_METAL_OBJECTS_INFO_EXT, &texture};
+    g_export((VkDevice)entry.device, &info);
+    id<MTLTexture> exported = texture.mtlTexture;
+    MTLPixelFormat srgb = exported.pixelFormat == MTLPixelFormatRGBA8Unorm ? MTLPixelFormatRGBA8Unorm_sRGB
+                                                                            : MTLPixelFormatBGRA8Unorm_sRGB;
+    id<MTLTexture> view = [exported newTextureViewWithPixelFormat:srgb];
+    fprintf(stderr, "immersive: slot %u hud exported %lux%lu, Metal format %lu, sRGB view %d\n", entry.slot,
+            (unsigned long)exported.width, (unsigned long)exported.height, (unsigned long)exported.pixelFormat,
+            view ? 1 : 0);
+    return g_hud_cache[entry.hud] = view ? view : exported;
 }
 
 const CachedDepth &depth_texture(const Entry &entry) {
@@ -368,6 +392,7 @@ extern "C" int skyrim_immersive_acquire(skyrim_immersive_frame *out) {
     }
     memcpy(out->camera, g_shown.camera, sizeof out->camera);
     out->has_camera = g_shown.has_camera ? 1 : 0;
+    out->hud_texture = (__bridge void *)hud_texture(g_shown);
     if (g_shown.eye_views && out->texture_eye2) {
         out->eye_views = 1;
         memcpy(out->eye_tangents, g_shown.eye_tangents, sizeof out->eye_tangents);
