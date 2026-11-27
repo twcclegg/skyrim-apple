@@ -388,7 +388,10 @@ void B_IDirect3DDevice9_SetRenderTarget(CPU *c) {
     if (g_d3d_trace) trace_surface("SetRenderTarget", ARG(1), s);
     if (s && ARG(1) == 0) {  // remember the scene's depth target (see d3d_scene_depth_target)
         D3DSURFACE_DESC desc;
-        if (SUCCEEDED(s->GetDesc(&desc)) && desc.Format == D3DFMT_R32F && desc.Width >= 640) g_scene_depth = s;
+        if (SUCCEEDED(s->GetDesc(&desc)) && desc.Format == D3DFMT_R32F && desc.Width >= 640) {
+            g_scene_depth = s;
+            d3d_scene_depth_bound(s);  // LB_SKIP_SCENE_DEPTH keeps it for the next frame's depth copy
+        }
     }
     if (in_pass() && ARG(1) == 0) {
         if (s && (s == g_from_rt || s == g_from_bb || s == g_rt)) { bind_rt(d); RET(0, 3); }

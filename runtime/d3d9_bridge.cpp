@@ -234,11 +234,13 @@ static const char *gpu_vendor_choice() {
     return v;
 }
 
+static void scene_depth_skip_apply(void);  // LB_SKIP_SCENE_DEPTH, below
 void B_IDirect3D9_GetAdapterIdentifier(CPU *c) {
     auto *d3d = (IDirect3D9 *)com_host(ARG(0));
     if (g_d3d_trace) d3d_trace(c, "IDirect3D9::GetAdapterIdentifier", 3);
     auto *id = (D3DADAPTER_IDENTIFIER9 *)GPTR(ARG(3));
     HRESULT hr = d3d->GetAdapterIdentifier(ARG(1), ARG(2), id);
+    scene_depth_skip_apply();  // LB_SKIP_SCENE_DEPTH, below: before the renderer's init reads the flag it sets
     const char *v = gpu_vendor_choice();
     if (SUCCEEDED(hr) && id && strcmp(v, "keep")) {
         uint32_t ven = 0x8086, dev = 0x5912;                     // Intel HD 630
@@ -431,6 +433,7 @@ void B_IDirect3DDevice9_Reset(CPU *c) {
     D3DPRESENT_PARAMETERS pp;
     pp_from_guest(ARG(1), &pp);
     { extern void hud_screen_reset(void); hud_screen_reset(); }
+    d3d_scene_depth_bound(nullptr);  // LB_SKIP_SCENE_DEPTH holds the R32F target; Reset needs it released
     rt_host_affinity_begin();
     HRESULT hr = d->Reset(&pp);
     rt_host_affinity_end();
@@ -1009,6 +1012,84 @@ static bool depth_copy_draw(void) {
     if (hr != 0) return false;
     g_depth_copied = true;
     return true;
+}
+
+/* LB_SKIP_SCENE_DEPTH=1: no second scene pass for depth, in the game itself rather than at the bridge.
+ *
+ * TESV 1.9.32 has three ways to give its effects the scene's depth as a texture, chosen once at renderer init
+ * (0xC6DBF0) and run per frame by 0xC95070, called from the batch renderer 0xC95280 after the main pass:
+ *   NVAPI   (byte 0x1BA75FD) NVIDIA only: NvAPI copies the depth buffer. Our runtime has no nvapi.dll.
+ *   RESZ    (byte 0x1BA75FF) AMD and Intel only, when CheckDeviceFormat accepts the 'RESZ' FOURCC: the game creates
+ *           an INTZ depth texture (0xC73810), binds it to sampler 0, draws one point with colour and depth writes
+ *           off and sets D3DRS_POINTSIZE to 0x7FA05000; the driver then copies the depth buffer into the texture.
+ *           DXVK implements it (D3D9DeviceEx::ResolveZ). The game's samplers then get the INTZ texture (0xC74670).
+ *   redraw  otherwise (Apple GPUs report vendor 0x106B; NVIDIA without NvAPI): 0xC94C30 draws the whole batch list
+ *           again with a depth technique into the back-buffer-sized R32F target (about 500-640 draws).
+ * The vendor check comes from GetAdapterIdentifier (0xC71080). This switch sets the RESZ byte just after the game's
+ * GetAdapterIdentifier call, before 0xC6DBF0 reads it, so the game takes the RESZ path whatever the vendor; the
+ * vendor itself is not changed (it also picks the alpha-to-coverage hack). Measured on the Linux build
+ * (notes/fresh-eyes-20261126/16-scene-depth-pass.md): the redraw costs 0.45-0.50 ms of main-thread time per frame
+ * (5-6% of the work), 0.40-0.47 ms of it still there with LB_DEPTH_COPY skipping its draws; the RESZ path leaves
+ * nothing of it.
+ *
+ * Side effects seen on Linux: the sun-shadow mask pass is drawn at the back buffer's size instead of 3/4 of it
+ * (more GPU work; shadow edges change slightly) and its depth is resolved too (a first RESZ). The R32F target is
+ * still created and still bound by the late (first-person) pass, but the world's depth is no longer drawn into it.
+ * Our own readers of that target (the immersive compositor's depth via the present tap, LB_SHOT's depth dumps)
+ * therefore get a copy here: at the RESZ made while the main scene target is bound, the main pass's depth-stencil is
+ * copied into the R32F target with dxvk_copy_depth_to_float (every stereo layer), as LB_DEPTH_COPY does.
+ * The target is learnt when the game binds it (it does so every frame, after the RESZ) and held with a reference
+ * until the next Reset; the first frame after a Reset has no copy.
+ * Not handled yet (see the notes): DXVK's ResolveZ copies one layer, so with LB_STEREO_MULTIVIEW=1 the game's own
+ * effects read a stale second layer; and whether the first-person depth still reaches the R32F target in this mode
+ * is unverified. */
+static int g_skip_scene_depth = -1;
+static IDirect3DSurface9 *g_resz_depth;  // the scene's R32F depth target, held (LB_SKIP_SCENE_DEPTH only)
+
+static void scene_depth_skip_apply(void) {
+    if (g_skip_scene_depth < 0) {
+        const char *e = getenv("LB_SKIP_SCENE_DEPTH");
+        g_skip_scene_depth = e && atoi(e) ? 1 : 0;
+#ifndef GAME_SKYRIM
+        g_skip_scene_depth = 0;  // the addresses are TESV 1.9.32's
+#endif
+        if (g_skip_scene_depth) {
+            const char *mv = getenv("LB_STEREO_MULTIVIEW");
+            LOG("LB_SKIP_SCENE_DEPTH: the game resolves its depth buffer (RESZ) instead of drawing the scene again%s",
+                mv && !strcmp(mv, "1") ? "; WARNING: with multiview the game's own depth reads see a stale right eye "
+                                         "until DXVK's ResolveZ copies every layer" : "");
+        }
+    }
+#ifdef GAME_SKYRIM
+    if (g_skip_scene_depth) M8(0x1BA75FF) = 1;  // the renderer's "RESZ available" byte (written by 0xC6DBF0)
+#endif
+}
+
+void d3d_scene_depth_bound(IDirect3DSurface9 *s) {
+    if (g_skip_scene_depth != 1 || s == g_resz_depth) return;
+    if (s) s->AddRef();
+    if (g_resz_depth) g_resz_depth->Release();
+    g_resz_depth = s;
+}
+
+void d3d_scene_depth_resz(IDirect3DDevice9 *d) {
+    if (g_skip_scene_depth != 1) return;
+    IDirect3DSurface9 *rt = nullptr, *ds = nullptr;
+    D3DSURFACE_DESC desc = {};
+    if (FAILED(d->GetRenderTarget(0, &rt)) || !rt) return;
+    rt->GetDesc(&desc);
+    rt->Release();
+    // The game resolves twice a frame: after the sun-shadow mask pass (an A8R8G8B8 target) and after the main pass
+    // (the A16B16G16R16F scene target, or A8R8G8B8 with bFloatPointRenderTarget=0). The second one is the world.
+    const bool main_target = desc.Width == g_bb_w && desc.Height == g_bb_h &&
+                             (desc.Format == D3DFMT_A16B16G16R16F || (desc.Format == D3DFMT_A8R8G8B8 && g_pass_frame.seen_main));
+    if (!main_target) return;
+    if (g_d3d_passes) g_pass_frame.seen_depth = true;  // effects after this point are "fx", as after the redraw
+    if (!g_resz_depth || FAILED(d->GetDepthStencilSurface(&ds)) || !ds) return;
+    const long hr = dxvk_copy_depth_to_float(d, ds, g_resz_depth);
+    ds->Release();
+    static int logged;
+    if (hr != 0 && logged++ < 3) LOG("LB_SKIP_SCENE_DEPTH: depth copy for the compositor failed (hr %08lx)", (unsigned long)hr);
 }
 
 static void passes_present(void) {

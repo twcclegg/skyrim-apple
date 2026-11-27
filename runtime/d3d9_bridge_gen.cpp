@@ -372,6 +372,7 @@ static void B_IDirect3DDevice9_SetRenderState(CPU *c) {
     IDirect3DDevice9 *self = (IDirect3DDevice9 *)com_host(ARG(0));
     if (g_d3d_trace) d3d_trace(c, "IDirect3DDevice9::SetRenderState", 2);
     auto r = bridge_call(self, &IDirect3DDevice9::SetRenderState, ARG(1), ARG(2));
+    if (ARG(1) == D3DRS_POINTSIZE && ARG(2) == D3D_RESZ_CODE) d3d_scene_depth_resz(self);
     RET((uint32_t)r, 3);
 }
 
