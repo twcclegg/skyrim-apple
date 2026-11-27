@@ -72,6 +72,10 @@ final class LauncherModel: ObservableObject {
     @Published private(set) var canPrepare = false
     @Published private(set) var runtimeReady = false
     @Published private(set) var session: Session = .idle
+    #if os(visionOS) && SKYRIM_NATIVE_RUNTIME
+    /// True while the immersive layer is drawing (ImmersiveCompositor reports its start and end).
+    @Published private(set) var immersiveSpaceRunning = false
+    #endif
     @Published private(set) var artworkImage: PlatformImage?
     @Published private(set) var logURL: URL?
     @Published var errorMessage: String?
@@ -125,6 +129,15 @@ final class LauncherModel: ObservableObject {
                 MainActor.assumeIsolated { self?.supportedInputDisconnected() }
             }
             .store(in: &subscriptions)
+        #if os(visionOS) && SKYRIM_NATIVE_RUNTIME
+        NotificationCenter.default.publisher(for: .skyrimImmersiveRunning)
+            .sink { [weak self] note in
+                // ImmersiveCompositor posts it on the main queue.
+                let running = (note.object as? Bool) ?? false
+                MainActor.assumeIsolated { self?.immersiveSpaceChanged(running: running) }
+            }
+            .store(in: &subscriptions)
+        #endif
         #if SKYRIM_NATIVE_RUNTIME
         if runtime == .nativeDevice {
             objectWillChange.sink { [weak self] _ in
@@ -271,6 +284,11 @@ final class LauncherModel: ObservableObject {
     }
 
     var isGameActive: Bool { session != .idle }
+
+    var isPaused: Bool {
+        if case .paused = session { return true }
+        return false
+    }
 
     // MARK: Game folder
 
@@ -543,6 +561,22 @@ final class LauncherModel: ObservableObject {
             break
         }
     }
+
+    #if os(visionOS) && SKYRIM_NATIVE_RUNTIME
+    /// The immersive layer started or ended. When it ends under a running game (Digital Crown, the system closing
+    /// the space) the game pauses instead of carrying on unwatched in the flat window; the Paused screen then
+    /// offers the way back in. ImmersivePolicy says when that pause would strand the game instead.
+    private func immersiveSpaceChanged(running: Bool) {
+        let ended = immersiveSpaceRunning && !running
+        immersiveSpaceRunning = running
+        guard ended else { return }
+        let gameRunning = session == .running || session == .launching
+        if ImmersivePolicy.pausesOnLeave(gameRunning: gameRunning, unattended: Self.simulatorAutoPlay,
+                                         launcherPresent: !Self.gameSceneMode) {
+            pause(reason: ImmersivePolicy.leftReason)
+        }
+    }
+    #endif
 
     #if os(macOS)
     /// Suspends the game once `run.sh` has exec'd into it, retrying while it is still starting.
