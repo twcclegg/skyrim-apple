@@ -3,6 +3,7 @@
 #define _GNU_SOURCE
 #include "rt.h"
 #include "import_inline.h"
+#include "comfort_ini.h"
 #if defined(__APPLE__)
 #include <TargetConditionals.h>
 #endif
@@ -116,13 +117,14 @@ static const char *ini_find(IniFile *f, const char *sec, const char *key) {
 /* LB_INI="Section:key=value;Section:key=value": values the game reads instead of its INI files' (any of them), for
  * benchmarking one setting at a time without editing the player's files. Each override is logged once, when the
  * game first reads it. */
-#define INI_OVERRIDES 32
+#define INI_OVERRIDES COMFORT_INI_MAX_ENTRIES
 static struct { char sec[64], key[64], val[64]; int logged; } g_ini_over[INI_OVERRIDES];
 static int g_ini_nover = -1;
 static const char *ini_override(const char *sec, const char *key) {
     if (g_ini_nover < 0) {
         g_ini_nover = 0;
-        const char *e = getenv("LB_INI");
+        /* With the comfort defaults for immersive play behind the player's own entries (comfort_ini.h). */
+        const char *e = comfort_ini_effective(getenv("LB_INI"));
         while (e && *e && g_ini_nover < INI_OVERRIDES) {
             while (*e == ' ') e++;  /* "a:b=1; c:d=2" */
             const char *end = strchr(e, ';'), *colon = strchr(e, ':'), *eq = strchr(e, '=');
