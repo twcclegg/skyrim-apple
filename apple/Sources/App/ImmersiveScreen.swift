@@ -941,12 +941,18 @@ final class ImmersiveCompositor: @unchecked Sendable {
     /// What the drawables and rate maps last logged looked like, so each is logged when it changes (at most 8 times).
     private var loggedDrawable = "", loggedDrawableCount = 0
     private var loggedRateMaps = "", loggedRateMapCount = 0
+    /// Calls to logDrawable; it looks only at every 90th (about once a second), so a steady drawable costs no
+    /// string building at the display rate.
+    private var drawableLogTick = 0
     /// How far the eye was from where the mesh's rays start (meters), over the drawn eyes: how much the per-pixel
     /// search had to correct, to read next to the cost switches.
     private var eyeOffsetSum: Double = 0, eyeOffsetMax: Double = 0, eyeOffsetCount = 0
 
-    /// Logs the drawable's texture and viewport sizes and its rasterization rate maps, when they change.
+    /// Logs the drawable's texture and viewport sizes and its rasterization rate maps, when they change (checked
+    /// about once a second).
     private func logDrawable(_ drawable: LayerRenderer.Drawable) {
+        drawableLogTick += 1
+        guard drawableLogTick % 90 == 1 else { return }
         if loggedDrawableCount < 8 {
             let colour = drawable.colorTextures.map { "\($0.width)x\($0.height)x\($0.arrayLength)" }.joined(separator: " ")
             let depth = drawable.depthTextures.map { "\($0.width)x\($0.height)" }.joined(separator: " ")
