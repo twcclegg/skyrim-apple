@@ -572,6 +572,7 @@ final class ImmersiveCompositor: @unchecked Sendable {
         hud.depthAttachmentPixelFormat = layer.configuration.depthFormat
         // Optional: without it the interface stays out of the layer, and the picture is still shown.
         do { hudPipeline = try device.makeRenderPipelineState(descriptor: hud) } catch { log("hud pipeline: \(error)") }
+        // The interface writes no depth, so visionOS's own late reprojection still sees the scene's depth under it.
         let always = MTLDepthStencilDescriptor()
         always.depthCompareFunction = .always
         always.isDepthWriteEnabled = false
@@ -1001,8 +1002,7 @@ final class ImmersiveCompositor: @unchecked Sendable {
                 }
                 if let hudPointer = game.hud_texture, let hudPipeline, let hudDepth, let place = heldModel ?? model,
                    let hud = Unmanaged<AnyObject>.fromOpaque(hudPointer).takeUnretainedValue() as? any MTLTexture {
-                    // LB_HUD_LAYER: the interface as a flat layer, never moved by the depth mesh (visionOS's own late
-                    // reprojection still sees the scene's depth under it: no depth is written here). With a camera, a
+                    // LB_HUD_LAYER: the interface as a flat layer, never moved by the depth mesh. With a camera, a
                     // plane hudDistance ahead of it spanning the game's field of view (so the reticle stays on the
                     // aim point), placed as the frame is but without the movement shift; without one (menus), over
                     // the screen the picture is shown on, just in front of it.
