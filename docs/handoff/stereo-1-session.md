@@ -4,6 +4,10 @@ The first time live per-eye stereo (DXVK multiview) runs on the Vision Pro. Ever
 the M1 and M5 Macs (issue #42). Under an hour of headset time, on AC power if possible: the Nov 15–16 session showed
 runs about 7% slower after two hours on battery, and *serious* thermal soon after.
 
+**Running it:** `tools/bench/session.py` drives a session like this one from a plan file, and `tools/bench/report.py`
+writes the tables; `tools/bench/sessions/budget.json` is this order as data (see "Headset sessions" in
+`tools/bench/README.md`).
+
 ## Build
 
 `main` at or after the merge of `true3d/leftovers` (DXVK twcclegg/dxvk-native, branch `skyrim-apple` plus any bump in

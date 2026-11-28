@@ -29,6 +29,8 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+import budget
+
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parent.parent
 RESULTS = REPO / "bench-results"
@@ -173,14 +175,26 @@ class Device:
         except subprocess.TimeoutExpired as expired:
             return (expired.stdout or b"").decode(errors="replace") + "\nbench: launch timed out\n"
 
+    def unlocked(self):
+        """True or False from devicectl's lock state; None when it can't tell (no answer, another output format)."""
+        try:
+            done = self.devicectl("device", "info", "lockState", "--device", self.udid, timeout=30)
+        except subprocess.TimeoutExpired:
+            return None
+        m = re.search(r"passcodeRequired: (true|false)", done.stdout)
+        return None if done.returncode or not m else m[1] == "false"
+
+    def push(self, source, destination):
+        """Copies a local file into the app's container (destination relative to it); returns devicectl's result."""
+        return self.devicectl("device", "copy", "to", "--device", self.udid, "--domain-type", "appDataContainer",
+                              "--domain-identifier", BUNDLE, "--source", str(source), "--destination", destination)
+
     def place_game_file(self, name, text):
         """Writes a small text file into the game folder (Documents/Skyrim), e.g. a console batch file."""
         with tempfile.TemporaryDirectory() as tmp:
             local = Path(tmp) / name
             local.write_text(text)
-            done = self.devicectl("device", "copy", "to", "--device", self.udid, "--domain-type", "appDataContainer",
-                                  "--domain-identifier", BUNDLE, "--source", str(local),
-                                  "--destination", f"Documents/Skyrim/{name}")
+            done = self.push(local, f"Documents/Skyrim/{name}")
             if done.returncode != 0:
                 fail(f"couldn't place {name} in the game folder: {done.stderr.strip()[-500:]}")
 
@@ -189,10 +203,13 @@ class Device:
                              "--domain-identifier", BUNDLE, "--subdirectory", folder).stdout
         return re.findall(r"^(\S+\.log)\s", out, re.M)
 
-    def pull(self, source, destination):
-        done = self.devicectl("device", "copy", "from", "--device", self.udid, "--domain-type", "appDataContainer",
+    def copy_from(self, source, destination):
+        """Copies a file out of the app's container; returns devicectl's result (its stderr says why it failed)."""
+        return self.devicectl("device", "copy", "from", "--device", self.udid, "--domain-type", "appDataContainer",
                               "--domain-identifier", BUNDLE, "--source", source, "--destination", str(destination))
-        return done.returncode == 0 and Path(destination).exists()
+
+    def pull(self, source, destination):
+        return self.copy_from(source, destination).returncode == 0 and Path(destination).exists()
 
 
 class Simulator:
@@ -431,6 +448,9 @@ def parse_log(text, scenario=None, console=""):
     if gpu:
         summary["gpu"] = gpu
     summary["meta"] = {"screenshot_frames": stalled}
+    # Per phase `budget` (GPU busy, cadence, compositor GPU, at-draw compiles, hitches) and run facts in meta
+    # (thermal, frame cap): budget.py.
+    budget.add_to_summary(summary, text, (scenario or {}).get("phases", {}), stalled, console)
     exited = any("exit frame" in n and "reached" in n for n in notes)
     return frames, shots, notes, summary, exited
 
@@ -513,12 +533,37 @@ def execute(scenario, args):
         (out / "summary.json").write_text(json.dumps(summary, indent=2))
         print("bench: WARNING BENCH_IMMERSIVE was set but the log has no immersive: lines; the game ran without the "
               "immersive space, so this is not a stereo run", file=sys.stderr)
+    thermal = summary["meta"].get("thermal", {}).get("worst")
+    if thermal in ("serious", "critical"):
+        print(f"bench: WARNING the run reached thermal state {thermal}; leave it out of comparisons", file=sys.stderr)
     if paging and paging["swapins"] + paging["swapouts"] > 1024:
         print(f"bench: WARNING the Mac swapped {paging['swapins']} MB in and {paging['swapouts']} MB out during the "
               "run; memory pressure slows everything, so check this run before comparing it", file=sys.stderr)
     if args.baseline:
         compare(Path(args.baseline), out)
     return out
+
+
+def reparse(run_dir, scenario=None):
+    """A results directory's summary rebuilt from its game.log and console.txt with today's parser. The phases come
+    from `scenario`, else from the old summary's meta (what the run actually used), else from the scenario it names;
+    the old meta (label, scenario, clean exit, notes) is kept."""
+    run_dir = Path(run_dir)
+    old = json.loads((run_dir / "summary.json").read_text()) if (run_dir / "summary.json").exists() else {}
+    meta = old.get("meta", {})
+    if scenario is None:
+        if meta.get("phases"):
+            scenario = {"name": meta.get("scenario", ""), "phases": meta["phases"]}
+        elif meta.get("scenario") and (HERE / "scenarios" / f"{meta['scenario']}.json").exists():
+            scenario = load_scenario(meta["scenario"])
+    log = (run_dir / "game.log").read_text(errors="replace")
+    console = (run_dir / "console.txt").read_text(errors="replace") if (run_dir / "console.txt").exists() else ""
+    *_, summary, exited = parse_log(log, scenario, console)
+    keep = {k: v for k, v in meta.items() if k not in summary["meta"]}
+    summary["meta"] = {**keep, **summary["meta"], "exited_cleanly": meta.get("exited_cleanly", exited)}
+    if scenario and "phases" not in summary["meta"]:
+        summary["meta"]["phases"] = scenario.get("phases", {})
+    return summary
 
 
 def print_summary(summary):
@@ -534,6 +579,44 @@ def print_summary(summary):
     if gpu:
         print(f"gpu busy {gpu['gpu_busy_pct']:.1f}%, {gpu['gpu_busy_ms']:.2f} ms per frame over {gpu['frames']} frames "
               "(whole run)")
+    for name, s in summary.items():
+        if name not in ("meta", "gpu") and isinstance(s, dict) and s.get("budget"):
+            line = budget_line(s["budget"])
+            if line:
+                print(f"{name:<12}{line}")
+    meta = summary.get("meta", {})
+    if meta.get("thermal"):
+        cap = meta.get("frame_cap_fps")
+        print(f"thermal {meta['thermal']['worst']} (worst), frame cap "
+              f"{'unknown' if cap is None else 'off' if cap == 0 else f'{cap} fps'}")
+
+
+def budget_line(b):
+    """One line of a phase's budget block, for the terminal."""
+    cells = []
+    c = b.get("cadence")
+    if c:
+        h = c["held"]
+        cells.append(f"held 1/2/3/4+ {h['1']}/{h['2']}/{h['3']}/{h['4+']}")
+        if c.get("game_gpu_latency_mean_ms") is not None:
+            cells.append(f"game gpu {c['game_gpu_latency_mean_ms']:.1f} ms")
+    if b.get("compositor_gpu"):
+        cells.append(f"compositor {b['compositor_gpu']['mean_ms']:.2f} ms")
+    g = b.get("gpu_busy")
+    if g:
+        cells.append(f"gpu busy {g['ms']:.1f} ms{' (capped)' if g['capped'] else ''}")
+    p = b.get("pipelines")
+    if p and (p["at_draw"] or p["ahead"]):
+        cells.append(f"at draw {p['at_draw']} / {p['at_draw_ms']:.0f} ms (longest {p['at_draw_max_ms']:.0f})")
+    if b.get("hitches"):
+        cells.append(f"hitches {b['hitches']['frames']}")
+    fb = b.get("frame_budget")
+    if fb and fb.get("budget_ms"):
+        cells.append(f"late {fb['late']} (> {fb['late_ms']:.1f} ms)")
+        if fb["fits"] is not None:
+            cells.append(f"fits {fb['budget_ms']:.1f} ms" if fb["fits"] else f"over {fb['budget_ms']:.1f} ms: "
+                         + ", ".join(fb["over"]))
+    return "   ".join(cells)
 
 
 def print_pass_table(phase, old, new):
@@ -611,9 +694,10 @@ def main(argv=None):
     step = steps.add_parser("compare")
     step.add_argument("baseline")
     step.add_argument("candidate")
-    step = steps.add_parser("parse")
-    step.add_argument("log")
+    step = steps.add_parser("parse", help="summarize a log, or re-parse a results directory")
+    step.add_argument("log", help="a game log, or a results directory (its phases come from its summary.json)")
     step.add_argument("--scenario")
+    step.add_argument("--write", action="store_true", help="with a results directory: rewrite its summary.json")
     args = parser.parse_args(argv)
 
     if args.step == "run":
@@ -625,8 +709,15 @@ def main(argv=None):
     elif args.step == "compare":
         sys.exit(compare(Path(args.baseline), Path(args.candidate)))
     elif args.step == "parse":
-        scenario = load_scenario(args.scenario) if args.scenario else None
-        *_, summary, exited = parse_log(Path(args.log).read_text(errors="replace"), scenario)
+        path = Path(args.log)
+        if path.is_dir():
+            summary = reparse(path, load_scenario(args.scenario) if args.scenario else None)
+            exited = summary["meta"].get("exited_cleanly")
+            if args.write:
+                (path / "summary.json").write_text(json.dumps(summary, indent=2))
+        else:
+            scenario = load_scenario(args.scenario) if args.scenario else None
+            *_, summary, exited = parse_log(path.read_text(errors="replace"), scenario)
         print_summary(summary)
         if not exited:
             print("bench: the log doesn't show a clean exit at the exit frame")

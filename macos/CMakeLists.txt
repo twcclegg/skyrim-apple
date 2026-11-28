@@ -184,6 +184,8 @@ if(EXISTS "${SKYRIM_PYTHON}")
     "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_dependencies.py")
   add_test(NAME runtime_config COMMAND "${SKYRIM_PYTHON}"
     "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_runtime_config.py")
+  add_test(NAME bench_summary COMMAND "${SKYRIM_PYTHON}" -B
+    "${SKYRIM_ROOT}/tools/bench/test_bench.py")
   add_test(NAME build_binding COMMAND "${SKYRIM_PYTHON}"
     "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_build_receipt.py")
   add_test(NAME private_staging COMMAND "${SKYRIM_PYTHON}"
