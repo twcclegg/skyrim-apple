@@ -529,7 +529,13 @@ static void B_IDirect3DDevice9_DrawPrimitive(CPU *c) {
     if (g_d3d_passes) d3d_passes_draw(ARG(3));
     if (g_fp_flame) d3d_fp_flame_draw(self, 0, ARG(1), ARG(2), ARG(3), 0, 0, 0);
     if (g_bisect && d3d_skip_draw()) { RET(0, 4); return; }
+    if (g_hidden_draws && d3d_hidden_probe()) {
+        bridge_call(self, &IDirect3DDevice9::DrawPrimitive, ARG(1), ARG(2), ARG(3));
+        d3d_hidden_probe_done();
+    }
+    if (g_hidden_draws) d3d_hidden_begin();
     auto r = bridge_call(self, &IDirect3DDevice9::DrawPrimitive, ARG(1), ARG(2), ARG(3));
+    if (g_hidden_draws) d3d_hidden_end();
     RET((uint32_t)r, 4);
 }
 
@@ -541,7 +547,13 @@ static void B_IDirect3DDevice9_DrawIndexedPrimitive(CPU *c) {
     if (g_d3d_passes) d3d_passes_draw(ARG(6));
     if (g_fp_flame) d3d_fp_flame_draw(self, 1, ARG(1), ARG(2), ARG(3), ARG(4), ARG(5), ARG(6));
     if (g_bisect && d3d_skip_draw()) { RET(0, 7); return; }
+    if (g_hidden_draws && d3d_hidden_probe()) {
+        bridge_call(self, &IDirect3DDevice9::DrawIndexedPrimitive, ARG(1), (INT)ARG(2), ARG(3), ARG(4), ARG(5), ARG(6));
+        d3d_hidden_probe_done();
+    }
+    if (g_hidden_draws) d3d_hidden_begin();
     auto r = bridge_call(self, &IDirect3DDevice9::DrawIndexedPrimitive, ARG(1), (INT)ARG(2), ARG(3), ARG(4), ARG(5), ARG(6));
+    if (g_hidden_draws) d3d_hidden_end();
     RET((uint32_t)r, 7);
 }
 
@@ -552,7 +564,13 @@ static void B_IDirect3DDevice9_DrawPrimitiveUP(CPU *c) {
     if (g_d3d_fp) d3d_fp_draw();
     if (g_d3d_passes) d3d_passes_draw(ARG(2));
     if (g_bisect && d3d_skip_draw()) { RET(0, 5); return; }
+    if (g_hidden_draws && d3d_hidden_probe()) {
+        bridge_call(self, &IDirect3DDevice9::DrawPrimitiveUP, ARG(1), ARG(2), GPTR(ARG(3)), ARG(4));
+        d3d_hidden_probe_done();
+    }
+    if (g_hidden_draws) d3d_hidden_begin();
     auto r = bridge_call(self, &IDirect3DDevice9::DrawPrimitiveUP, ARG(1), ARG(2), GPTR(ARG(3)), ARG(4));
+    if (g_hidden_draws) d3d_hidden_end();
     RET((uint32_t)r, 5);
 }
 
@@ -563,7 +581,13 @@ static void B_IDirect3DDevice9_DrawIndexedPrimitiveUP(CPU *c) {
     if (g_d3d_fp) d3d_fp_draw();
     if (g_d3d_passes) d3d_passes_draw(ARG(4));
     if (g_bisect && d3d_skip_draw()) { RET(0, 9); return; }
+    if (g_hidden_draws && d3d_hidden_probe()) {
+        bridge_call(self, &IDirect3DDevice9::DrawIndexedPrimitiveUP, ARG(1), ARG(2), ARG(3), ARG(4), GPTR(ARG(5)), ARG(6), GPTR(ARG(7)), ARG(8));
+        d3d_hidden_probe_done();
+    }
+    if (g_hidden_draws) d3d_hidden_begin();
     auto r = bridge_call(self, &IDirect3DDevice9::DrawIndexedPrimitiveUP, ARG(1), ARG(2), ARG(3), ARG(4), GPTR(ARG(5)), ARG(6), GPTR(ARG(7)), ARG(8));
+    if (g_hidden_draws) d3d_hidden_end();
     RET((uint32_t)r, 9);
 }
 
@@ -1560,6 +1584,7 @@ static void B_IDirect3DQuery9_GetDataSize(CPU *c) {
 static void B_IDirect3DQuery9_Issue(CPU *c) {
     IDirect3DQuery9 *self = (IDirect3DQuery9 *)com_host(ARG(0));
     if (g_d3d_trace) d3d_trace(c, "IDirect3DQuery9::Issue", 1);
+    if (g_hidden_draws) d3d_hidden_guest_issue(self, ARG(1));
     auto r = bridge_call(self, &IDirect3DQuery9::Issue, ARG(1));
     RET((uint32_t)r, 2);
 }
