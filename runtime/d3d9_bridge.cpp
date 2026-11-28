@@ -459,6 +459,25 @@ void d3d_trace(CPU *c, const char *name, int nargs) {
     if (strstr(name, "SetTransform") && ARG(2))
         for (uint32_t i = 0; i < 16; i++)
             fprintf(stderr, "%s%g", i % 4 ? " " : " | ", *(float *)GPTR(ARG(2) + 4 * i));
+    // Which shader: FNV-1a 64 of its bytecode and the length in bytes, so it can be found in the game's shader
+    // packages (tools/shader_index.py reads them) without the bytecode itself in the log.
+    const bool ps = strstr(name, "SetPixelShader") && !strstr(name, "Constant");
+    const bool vs = strstr(name, "SetVertexShader") && !strstr(name, "Constant");
+    if ((ps || vs) && ARG(1)) {
+        void *h = com_host(ARG(1));
+        UINT size = 0;
+        HRESULT hr = ps ? ((IDirect3DPixelShader9 *)h)->GetFunction(nullptr, &size)
+                        : ((IDirect3DVertexShader9 *)h)->GetFunction(nullptr, &size);
+        std::vector<uint8_t> code(size);
+        if (SUCCEEDED(hr) && size)
+            hr = ps ? ((IDirect3DPixelShader9 *)h)->GetFunction(code.data(), &size)
+                    : ((IDirect3DVertexShader9 *)h)->GetFunction(code.data(), &size);
+        if (SUCCEEDED(hr) && size) {
+            uint64_t f = 0xcbf29ce484222325ull;
+            for (uint8_t b : code) { f ^= b; f *= 0x100000001b3ull; }
+            fprintf(stderr, " fnv %016llx len %u", (unsigned long long)f, size);
+        }
+    }
     fprintf(stderr, "\n");
 }
 
