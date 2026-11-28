@@ -379,6 +379,7 @@ void B_IDirect3D9_GetAdapterDisplayMode(CPU *c) {
 static void fp_init(IDirect3DDevice9 *d);  // first-person depth, below
 static void passes_init(IDirect3DDevice9 *d);  // LB_PASSES, below
 static void d3d_passes_reset(IDirect3DDevice9 *d);
+static void stereo_mask_present(bool reset);  // eye views' per-eye targets, below
 
 void B_IDirect3D9_CreateDevice(CPU *c) {
     auto *d3d = (IDirect3D9 *)com_host(ARG(0));
@@ -431,6 +432,9 @@ void B_IDirect3DDevice9_Reset(CPU *c) {
     D3DPRESENT_PARAMETERS pp;
     pp_from_guest(ARG(1), &pp);
     { extern void hud_screen_reset(void); hud_screen_reset(); }
+    // Drop the refs the stereo passes hold on the game's targets first: Reset wants no default-pool resource
+    // referenced, and a failed Reset must not leave them held. They are looked for again afterwards.
+    stereo_mask_present(true);
     rt_host_affinity_begin();
     HRESULT hr = d->Reset(&pp);
     rt_host_affinity_end();
@@ -550,7 +554,7 @@ static void bisect_present(void) {
 
 // LB_PASSES=1 logs, at each Present, the frame's draw calls and primitives by the kind of pass they belong to, so
 // we can tell how much of a frame a second eye would have to draw again (twcclegg/skyrim-apple#23):
-//   pass <frame> shadow=<draws>/<prims> refl=.. main=.. depth=.. fp=.. mask=.. fx=.. post=.. ui=.. other=.. rt=<changes>
+//   pass <frame> shadow=<draws>/<prims> mask=.. main=.. depth=.. fp=.. fx=.. post=.. ui=.. other=.. rt=<changes>
 // <frame> is the one in the same frame's "ft" line (LB_FRAMETIMES), the classes add up to its draw count, and rt
 // counts changes of render target 0. LB_PASSES=2 also logs each run of draws of one class into one target, in the
 // LB_D3DTRACE frames (without it, the first frame), to check the classes against a real frame:
@@ -563,10 +567,10 @@ static void bisect_present(void) {
 int g_d3d_passes;
 static int g_passes_log;  // LB_PASSES: 0 no lines, 1 pass lines, 2 also passdbg and fpdbg lines
 enum PassClass {
-    PASS_SHADOW, PASS_REFL, PASS_MAIN, PASS_DEPTH, PASS_FP, PASS_MASK, PASS_FX, PASS_POST, PASS_UI, PASS_OTHER, PASS_COUNT
+    PASS_SHADOW, PASS_MASK, PASS_MAIN, PASS_DEPTH, PASS_FP, PASS_FX, PASS_POST, PASS_UI, PASS_OTHER, PASS_COUNT
 };
-static const char *const k_pass_names[PASS_COUNT] = {"shadow", "refl", "main", "depth", "fp",
-                                                     "mask",   "fx",   "post", "ui",    "other"};
+static const char *const k_pass_names[PASS_COUNT] = {"shadow", "mask", "main", "depth", "fp",
+                                                     "fx",     "post", "ui",   "other"};
 struct PassTotals { int draws; uint32_t prims; };  // per class and frame (a GPU time per class would go here too)
 struct PassTarget { void *rt; uint32_t w, h, fmt; bool ds, bb; };  // what draws go to now (rt: identity only)
 static PassTarget g_pass_biggest, g_pass_biggest_now;  // the largest non-back-buffer target drawn to: last frame, this one
@@ -594,8 +598,8 @@ static bool g_passdbg;
  * drawn with the game's first-person camera, whose projection has its own near plane (5; the world's is 15). Traced in
  * Riverwood (TESV 1.9.32.0.8, low preset, 1280x720) with empty hands, a sword, and a sword plus Flames, a frame draws
  * the first-person meshes in three places, each time after a SetTransform(D3DTS_PROJECTION) with that near plane:
- *   mask     into the 960x540 pass (the "refl" class), first depth only, then writing red only: the hands in what
- *            looks like the screen-space sun-shadow mask (10 draws with a sword: 5 + 5)
+ *   mask     into the 960x540 pass (the "mask" class), first depth only, then writing red only: the hands in the
+ *            screen-space sun-shadow mask (10 draws with a sword: 5 + 5)
  *   prepass  first thing in the main pass on the scene target, colour writes off: the hands' depth, so the world is not
  *            drawn behind them (5 draws). Skipping the late pass leaves flat silhouettes in the clear colour there.
  *   late     after the world's effects and the sun's first occlusion query, still before tone mapping:
@@ -620,6 +624,8 @@ static void (*g_fp_listener)(int kind);
 static void stereo_fp_changed(int kind);  // stereo captures with the eye offset on first-person draws only, below
 static bool stereo_skip_fp(void);         // stereo captures: a frame drawn with no first-person draws, below
 static void stereo_late_eyes(void);       // eye views, LB_EYE_LATE: the eyes turned toward the head, below
+static void stereo_mask_seen(void);       // eye views: the sun-shadow mask given a layer per eye, below
+static void stereo_mask_present(bool reset);
 
 // The kind of the first-person draw being made, from the target bound (FP_NONE outside first-person draws).
 static int fp_kind(void) {
@@ -658,17 +664,21 @@ extern "C" void skyrim_first_person_listen(void (*fn)(int kind)) { g_fp_listener
 //   post    the first draw into the back buffer since it was bound, if it is a quad (<= 2 primitives): the final
 //           image (seen in Riverwood; the game also draws one quad into the back buffer earlier in the frame)
 //   fp      a first-person draw (d3d_first_person, above; seen in Riverwood with empty hands, a sword and Flames),
-//           whatever the target: the late pass, and its prepass and mask draws otherwise counted as main and refl
+//           whatever the target: the late pass, and its prepass and mask draws otherwise counted as main and mask
 //   depth   an R32F colour target of back-buffer size: the scene's depth drawn again (seen, 638 draws)
 //   main    an A16B16G16R16F target of back-buffer size with a depth-stencil bound, before the depth pass (size and
 //           format seen, 620 draws; the depth-stencil and "before" unverified)
 //   fx      the same target after the depth pass (unverified)
 //   shadow  a depth-stencil bound, target not of back-buffer aspect: the 512x1024 shadow map, also the two 512x512
 //           targets of the traced frame (unverified)
-//   refl    a depth-stencil bound, back-buffer aspect but smaller: the reflection (960x540 at 1280x720 seen; that
-//           it has a depth-stencil and the shadow mask has none is unverified)
+//   mask    a depth-stencil bound, back-buffer aspect, and either smaller or back-buffer-sized A8R8G8B8 before the
+//           main and depth passes: the deferred sun-shadow mask, an A8R8G8B8 target of the back buffer's size times
+//           iShadowMaskQuarter/4 with its own D24S8 depth-stencil of that size (seen: 960x660 at 1280x880 with 3, 306
+//           draws writing red, sampling the shadow map; 1280x880 with 4, then with the main pass's depth-stencil;
+//           skipping it removes the sun's shadows). With an A8R8G8B8 scene target (bFloatPointRenderTarget=0) the
+//           main pass before the depth pass is counted here too. Formerly called "refl"; LB_SKIP_CLASS still takes
+//           that name.
 //   post    no depth-stencil and <= 2 primitives: full-screen quads, the luminance chain and filters (unverified)
-//   mask    no depth-stencil, back-buffer aspect but smaller: the deferred sun-shadow mask (unverified)
 //   fx      any other draw into a back-buffer-sized target after the depth pass (unverified)
 //   other   the rest
 static int pass_class(uint32_t prims) {
@@ -695,9 +705,8 @@ static int pass_class(uint32_t prims) {
     }
     if (f.fp) return PASS_FP;
     if (t.ds && !bb_aspect) return PASS_SHADOW;
-    if (t.ds && smaller) return PASS_REFL;
+    if (t.ds && (smaller || (bb_size && t.fmt == D3DFMT_A8R8G8B8 && !f.seen_main && !f.seen_depth))) return PASS_MASK;
     if (!t.ds && prims <= 2) return PASS_POST;
-    if (!t.ds && bb_aspect && smaller) return PASS_MASK;
     if (bb_size && f.seen_depth) return PASS_FX;
     return PASS_OTHER;
 }
@@ -716,7 +725,7 @@ static void passdbg_flush(void) {
 // class between draws, and at Present; the time from one mark to the next goes to the class of the first draw after
 // the first mark (a span with no draw goes to "other"). The queries are read without flushing a few frames later,
 // and each frame gets one line once its last timestamp is in:
-//   passgpu <frame> shadow=<ms> refl=.. main=.. depth=.. fp=.. mask=.. fx=.. post=.. ui=.. other=.. total=<ms>
+//   passgpu <frame> shadow=<ms> mask=.. main=.. depth=.. fp=.. fx=.. post=.. ui=.. other=.. total=<ms>
 //           marks=<n> zero=<n>
 // <frame> is the one of the frame's "pass" line (tools/bench/bench.py merges the two), total is the sum of the
 // classes (first mark to last), marks the timestamps of the frame (past GPU_MARKS the last span takes the rest of
@@ -862,7 +871,9 @@ void d3d_passes_draw(uint32_t prims) {
         dxvk_stereo_set_view_ui_offsets(on0, on1);
     }
     if (k == PASS_MAIN && g_depth_copy == 1 && !g_main_ds && g_pass_device) g_pass_device->GetDepthStencilSurface(&g_main_ds);
-    if (k == PASS_MAIN) stereo_late_eyes();
+    if (k == PASS_MASK) stereo_mask_seen();
+    // The first draws through the eyes' matrices: the mask (world or first-person draws into it), or the main pass.
+    if (k == PASS_MASK || k == PASS_MAIN || k == PASS_FP) stereo_late_eyes();
     if (g_passes_gpu) gpu_draw(k);
     PassFrame &f = g_pass_frame;
     f.cls[k].draws++;
@@ -977,7 +988,7 @@ static void passes_init(IDirect3DDevice9 *d) {
         if (g_depth_copy) LOG("LB_DEPTH_COPY: the R32F depth pass is a copy of the main pass's depth");
         if (const char *sc = getenv("LB_SKIP_CLASS")) {  // timing experiments: the picture is wrong by design
             for (int c = 0; c < PASS_COUNT; c++)
-                if (strstr(sc, k_pass_names[c])) g_skip_class_mask |= 1u << c;
+                if (strstr(sc, k_pass_names[c]) || (c == PASS_MASK && strstr(sc, "refl"))) g_skip_class_mask |= 1u << c;
             LOG("LB_SKIP_CLASS=%s: skipping pass classes mask %x", sc, g_skip_class_mask);
         }
         const bool fp_wanted = (fp && atoi(fp)) || getenv("LB_FP_SKIP") || (eye && atof(eye) != 0) || g_fp_flame
@@ -1022,6 +1033,7 @@ static void passes_present(void) {
         g_ui_shift_on = false;
     }
     if (g_main_ds) { g_main_ds->Release(); g_main_ds = nullptr; }
+    stereo_mask_present(false);
     if (!g_d3d_passes) return;
     g_pass_frame.fp_late = g_pass_frame.fp_proj = false;
     fp_update();
@@ -2344,24 +2356,110 @@ static bool stereo_live_multiview(void) {
     return on == 1;
 }
 
+/* Eye views: the sun-shadow mask per eye. The game draws the sun's shadows into a screen-space mask first (the
+ * "mask" pass class: an A8R8G8B8 target of the back buffer's size times iShadowMaskQuarter/4, with its own D24S8
+ * depth-stencil), through the scene camera, and the main pass reads it at each pixel's screen position. DXVK gives
+ * two layers only to back-buffer-sized targets, so below iShadowMaskQuarter=4 the mask is drawn once, through view
+ * 0's (the left eye's) matrices, and the right eye reads shadows placed for the left eye's frustum: with the
+ * headset's asymmetric eye frusta, a tilted plane near the face. So when a draw of the mask class goes to a one-layer
+ * A8R8G8B8 target smaller than the back buffer with a depth-stencil of its own size, both are noted, and at the next
+ * Present, if a main or depth pass followed in that frame, given a second layer (dxvk_stereo_make_layered): from the
+ * next frame the pass draws both views, each with its eye's matrices, and the main pass samples each eye's own layer.
+ * The candidates are what the pass detector classed as the mask (which itself goes by size, aspect and depth-stencil);
+ * a target that does not fit is remembered and passed over, and the search goes on, so a menu or item render that
+ * happens to come first does not stop the real mask from being layered.
+ * By default only with per-eye matrices (eye views; plain multiview's mono mask is off by the eye separation only).
+ * The test is that eye views are set up (stereo_matrix_mode), not that the eyes' matrices are live: those stay off
+ * while any menu is open, the loading screen included. Where the eyes stay set through menus (LB_STEREO_TEST_EYES on
+ * the Mac), the mask is layered at the world's first frame instead of about 40 frames later, and the mono pipelines
+ * for it are never compiled; layered while a menu is open, it is drawn per eye with the plain offset the menus use.
+ * The visionOS compositor clears the eyes while a menu or the loading screen has no camera, so there the mask is
+ * layered once the world's camera is back, much as before.
+ * LB_STEREO_MASK=1 also with plain multiview offsets, =0 never. Costs about one more mask pass of GPU time. */
+extern "C" int dxvk_stereo_multiview_enabled(void *device);         // dxvk_stereo.h
+extern "C" long dxvk_stereo_make_layered(void *device, void *surface);
+static IDirect3DSurface9 *g_mask_pending[2];  // colour target, depth-stencil: to be layered at the next Present
+static bool g_mask_done;                      // layered, or multiview off, since the device's last Reset
+static void *g_mask_skip;                     // the last mask-class target found not to fit (g_pass_target.rt)
+static void stereo_mask_seen(void) {
+    if (g_mask_done || g_mask_pending[0] || !g_pass_device || g_pass_target.rt == g_mask_skip) return;
+    static int want = -1;  // 0 never, 1 always, 2 with eye views
+    if (want < 0) { const char *e = getenv("LB_STEREO_MASK"); want = e && *e ? (atoi(e) ? 1 : 0) : 2; }
+    if (!want || (want == 2 && !stereo_matrix_mode())) return;  // eye views may start later
+    if (!dxvk_stereo_multiview_enabled(g_pass_device)) { g_mask_done = true; return; }
+    IDirect3DSurface9 *rt = nullptr, *ds = nullptr;
+    g_pass_device->GetRenderTarget(0, &rt);
+    g_pass_device->GetDepthStencilSurface(&ds);
+    D3DSURFACE_DESC rd = {}, dd = {};
+    if (rt) rt->GetDesc(&rd);
+    if (ds) ds->GetDesc(&dd);
+    const int rl = rt ? dxvk_stereo_surface_layers(rt) : 0, dl = ds ? dxvk_stereo_surface_layers(ds) : 0;
+    if (rl == 2 && dl == 2) {
+        g_mask_skip = g_pass_target.rt;  // back-buffer-sized (iShadowMaskQuarter=4): already drawn per eye
+    } else if (rt && ds && rl == 1 && rd.Format == D3DFMT_A8R8G8B8 && rd.Width < g_bb_w && dd.Width == rd.Width
+               && dd.Height == rd.Height) {
+        g_mask_pending[0] = rt;
+        g_mask_pending[1] = ds;
+        rt = ds = nullptr;
+    } else {
+        g_mask_skip = g_pass_target.rt;
+        static bool logged;
+        if (!logged) {
+            logged = true;
+            LOG("stereo: mask-class target %ux%u fmt %u (%d layers) with depth-stencil %ux%u (%d layers) is not a "
+                "shadow mask to layer: passed over (logged once)", rd.Width, rd.Height, (unsigned)rd.Format, rl,
+                dd.Width, dd.Height, dl);
+        }
+    }
+    if (rt) rt->Release();
+    if (ds) ds->Release();
+}
+// At Present, or before a Reset (the game may make its targets again: look again, layer nothing now).
+static void stereo_mask_present(bool reset) {
+    if (reset) { g_mask_done = false; g_mask_skip = nullptr; }
+    if (!g_mask_pending[0]) return;
+    // Only if a main or depth pass followed: the mask feeds the main pass. A frame with neither (a menu drawing a
+    // target that looks like the mask) layers nothing, and the search goes on next frame.
+    if (!reset && (g_pass_frame.seen_main || g_pass_frame.seen_depth)) {
+        D3DSURFACE_DESC rd = {};
+        g_mask_pending[0]->GetDesc(&rd);
+        // The depth-stencil first: a two-layer colour target with a one-layer depth-stencil would stay a mono pass
+        // whose second layer nobody draws, and the right eye would read that.
+        const long hd = dxvk_stereo_make_layered(g_pass_device, g_mask_pending[1]);
+        const long hr = hd == 0 ? dxvk_stereo_make_layered(g_pass_device, g_mask_pending[0]) : hd;
+        if (hd == 0 && hr == 0)
+            LOG("stereo: shadow mask %ux%u and its depth-stencil now drawn per eye (two layers)", rd.Width, rd.Height);
+        else
+            LOG("stereo: shadow mask %ux%u left mono: layering failed (hr %08lx/%08lx)", rd.Width, rd.Height,
+                (unsigned long)hd, (unsigned long)hr);
+        g_mask_done = true;
+    }
+    for (IDirect3DSurface9 *&s : g_mask_pending) { if (s) s->Release(); s = nullptr; }
+}
+
 // After Present: set the eye, and the clock, for the next frame.
 /* Eye views, stage 2 of plans/eye-views.md (LB_EYE_LATE=1): the game camera trails the head (head steering is a
  * closed loop on the camera the game last presented, about 10 degrees behind a 27 deg/s sweep on the Mac), and
- * each frame is rendered where its camera points. At the frame's first main-scene draw, when this frame's camera is
- * known, the eyes are turned from the camera toward where the head points now (skyrim_head_now), by at most
- * LB_EYE_LATE_MAX degrees each in heading and pitch (default 2: the compositor's default margin, so the eyes stay
- * inside what the game culls for), and the matrices and the eyes this frame reports are redone with them. The
+ * each frame is rendered where its camera points. At the frame's first draw of the sun-shadow mask, of the main
+ * pass or of a first-person mesh, whichever comes first (the first draws through the eyes' matrices: the hands may
+ * be drawn into the mask before the world; the camera is this frame's by then, since the game culls and draws the
+ * sun's shadow maps from it before any of them), the eyes are turned from the
+ * camera toward where the head points now (skyrim_head_now), by at most LB_EYE_LATE_MAX degrees each in heading
+ * and pitch (default 2: the compositor's default margin, so the eyes stay inside what the game culls for), and the
+ * matrices and the eyes this frame reports are redone with them. Turning them at the main pass instead left the
+ * mask drawn through the unturned eyes, and the shadows swam with the head. The
  * compositor places each eye's picture by the reported pose, so the picture comes out where the head looks and
  * only the remaining difference is corrected there. g_late_done: once per frame. */
 static bool g_late_done;
 /* Why late eyes did or didn't apply to a frame, counted per 300 frames and logged while LB_EYE_LATE=1 is requested
- * but inactive (stereo_late_report). LATE_NOT_CALLED: no draw of the frame was classed as the main pass, so
- * stereo_late_eyes never ran; the frame's largest render target is logged with it, to show what the scene used. */
+ * but inactive (stereo_late_report). LATE_NOT_CALLED: no draw of the frame was classed as the mask, main or
+ * first-person pass, so stereo_late_eyes never ran; the frame's largest render target is logged with it, to show
+ * what the scene used. */
 enum { LATE_APPLIED, LATE_NOT_CALLED, LATE_NO_MATRICES, LATE_NO_EYES, LATE_MENU, LATE_NO_CAMERA, LATE_NO_HEAD,
        LATE_STEEP, LATE_NO_FRUSTUM, LATE_COUNT };
-static const char *const k_late_why[LATE_COUNT] = {"applied", "no main-pass draw", "no live eye matrices",
-    "no eyes from the compositor", "menu open", "no world camera", "no head pose (steering not anchored)",
-    "camera pitch too steep", "no valid frustum"};
+static const char *const k_late_why[LATE_COUNT] = {"applied", "no mask, main or first-person draw",
+    "no live eye matrices", "no eyes from the compositor", "menu open", "no world camera",
+    "no head pose (steering not anchored)", "camera pitch too steep", "no valid frustum"};
 static int g_late_why = LATE_NOT_CALLED;
 extern "C" int skyrim_head_now(float *heading, float *pitch);  // platform_sdl.c
 static void stereo_late_eyes(void) {
@@ -2748,6 +2846,8 @@ static void stereo_before_present(IDirect3DDevice9 *) {}
 static void stereo_after_present(void) {}
 static void stereo_fp_changed(int) {}
 static void stereo_late_eyes(void) {}
+static void stereo_mask_seen(void) {}
+static void stereo_mask_present(bool) {}
 static bool stereo_skip_fp(void) { return false; }
 static void vr180_before_present(IDirect3DDevice9 *) {}
 static void vr180_after_present(void) {}
