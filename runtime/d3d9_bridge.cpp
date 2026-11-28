@@ -552,8 +552,10 @@ static void bisect_present(void) {
 
 // LB_PASSES=1 logs, at each Present, the frame's draw calls and primitives by the kind of pass they belong to, so
 // we can tell how much of a frame a second eye would have to draw again (twcclegg/skyrim-apple#23):
-//   pass <frame> shadow=<draws>/<prims> refl=.. main=.. depth=.. fp=.. mask=.. fx=.. post=.. ui=.. other=.. rt=<changes>
-// <frame> is the one in the same frame's "ft" line (LB_FRAMETIMES), the classes add up to its draw count, and rt
+//   pass <frame> shadow=<draws>/<prims> refl=.. main=.. depth=.. fp=.. mask=.. fx=.. post=.. ui=.. other=..
+//        overlay=<draws> rt=<changes>
+// <frame> is the one in the same frame's "ft" line (LB_FRAMETIMES), the classes add up to its draw count, overlay
+// counts the ui draws live stereo placed as the interface through stereo_ui_overlay (the screen blood), and rt
 // counts changes of render target 0. LB_PASSES=2 also logs each run of draws of one class into one target, in the
 // LB_D3DTRACE frames (without it, the first frame), to check the classes against a real frame:
 //   passdbg <frame> <class> <w>x<h> fmt=<D3DFORMAT> ds=<depth-stencil bound> draws=<n> prims=<n>
@@ -583,7 +585,9 @@ struct PassFrame {
     bool fp_late;                         // in the late pass: after its Clear of depth only, until its projection ends
     bool fp_late_confirmed;               // ... and its projection was seen to be the first-person one
     bool fp_proj;                         // the projection set last is the first-person one
-    bool overlay_proj;                    // ... a perspective one of neither the world camera nor the first person
+    bool overlay_proj;                    // ... the screen blood's camera (near plane 1, neither world nor first person)
+    float overlay_near, overlay_world;    // its near plane, and the world camera's when it was set (for the log)
+    int overlay_draws;                    // draws placed as the interface by stereo_ui_overlay
     bool fp;                              // fp_late || fp_proj, and a target that allows it
     bool fp_last_draw;                    // the frame's previous draw was a first-person one
     int fp_runs, fp_kind_draws[FP_KINDS]; // runs of consecutive first-person draws; draws by kind (index = kind)
@@ -926,6 +930,19 @@ static void gpu_init(IDirect3DDevice9 *d) {
         (unsigned long long)freq);
 }
 
+// The first draw of a run placed as the interface by stereo_ui_overlay: one line per distinct near plane, so a camera
+// the rule catches is never silent.
+static void overlay_log(void) {
+    static std::vector<float> logged;
+    const PassFrame &f = g_pass_frame;
+    for (float n : logged)
+        if (fabsf(n - f.overlay_near) <= 1e-3f * n) return;
+    if (logged.size() >= 16) return;
+    logged.push_back(f.overlay_near);
+    LOG("overlay projection near %g (world %g, first person %g): its interface draws are placed as the HUD",
+        f.overlay_near, f.overlay_world, g_fp_near);
+}
+
 void d3d_passes_draw(uint32_t prims) {
     {
         const PassTarget &t = g_pass_target;
@@ -940,7 +957,9 @@ void d3d_passes_draw(uint32_t prims) {
         dxvk_stereo_set_view_ui_offsets(on0, on1);
     }
     const bool overlay = g_ui_shift_on && k == PASS_UI && g_pass_frame.overlay_proj;
+    if (overlay && !g_ui_overlay_on) overlay_log();
     if (overlay != g_ui_overlay_on) stereo_ui_overlay(overlay);
+    if (overlay) g_pass_frame.overlay_draws++;
     if (k == PASS_MAIN && g_depth_copy == 1 && !g_main_ds && g_pass_device) g_pass_device->GetDepthStencilSurface(&g_main_ds);
     if (k == PASS_MAIN) stereo_late_eyes();
     if (g_passes_gpu) gpu_draw(k);
@@ -1039,7 +1058,11 @@ void d3d_passes_projection(const float *m) {
         f.fp_late = false;
     }
     f.fp_proj = same(near_plane, g_fp_near) && !same(near_plane, world);
-    f.overlay_proj = world > 0 && near_plane > 0 && !same(near_plane, world) && !same(near_plane, g_fp_near);
+    // The screen blood's camera, traced: near plane 1 (the world's is 15, the first person's 5). Any other camera of
+    // the game's own keeps going through the eyes' matrices.
+    f.overlay_proj = world > 0 && same(near_plane, 1.0f) && !same(near_plane, world) && !same(near_plane, g_fp_near);
+    f.overlay_near = near_plane;
+    f.overlay_world = world;
     fp_update();
 }
 
@@ -1125,7 +1148,7 @@ static void passes_present(void) {
     for (int i = 0; i < PASS_COUNT && n < (int)sizeof line; i++)
         n += snprintf(line + n, sizeof line - n, " %s=%d/%u", k_pass_names[i], g_pass_frame.cls[i].draws,
                       g_pass_frame.cls[i].prims);
-    LOG("%s rt=%d", line, g_pass_frame.rt_changes);
+    LOG("%s overlay=%d rt=%d", line, g_pass_frame.overlay_draws, g_pass_frame.rt_changes);
     if (g_passes_gpu) gpu_present(platform_frame_count());
     g_pass_frame = PassFrame();
     g_passdbg = g_passes_log == 2 && g_d3d_trace;
@@ -2409,33 +2432,13 @@ static void stereo_before_present(IDirect3DDevice9 *d) {
         slot->fp_only ? " (first person only)" : slot->skip_fp ? " (no first person)" : "", tag);
 }
 
-// The first-person flag changed (fp_update): on first-person-only frames the shift follows it.
-static void stereo_fp_changed(int kind) {
-    const StereoState &st = g_stereo;
-    if (st.on && st.fp_only) dxvk_stereo_set_clip_shift(kind != FP_NONE ? st.k_applied : 0.0f);
-    // Live per-eye matrices: first-person draws through their own projection's inverse.
-    if (g_live_m_valid) {
-        const bool fp = kind != FP_NONE && g_live_m_fp_valid;
-        dxvk_stereo_set_view_clip_matrices(fp ? g_live_m_fp[0] : g_live_m_world[0], fp ? g_live_m_fp[1] : g_live_m_world[1]);
-    }
-}
-static bool stereo_skip_fp(void) { return g_stereo.skip_fp; }
-
-/* Live stereo: interface draws made while the projection set last is a camera of its own (overlay_proj, from
- * d3d_passes_projection: perspective, with neither the world camera's near plane nor the first person's) get the
- * interface's offset on every vertex. DXVK gives that offset only to vertices with w within 1e-5 of 1; the others
- * count as perspective and go through the eyes' matrices, which undo the world camera's projection. The screen blood
- * is drawn so: its quads (pixel shader constants BloodColor, BloodAlpha) and the glint drawn just before them
- * (FlareColor, FlareHDR: the same quads, scaled slightly about the sun's place on the screen) come from a camera
- * with near plane 1, at w = 1.00001. Through the world's inverse they came out at the world camera's near plane,
- * about 20 cm in front of the eyes, and magnified by the game's field of view over the eye's. The interface draws
- * after them in the frame (the HUD) see the same projection, but their vertices are at w = 1, which the matrices
- * leave alone. As matrices: clip x and y move by the offset times w (the same offset on the screen whatever w is),
- * and the perspective shift is off while they draw. Off again, the frame's matrices and shift are put back. */
-static void stereo_ui_overlay(bool on) {
-    g_ui_overlay_on = on;
+/* The per-view clip matrices for the draws being made, from the state that decides them: the interface offset on
+ * every vertex while stereo_ui_overlay is on; otherwise, with live per-eye matrices, the first person's for
+ * first-person draws (through their own projection's inverse) and the world's for the rest; otherwise identity.
+ * Everything that changes one of those inputs calls this, so none of them overwrites another's choice. */
+static void stereo_apply_frame_matrices(void) {
     static const float identity[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
-    if (on) {
+    if (g_ui_overlay_on) {
         float m[2][16];
         for (int e = 0; e < 2; e++) {
             memcpy(m[e], identity, sizeof identity);
@@ -2443,17 +2446,40 @@ static void stereo_ui_overlay(bool on) {
             m[e][13] = -g_ui_k[e][1];
         }
         dxvk_stereo_set_view_clip_matrices(m[0], m[1]);
-        dxvk_stereo_set_clip_shift(0.0f);
-        return;
-    }
-    const StereoState &st = g_stereo;
-    if (g_live_m_valid) {
+    } else if (g_live_m_valid) {
         const bool fp = fp_kind() != FP_NONE && g_live_m_fp_valid;
         dxvk_stereo_set_view_clip_matrices(fp ? g_live_m_fp[0] : g_live_m_world[0], fp ? g_live_m_fp[1] : g_live_m_world[1]);
     } else {
         dxvk_stereo_set_view_clip_matrices(identity, identity);
     }
-    dxvk_stereo_set_clip_shift(st.fp_only && fp_kind() == FP_NONE ? 0.0f : st.k_applied);
+}
+
+// The first-person flag changed (fp_update): on first-person-only frames the shift follows it.
+static void stereo_fp_changed(int kind) {
+    const StereoState &st = g_stereo;
+    if (st.on && st.fp_only) dxvk_stereo_set_clip_shift(kind != FP_NONE ? st.k_applied : 0.0f);
+    if (g_live_m_valid) stereo_apply_frame_matrices();  // kind == fp_kind() here
+}
+static bool stereo_skip_fp(void) { return g_stereo.skip_fp; }
+
+/* Live stereo: interface draws made while the projection set last is the screen blood's camera (overlay_proj, from
+ * d3d_passes_projection: perspective with near plane 1, which is neither the world camera's nor the first person's)
+ * get the interface's offset on every vertex. Other cameras of the game's own are left alone; each near plane the rule
+ * catches is logged once (overlay_log), and LB_PASSES counts the draws (overlay=). DXVK gives that offset only to
+ * vertices with w within 1e-5 of 1; the others count as perspective and go through the eyes' matrices, which undo the
+ * world camera's projection. The screen blood is drawn so: its quads (pixel shader constants BloodColor, BloodAlpha)
+ * and the glint drawn just before them (FlareColor, FlareHDR: the same quads, scaled slightly about the sun's place on
+ * the screen) come from a camera with near plane 1, at w = 1.00001. Through the world's inverse they came out at the
+ * world camera's near plane, about 20 cm in front of the eyes, and magnified by the game's field of view over the
+ * eye's. The interface draws after them in the frame (the HUD) see the same projection, but their vertices are at
+ * w = 1, which the matrices leave alone. As matrices: clip x and y move by the offset times w (the same offset on the
+ * screen whatever w is), and the perspective shift is off while they draw (stereo_apply_frame_matrices). Off again,
+ * the frame's matrices and shift are put back. */
+static void stereo_ui_overlay(bool on) {
+    g_ui_overlay_on = on;
+    stereo_apply_frame_matrices();
+    const StereoState &st = g_stereo;
+    dxvk_stereo_set_clip_shift(on || (st.fp_only && fp_kind() == FP_NONE) ? 0.0f : st.k_applied);
 }
 
 static bool stereo_live_multiview(void) {
@@ -2542,8 +2568,7 @@ static void stereo_late_eyes(void) {
     g_late_why = LATE_APPLIED;
     memcpy(g_live_m_world, m, sizeof m);
     g_live_m_fp_valid = g_fp_near > 0 && stereo_eye_matrices(cam, g_stereo.d, eyes, g_live_m_fp, g_fp_near, far_scale);
-    const bool fp = fp_kind() != FP_NONE && g_live_m_fp_valid;
-    dxvk_stereo_set_view_clip_matrices(fp ? g_live_m_fp[0] : m[0], fp ? g_live_m_fp[1] : m[1]);
+    stereo_apply_frame_matrices();
     { std::lock_guard<std::mutex> hold(g_stereo_eyes_lock); g_eyes_drawing = eyes; }
     static int logged;
     if (++logged % 300 == 1)
@@ -2666,7 +2691,7 @@ static void stereo_after_present(void) {
             memcpy(g_live_m_world, m, sizeof m);
             g_live_m_valid = true;
             g_live_m_fp_valid = g_fp_near > 0 && stereo_eye_matrices(cam, st.d, eyes, g_live_m_fp, g_fp_near);
-            dxvk_stereo_set_view_clip_matrices(m[0], m[1]);  // the eyes' cameras; no offset on top
+            stereo_apply_frame_matrices();  // the eyes' cameras (the world's: no draw is first-person between frames)
             matrices_set = true;
         } else if (r > l) {
             k = 2.0f / (r - l) * -st.d;
@@ -2674,9 +2699,8 @@ static void stereo_after_present(void) {
     }
     if (!matrices_set && g_live_m_valid) {
         // Back to the plain offset: the matrices stay in DXVK until replaced, so reset them.
-        static const float identity[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
-        dxvk_stereo_set_view_clip_matrices(identity, identity);
         g_live_m_valid = g_live_m_fp_valid = false;
+        stereo_apply_frame_matrices();
     }
     if (eye) st.cam_applied_valid = valid || (eye == 'C' && game_camera_read(&st.cam_applied));
     st.k_applied = k;

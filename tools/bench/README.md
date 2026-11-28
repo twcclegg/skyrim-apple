@@ -28,9 +28,10 @@ come from private game files).
 ## Draws per pass (`LB_PASSES`)
 
 `--env LB_PASSES=1` adds one line per frame next to the `ft` line, with the frame's draw calls and primitives by
-the kind of pass they belong to (the classes add up to the `ft` draw count; `rt` counts render-target changes):
+the kind of pass they belong to (the classes add up to the `ft` draw count; `overlay` counts the `ui` draws live
+stereo places as the interface through their own camera, the screen blood; `rt` counts render-target changes):
 
-    pass <frame> shadow=<draws>/<prims> refl=… main=… depth=… fp=… mask=… fx=… post=… ui=… other=… rt=<n>
+    pass <frame> shadow=<draws>/<prims> refl=… main=… depth=… fp=… mask=… fx=… post=… ui=… other=… overlay=<n> rt=<n>
 
 The classes are guessed from the bound targets (size and format relative to the back buffer, whether a
 depth-stencil is bound, depth-only clears, quads); the rules and which of them are unverified are in
