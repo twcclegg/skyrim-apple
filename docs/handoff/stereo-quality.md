@@ -45,15 +45,20 @@ its scenes simply have more within arm's reach. "Stronger" therefore needs an ex
 
 ## What was built
 
-All off by default, in `apple/Sources/App/ImmersiveScreen.swift`, set in `launch-env.json` like the other
-`LB_IMMERSIVE_*` switches.
+In `apple/Sources/App/ImmersiveScreen.swift`, set in `launch-env.json` like the other `LB_IMMERSIVE_*`
+switches. The search is on by default; the eye separation switch is off.
 
-- **`LB_IMMERSIVE_REFINE=<steps>`: per-pixel depth search in the fragment shader** (0 = off; 2 is enough,
-  more changes nothing measurable). Starting from the mesh, each step takes the depth of the game pixel the
-  eye's ray is thought to show, moves to where the ray reaches that distance and looks up the game pixel
-  there. A ray that keeps jumping between a near and a far surface is looking past the near one's edge at
-  something the game's camera never saw, and shows the far surface's pixel. With it on, the mesh is kept
-  whole (edge triangles are no longer laid flat), so there are no gaps.
+- **`LB_IMMERSIVE_REFINE=<steps>`: per-pixel depth search in the fragment shader** (default 4, 0 = off, at
+  most 8; on these captures more than 2 steps changed nothing measurable). Starting from the mesh, each step
+  takes the depth of the game pixel the eye's ray is thought to show, moves to where the ray reaches that
+  distance and looks up the game pixel there. A ray that keeps jumping between a near and a far surface is
+  looking past the near one's edge at something the game's camera never saw, and shows the far surface's
+  pixel. A ray that never reaches that distance, reaches it behind where the rays start, or leaves the
+  picture keeps the pixel it had. With it on, the mesh is kept whole (edge triangles are no longer laid
+  flat), so there are no gaps and the `LB_IMMERSIVE_HOLES` fill is not drawn; with `LB_IMMERSIVE_REFINE=0`
+  both come back. Under `LB_IMMERSIVE_MOTION=1` the player's hands and weapon are placed differently from
+  the world (`docs/handoff/camera-motion.md`), so pixels nearer than 1.5 times `LB_IMMERSIVE_MOTION_NEAR_M`
+  skip the search and show the mesh alone.
 - **`LB_IMMERSIVE_IPD_SCALE=<k>`: eye separation for drawing, as a multiple of the wearer's** (default 1).
   Above 1 gives proportionally more disparity at every distance, and the world looks smaller by the same
   factor. Unlike `LB_IMMERSIVE_HEAD_SCALE` below 1 it does not also multiply the parallax from moving the
@@ -109,11 +114,12 @@ plain camera offset; how it feels is a headset question.
 
 One change per test, each with the usual head-mode settings (`LB_IMMERSIVE_HEAD=1`, `LB_ANY_PAD=1`):
 
-1. `LB_IMMERSIVE_REFINE=2`. Look at the outlines of near things against far ones (posts, people, the well's
-   crossbar) and at thin things (branches, railings). Before: a dark sliver on one side in each eye, shimmering
-   as the head moves, and thin things flat against what is behind them. After: clean outlines; behind an
-   object's edge the background is repeated for a few pixels instead. The log line `compositor gpu … ms per
-   frame` gives the cost; compare it with the same scene without the switch.
+1. The search (on by default) against `LB_IMMERSIVE_REFINE=0`. Look at the outlines of near things against far
+   ones (posts, people, the well's crossbar) and at thin things (branches, railings). Without it: a dark sliver
+   on one side in each eye, shimmering as the head moves, and thin things flat against what is behind them.
+   With it: clean outlines; behind an object's edge the background is repeated for a few pixels instead. The
+   log line `compositor gpu … ms per frame` gives the cost, and `LB_IMMERSIVE_PASS_TIME=1` splits it into the
+   vertex and fragment stages; compare 0, 2 and 4 steps in the same scene.
 2. `LB_FOV=80` in place of 100, same build. Sharper centre (10 against 7 pixels per degree), less picture to
    turn into before the game catches up.
 3. `LB_IMMERSIVE_IPD_SCALE=1.3` if depth still reads as weak. The world will look about a quarter smaller;
