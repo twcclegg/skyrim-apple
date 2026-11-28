@@ -174,9 +174,10 @@ class ShaderIndexTest(unittest.TestCase):
             with self.assertRaises(si.FormatError):
                 si.walk_fxp(package)
         self.write("Data/Update.bsa", bsa({"shadersfx\\shaders002.fxp": b"junk" * 5}))
-        status, text = run("index", self.game)
-        self.assertEqual(status, 1)
-        self.assertIn("shaders002.fxp", text)
+        status, text = run("index", self.game)                                     # skipped and named, the rest read
+        self.assertEqual(status, 0, text)
+        self.assertIn("skipped, doesn't parse: Data/Update.bsa: shadersfx\\shaders002.fxp", text)
+        self.assertIn(key(self.main_ps[0]), {e["key"] for e in si.build_index(self.game)["shaders"]})
 
     def test_missing_sources(self):
         os.remove(os.path.join(self.game, "Data/Update.bsa"))
@@ -185,6 +186,14 @@ class ShaderIndexTest(unittest.TestCase):
         self.assertEqual(table["missing"], ["Data/Update.bsa", "TESV.exe"])
         self.assertTrue(next(e for e in table["shaders"] if e["key"] == key(self.old_variant))["live"])
         self.assertEqual(run("index", os.path.join(self.root, "nowhere"))[0], 1)
+        empty = os.path.join(self.root, "empty")
+        os.makedirs(empty)
+        first, _ = self.caches()
+        for command in (["verify", empty, first], ["siblings", empty, first, first]):
+            status, text = run(*command)                                           # a wrong folder isn't 0% coverage
+            self.assertEqual(status, 1, text)
+            self.assertIn("no shaders found", text)
+            self.assertIn("not found: TESV.exe", text)
 
     def caches(self):
         vs, ps = key(self.vs[0]), key(self.variants[0x10])
@@ -260,6 +269,12 @@ class ShaderIndexTest(unittest.TestCase):
         self.assertEqual(status, 0, text)
         self.assertIn("light-count siblings: 0 of 2", text)
         self.assertIn("drop --raw", text)
+        # a normalising build also clears blending and swizzle where the pixel shader writes nothing
+        on = [0x80000001] + [0] * 7
+        a = self.write("a.dxvk-cache", cache(11, [entry(11, vs, ps[0x10], colour=97, fill=0, blend=on)]))
+        b = self.write("b.dxvk-cache", cache(11, [entry(11, vs, ps[0x20], colour=97, fill=0, blend=[0] * 8)]))
+        self.assertIn("light-count siblings: 1 of 1", run("siblings", self.game, a, b)[1])
+        self.assertIn("light-count siblings: 0 of 1", run("siblings", self.game, a, b, "--raw")[1])
         short = struct.pack("<I", 1) + bytes.fromhex(vs) + struct.pack("<I", 16) + bytes.fromhex(ps[0x20]) + bytes(30)
         short = struct.pack("<I", 0x11 | (len(short) << 8)) + hashlib.sha1(short).digest() + short
         status, text = run("siblings", self.game, a, self.write("c.dxvk-cache", cache(11, [short])))
@@ -285,7 +300,32 @@ class ShaderIndexTest(unittest.TestCase):
         self.assertEqual(found, {self.vs[0]: 1, self.exe_vs: 1, self.variants[0x10]: 16, self.exe_ps: 16,
                                  self.main_ps[0]: 16})
         self.assertEqual(os.stat(out).st_mode & 0o077, 0)
-        self.assertEqual(run("dxso", self.game, "--all", "--out", out)[0], 0)
+        status, text = run("dxso", self.game, "--all", "--out", out)
+        self.assertEqual(status, 0, text)
+        with open(out, "rb") as fh:
+            data = fh.read()
+        self.assertNotIn(self.exe_ps, data)                                        # executable hits need a cache
+        self.assertNotIn(self.exe_vs, data)
+        self.assertIn(self.variants[0x20], data)
+        status, text = run("dxso", self.game, first, "--all", "--out", out)
+        self.assertEqual(status, 0, text)
+        with open(out, "rb") as fh:
+            data = fh.read()
+        self.assertIn(self.exe_ps, data)
+        self.assertIn(self.variants[0x20], data)
+        os.chmod(out, 0o644)
+        for game in (os.path.join(self.root, "nowhere"), os.path.join(self.root, "game", "Data")):
+            status, text = run("dxso", game, "--all", "--out", out)               # a wrong path leaves the file alone
+            self.assertEqual(status, 1, text)
+            with open(out, "rb") as fh:
+                self.assertEqual(fh.read(), data)
+        status, text = run("dxso", self.game, self.write("e.dxvk-cache", cache(10, [entry(10, *self.fixed)])),
+                           "--out", out)
+        self.assertEqual(status, 1, text)                                          # nothing to write
+        self.assertIn("left as it was", text)
+        self.assertEqual(run("dxso", self.game, first, "--out", out)[0], 0)
+        self.assertEqual(os.stat(out).st_mode & 0o077, 0)                          # replaced, so private again
+        self.assertEqual([n for n in os.listdir(self.root) if n.endswith(".tmp")], [])
         self.assertEqual(run("dxso", self.game, "--out", out)[0], 2)
         work_tree = os.path.join(self.root, "repo")
         os.makedirs(os.path.join(work_tree, ".git"))

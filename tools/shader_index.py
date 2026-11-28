@@ -18,7 +18,8 @@ compiles shaders: it hands DXVK bytecode it reads from three places, and this to
   TESV.exe
       Shader model 3 bytecode embedded in the executable's data (the interface renderer's shaders). Found by
       scanning for a version token and walking the instructions to END, so a few entries may be data that
-      only looks like a shader; such a key is never asked for.
+      only looks like a shader. index and verify are unaffected (such a key is never asked for), and dxso
+      writes an executable entry only when a given state cache names it, never for --all alone.
 
 index     prints counts; --json writes the table: key, stage, length and where the bytes are (source file and
           absolute offset), plus pack and variants for lighting shaders. Hashes, offsets and names only.
@@ -32,13 +33,20 @@ siblings  the light-count test: for every entry the later cache has and the earl
           spec constants)? State Vulkan ignores is cleared in both caches first (no depth attachment: depth
           and stencil state; depth or stencil test off: their ops; blending off or no colour attachment: that
           attachment's blend factors), the attachment-based part of dxvkNormalizePipelineState
-          (twcclegg/dxvk-native#10), as tools/cache-overlap.py --normalize does. Without it, a cache written by
-          a build with that normalisation shares no entry with one written before it. --raw compares bytes.
-dxso      writes the shaders that the given state caches name (or --all) as a bytecode cache in the format of
+          (twcclegg/dxvk-native#10). Without it, a cache written by a build with that normalisation shares no
+          entry with one written before it. That build also clears the blend word and swizzle of an attachment
+          the pixel shader doesn't write, which needs the shader's outputs; instead, an attachment whose blend
+          word and swizzle are zero in one entry matches any value in the other. --raw compares bytes.
+dxso      writes the shaders that the given state caches name as a bytecode cache in the format of
           twcclegg/dxvk-native#8 (<exe>.dxso-cache), which that build's startup path creates shaders from.
+          --all adds every archive shader. The file is written beside --out and moved over it only when
+          complete, and an existing file is left alone if no shader would be written.
           THE OUTPUT CONTAINS THE GAME'S SHADER CODE: it is refused inside a git work tree. Keep it private.
 
-Exit status: 0 success; 1 a file can't be read or parsed, or coverage is under --min-entries; 2 usage.
+A package that doesn't parse is skipped and named, and the other packages are still read.
+
+Exit status: 0 success; 1 a file can't be read or parsed, no shaders are found, nothing would be written, or
+coverage is under --min-entries; 2 usage.
 """
 
 import argparse
@@ -81,7 +89,7 @@ def dxso_length(buf, start, limit=None):
             return p - start
         if op == 0xFFFE:                         # comment: length in bits 16-30
             p += 4 * ((token >> 16) & 0x7FFF)
-        elif op <= 0x60 or op == 0xFFFD:         # instruction: length in bits 24-27
+        elif op <= 0x60:                         # instruction: length in bits 24-27 (phase, 0xFFFD, is ps_1_4 only)
             p += 4 * ((token >> 24) & 0xF)
         else:
             return None
@@ -125,8 +133,14 @@ def bsa_file(fh, record):
         fh.seek(skip - 1, os.SEEK_CUR)
         offset, size = offset + skip, size - skip
     if packed:
-        fh.seek(4, os.SEEK_CUR)                  # uncompressed size
-        return zlib.decompress(fh.read(size - 4)), None
+        if size < 4:
+            raise FormatError("compressed member at offset %d is too short" % offset)
+        declared, = struct.unpack("<I", fh.read(4))
+        out = zlib.decompress(fh.read(size - 4))
+        if len(out) != declared:
+            raise FormatError("compressed member at offset %d: %d bytes, the archive says %d"
+                              % (offset, len(out), declared))
+        return out, None
     data = fh.read(size)
     if len(data) != size:
         raise FormatError("archive is truncated")
@@ -193,8 +207,9 @@ def lighting_pack(name):
 
 
 def build_index(game_dir, archives=ARCHIVES, executable=EXECUTABLE):
-    """The table, as the dict --json writes. Missing sources are skipped and named in "missing"."""
-    sources, records, missing = [], [], []
+    """The table, as the dict --json writes. Missing sources are skipped and named in "missing", packages that
+    don't parse in "skipped"."""
+    sources, records, missing, skipped = [], [], [], []
     for relative in archives:
         path = os.path.join(game_dir, relative)
         if not os.path.isfile(path):
@@ -207,11 +222,12 @@ def build_index(game_dir, archives=ARCHIVES, executable=EXECUTABLE):
                 name = record[0]
                 if not (name.startswith("shadersfx\\") and name.endswith(".fxp")):
                     continue
-                data, base = bsa_file(fh, record)
                 try:
+                    data, base = bsa_file(fh, record)
                     found = walk_fxp(data)
-                except FormatError as error:
-                    raise FormatError("%s: %s: %s" % (relative, name, error))
+                except (FormatError, zlib.error) as error:
+                    skipped.append("%s: %s: %s" % (relative, name, error))
+                    continue
                 for stage, ident, start, length in found:
                     records.append((stage, hashlib.sha1(data[start:start + length]).hexdigest(), length, index,
                                     None if base is None else base + start, name, ident, start))
@@ -257,14 +273,27 @@ def build_index(game_dir, archives=ARCHIVES, executable=EXECUTABLE):
             else:
                 mine = [e for e in shaders.values() if e["stage"] == stage and (e["live"] or source["path"] == "all")]
                 row[stage] = {"records": sum(e["records"] for e in mine), "unique": len(mine)}
-    return {"format": 1, "sources": sources, "missing": missing, "counts": counts,
+    return {"format": 1, "sources": sources, "missing": missing, "skipped": skipped, "counts": counts,
             "shaders": list(shaders.values())}
 
 
+def report_sources(table):
+    """Print what a game-folder table couldn't read."""
+    for name in table.get("missing", []):
+        print("not found: %s" % name)
+    for problem in table.get("skipped", []):
+        print("skipped, doesn't parse: %s" % problem)
+
+
 def load_index(path):
-    """A table from a game folder or from a file written by index --json."""
+    """A table from a game folder or from a file written by index --json. A folder with no shaders is an error,
+    so a wrong path can't pass for a measurement."""
     if os.path.isdir(path):
-        return build_index(path)
+        table = build_index(path)
+        report_sources(table)
+        if not table["shaders"]:
+            raise FormatError("%s: no shaders found; is this the game folder (the one holding TESV.exe)?" % path)
+        return table
     try:
         with open(path, "r", encoding="utf-8") as fh:
             table = json.load(fh)
@@ -350,8 +379,7 @@ def graphics_state(state, version, normalize=True):
 
 def cmd_index(args):
     table = build_index(args.game)
-    for name in table["missing"]:
-        print("not found: %s" % name)
+    report_sources(table)
     print("%-28s %10s %10s %10s %10s" % ("source", "vs records", "vs unique", "ps records", "ps unique"))
     for name, row in table["counts"].items():
         print("%-28s %10d %10d %10d %10d" % (name, row["vs"]["records"], row["vs"]["unique"],
@@ -420,6 +448,18 @@ def cmd_verify(args):
     return 0
 
 
+def same_words(a, b):
+    """State words equal, where an attachment whose blend word and swizzle are both zero on one side matches
+    anything on the other: a normalising build clears both for an attachment the pixel shader doesn't write."""
+    if a[:10] != b[:10] or a[12:] != b[12:]:
+        return False
+    for i in range(8):
+        if (a[11][i], a[10][i]) != (b[11][i], b[10][i]) \
+                and (a[11][i], a[10][i]) != (0, 0) and (b[11][i], b[10][i]) != (0, 0):
+            return False
+    return True
+
+
 SIBLING_RANKS = ["sibling, same state apart from the binding mask",
                  "sibling, same state apart from the binding mask and spec constants",
                  "sibling, other state differs",
@@ -454,8 +494,8 @@ def cmd_siblings(args):
     for shaders, (rp, _, words, spec) in lighting:
         best, step = len(SIBLING_RANKS) - 1, None
         for pack, variants in packs[shaders["ps"]].items():
-            for other, (other_rp, _, other_words, other_spec) in by_group.get((shaders["vs"], pack), ()):
-                same = other_rp == rp and other_words == words
+            for other, (other_rp, _, other_words, other_spec) in by_group.get((shaders.get("vs"), pack), ()):
+                same = other_rp == rp and (same_words(other_words, words) if not args.raw else other_words == words)
                 rank = 0 if same and other_spec == spec else 1 if same else 2
                 distance = min((abs((v >> 4 & 7) - (o >> 4 & 7)), abs((v >> 7 & 7) - (o >> 7 & 7)))
                                for v in variants for o in other)
@@ -499,43 +539,61 @@ def cmd_dxso(args):
     if inside_git_tree(args.out):
         print("refusing to write the game's shader code inside a git work tree: %s" % args.out)
         return 2
+    if not args.all and not args.caches:
+        print("name the state caches whose shaders to write, or pass --all")
+        return 2
     table = build_index(args.game)
-    wanted = None
-    if not args.all:
-        if not args.caches:
-            print("name the state caches whose shaders to write, or pass --all")
-            return 2
-        wanted = {(stage, key) for path in args.caches
-                  for shaders, _ in read_state_cache(path)[1] for stage, key in shaders.items()}
+    report_sources(table)
+    if not table["shaders"]:
+        raise FormatError("%s: no shaders found; is this the game folder (the one holding TESV.exe)?" % args.game)
+    named = {(stage, key) for path in args.caches
+             for shaders, _ in read_state_cache(path)[1] for stage, key in shaders.items()}
+    kinds = [s["kind"] for s in table["sources"]]
+    # Executable hits may be data that only looks like a shader; write one only when a cache names it
+    chosen = [e for e in table["shaders"] if (e["stage"], e["key"]) in named
+              or args.all and kinds[e["source"]] != "exe"]
+    if not chosen:
+        print("no shader to write; %s is left as it was" % args.out)
+        return 1
+    folder = os.path.dirname(os.path.abspath(args.out))
+    temporary = os.path.join(folder, ".%s.%d.tmp" % (os.path.basename(args.out), os.getpid()))
     handles, archives, written = {}, {}, 0
-    with open(os.open(args.out, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "wb") as out:
-        out.write(b"DXSO" + struct.pack("<I", 1))
-        for entry in table["shaders"]:
-            if wanted is not None and (entry["stage"], entry["key"]) not in wanted:
-                continue
-            source = entry["source"]
-            path = os.path.join(args.game, table["sources"][source]["path"])
-            if source not in handles:
-                handles[source] = open(path, "rb")
-            fh = handles[source]
-            if entry["offset"] is not None:
-                fh.seek(entry["offset"])
-                code = fh.read(entry["length"])
-            else:                                # compressed archive member
-                if source not in archives:
-                    archives[source] = {r[0]: r for r in read_bsa(path)}
-                code = bsa_file(fh, archives[source][entry["file"]])[0][entry["inner"]:entry["inner"] + entry["length"]]
-            if hashlib.sha1(code).hexdigest() != entry["key"]:
-                raise FormatError("%s changed while reading" % path)
-            out.write(struct.pack("<II", STAGE_BITS[entry["stage"]], len(code)) + bytes.fromhex(entry["key"]) + code)
-            written += 1
-    for fh in handles.values():
-        fh.close()
-    missing = 0 if wanted is None else len(wanted) - written
+    try:
+        with open(os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb") as out:
+            out.write(b"DXSO" + struct.pack("<I", 1))
+            for entry in chosen:
+                written += write_dxso_entry(out, entry, table, args.game, handles, archives)
+        os.replace(temporary, args.out)
+    finally:
+        for fh in handles.values():
+            fh.close()
+        if os.path.exists(temporary):
+            os.remove(temporary)
+    missing = len(named - {(e["stage"], e["key"]) for e in chosen})
     print("wrote %d shaders to %s%s" % (written, args.out, "" if not missing else
                                         "; %d keys of the caches are not in the game files" % missing))
     print("this file holds the game's shader code: keep it out of repositories, logs and uploads")
     return 0
+
+
+def write_dxso_entry(out, entry, table, game, handles, archives):
+    """Append one shader, read from its source and checked against its key. Returns 1."""
+    source = entry["source"]
+    path = os.path.join(game, table["sources"][source]["path"])
+    if source not in handles:
+        handles[source] = open(path, "rb")
+    fh = handles[source]
+    if entry["offset"] is not None:
+        fh.seek(entry["offset"])
+        code = fh.read(entry["length"])
+    else:                                        # compressed archive member
+        if source not in archives:
+            archives[source] = {r[0]: r for r in read_bsa(path)}
+        code = bsa_file(fh, archives[source][entry["file"]])[0][entry["inner"]:entry["inner"] + entry["length"]]
+    if hashlib.sha1(code).hexdigest() != entry["key"]:
+        raise FormatError("%s changed while reading" % path)
+    out.write(struct.pack("<II", STAGE_BITS[entry["stage"]], len(code)) + bytes.fromhex(entry["key"]) + code)
+    return 1
 
 
 def main(argv=None):
