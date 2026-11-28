@@ -62,6 +62,11 @@ enum NativeRuntime {
     }
     #endif
 
+    /// Play Immersive, before the game starts: the game gets the comfort defaults for immersive play through LB_INI
+    /// (runtime/comfort_ini.h; LB_COMFORT_INI=0 in launch-env.json opts out). The game reads its settings once, at
+    /// start, so a game started in the window keeps the game's own behaviour even if it later moves into the space.
+    static func markImmersiveLaunch() { skyrim_comfort_ini_immersive(1) }
+
     /// Holds the game's frames and hides its window, showing the launcher, until resumed.
     static func setPaused(_ paused: Bool) { skyrim_native_set_paused(paused ? 1 : 0) }
 

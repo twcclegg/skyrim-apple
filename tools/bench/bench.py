@@ -134,6 +134,18 @@ def load_scenario(name):
 
 # ---------------------------------------------------------------- targets
 
+def immersive_arguments():
+    """Launcher test hooks for a headset or simulator run. BENCH_IMMERSIVE=1: autoplay goes through Play Immersive.
+    BENCH_REENTER=<seconds>, with it: that long into the game the launcher closes the immersive space and opens it
+    again, logging each step as "bench: re-entry: ..." (the second attach of the compositor to a running game)."""
+    if not os.environ.get("BENCH_IMMERSIVE"):
+        return []
+    arguments = ["-SkyrimBenchImmersive", "YES"]
+    if os.environ.get("BENCH_REENTER"):
+        arguments += ["-SkyrimBenchReenter", os.environ["BENCH_REENTER"]]
+    return arguments
+
+
 class Device:
     def __init__(self, udid):
         self.udid = udid
@@ -154,7 +166,7 @@ class Device:
         """Runs the app until it exits; returns the console text."""
         command = ["xcrun", "devicectl", "device", "process", "launch", "--device", self.udid, "--console",
                    "--terminate-existing", "--environment-variables", json.dumps(env), BUNDLE,
-                   "--", "-SkyrimBenchAutoPlay", "YES", *(["-SkyrimBenchImmersive", "YES"] if os.environ.get("BENCH_IMMERSIVE") else [])]  # "--": devicectl would read -S… as its own options
+                   "--", "-SkyrimBenchAutoPlay", "YES", *immersive_arguments()]  # "--": devicectl would read -S… as its own options
         try:
             done = subprocess.run(command, capture_output=True, text=True, timeout=timeout)
             return done.stdout + done.stderr
@@ -200,7 +212,7 @@ class Simulator:
     def launch(self, env, timeout):
         child = dict(os.environ, **{f"SIMCTL_CHILD_{k}": v for k, v in env.items()})
         command = ["xcrun", "simctl", "launch", "--console", "--terminate-running-process", self.udid, BUNDLE,
-                   "-SkyrimSimulatorAutoPlay", "YES"]
+                   "-SkyrimSimulatorAutoPlay", "YES", *immersive_arguments()]
         try:
             done = subprocess.run(command, capture_output=True, text=True, timeout=timeout, env=child)
             return done.stdout + done.stderr

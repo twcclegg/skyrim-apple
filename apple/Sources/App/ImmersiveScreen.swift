@@ -79,6 +79,99 @@ final class GPUTimeTally: @unchecked Sendable {
     }
 }
 
+/// LB_IMMERSIVE_PASS_TIME=1: the GPU time of the eyes' passes, vertex and fragment stages apart, from timestamps
+/// taken at the stage boundaries of each pass (a counter sample buffer). Each frame takes the next of `frames`
+/// slots of `perFrame` samples, four a pass; the completion handler reads them back and tallies the frame's sum.
+/// Timestamps are GPU ticks: converted to seconds by comparing two GPU timestamp readings with the wall clock.
+final class PassTimer: @unchecked Sendable {
+    private static let frames = 8, perFrame = 16
+    private let buffer: any MTLCounterSampleBuffer
+    private let device: any MTLDevice
+    private var slot = 0, used = 0
+    private let lock = NSLock()
+    private var vertex = 0.0, fragment = 0.0, vertexMax = 0.0, fragmentMax = 0.0, count = 0, misses = 0
+    private var clockStart: (gpu: UInt64, wall: Double)
+
+    /// nil when the GPU can't take timestamps at stage boundaries.
+    init?(device: any MTLDevice) {
+        guard device.supportsCounterSampling(.atStageBoundary),
+              let set = device.counterSets?.first(where: { $0.name == MTLCommonCounterSet.timestamp.rawValue }) else { return nil }
+        let description = MTLCounterSampleBufferDescriptor()
+        description.counterSet = set
+        description.storageMode = .shared
+        description.sampleCount = Self.frames * Self.perFrame
+        guard let buffer = try? device.makeCounterSampleBuffer(descriptor: description) else { return nil }
+        self.buffer = buffer
+        self.device = device
+        clockStart = (device.sampleTimestamps().gpu, CACurrentMediaTime())
+    }
+
+    /// Starts a frame's samples; returns its slot for `finish`.
+    func beginFrame() -> Int {
+        slot = (slot + 1) % Self.frames
+        used = 0
+        return slot
+    }
+
+    /// Has the pass write its four timestamps, while the frame's slot has room. Returns the passes so far.
+    func attach(_ pass: MTLRenderPassDescriptor) -> Int {
+        guard used + 4 <= Self.perFrame, let attachment = pass.sampleBufferAttachments[0] else { return used / 4 }
+        let first = slot * Self.perFrame + used
+        attachment.sampleBuffer = buffer
+        attachment.startOfVertexSampleIndex = first
+        attachment.endOfVertexSampleIndex = first + 1
+        attachment.startOfFragmentSampleIndex = first + 2
+        attachment.endOfFragmentSampleIndex = first + 3
+        used += 4
+        return used / 4
+    }
+
+    /// From the command buffer's completion handler: reads the frame's timestamps and tallies its stage times.
+    func finish(slot: Int, passes: Int) {
+        guard passes > 0 else { return }
+        let first = slot * Self.perFrame
+        guard let data = try? buffer.resolveCounterRange(first..<(first + passes * 4)) else {
+            lock.lock(); misses += 1; lock.unlock()
+            return
+        }
+        var vertexTicks: UInt64 = 0, fragmentTicks: UInt64 = 0, bad = false
+        data.withUnsafeBytes { raw in
+            let stamps = raw.bindMemory(to: MTLCounterResultTimestamp.self)
+            guard stamps.count >= passes * 4 else { bad = true; return }
+            for pass in 0..<passes {
+                let t = (0..<4).map { stamps[pass * 4 + $0].timestamp }
+                if t.contains(where: { $0 == 0 || $0 == UInt64.max }) || t[1] < t[0] || t[3] < t[2] { bad = true; return }
+                vertexTicks += t[1] - t[0]
+                fragmentTicks += t[3] - t[2]
+            }
+        }
+        lock.lock()
+        if bad {
+            misses += 1
+        } else {
+            let v = Double(vertexTicks), f = Double(fragmentTicks)
+            vertex += v; fragment += f; count += 1
+            vertexMax = max(vertexMax, v); fragmentMax = max(fragmentMax, f)
+        }
+        lock.unlock()
+    }
+
+    /// Mean and largest stage times per frame since the last call, in seconds; frames whose samples failed.
+    func take() -> (vertex: Double, fragment: Double, vertexMax: Double, fragmentMax: Double, frames: Int, misses: Int) {
+        let now = (gpu: device.sampleTimestamps().gpu, wall: CACurrentMediaTime())
+        let ticks = now.gpu > clockStart.gpu ? Double(now.gpu - clockStart.gpu) : 0
+        let secondsPerTick = ticks > 0 ? (now.wall - clockStart.wall) / ticks : 0
+        clockStart = now
+        lock.lock(); defer {
+            vertex = 0; fragment = 0; vertexMax = 0; fragmentMax = 0; count = 0; misses = 0
+            lock.unlock()
+        }
+        let n = Double(max(count, 1))
+        return (vertex / n * secondsPerTick, fragment / n * secondsPerTick, vertexMax * secondsPerTick,
+                fragmentMax * secondsPerTick, count, misses)
+    }
+}
+
 enum SpatialEventLog {
     nonisolated(unsafe) private static var counts: [String: Int] = [:]
     private static let lock = NSLock()
@@ -130,6 +223,9 @@ private struct QuadUniforms {
     /// meters travels with the camera (the player's own hands and weapon) and is placed by heldModel, not model;
     /// the change is spread over the next half as far again. 0: everything is placed by model.
     var heldWithin: Float
+    /// The per-pixel search stops as soon as a step moves the game pixel shown by less than this many game pixels
+    /// without leaving the depth texel it read (LB_IMMERSIVE_REFINE_EXIT); 0 = every pixel runs every step.
+    var refineExit: Float
 }
 
 /// Runs on its own thread for as long as the layer lives: presents at the display's rate, showing the newest finished
@@ -141,7 +237,7 @@ final class ImmersiveCompositor: @unchecked Sendable {
     struct Uniforms {
         float4x4 viewProjection; float4x4 model; float4x4 heldModel; float2 halfSize; float2 screenCentre; uint decode; uint hasDepth;
         uint2 grid; float eyeBack; float nearUnits; float unitsPerMeter; float depthScale; float maxBehind; float backplate;
-        float tear; float trueDepth; float sharpen; float4 eyeRefine; float heldWithin;
+        float tear; float trueDepth; float sharpen; float4 eyeRefine; float heldWithin; float refineExit;
     };
     struct Out { float4 position [[position]]; float2 uv; float3 local; };
     // A grid over the game image. With depth, each vertex moves along the ray from the game's camera (eyeBack in
@@ -152,30 +248,40 @@ final class ImmersiveCompositor: @unchecked Sendable {
     // How far behind the screen (meters, along the viewer's ray) the game pixel at uv sits. The screen is a window:
     // everything is behind it, at depthScale meters per game meter, up to maxBehind. A consistent geometry (unlike a
     // relief pushed out of the screen), so the eyes converge where the picture is.
-    // The game pixel's view depth in game meters.
-    float behind_screen_raw(float2 uv, constant Uniforms &u, texture2d<float> depth, bool dilate) {
+    // The game's depth (as D3D wrote it) of the game pixel at uv.
+    float nearest_depth(float2 uv, uint2 grid, texture2d<float> depth, bool dilate) {
         constexpr sampler nearest(address::clamp_to_edge, filter::nearest);
         float d = depth.sample(nearest, uv, level(0)).r;
         if (dilate) {
             // The nearest depth around the point (half a grid cell each way), so a thin foreground edge keeps its
             // depth instead of a vertex landing beside it in the background.
-            float2 cell = 0.5 / float2(u.grid - 1);
+            float2 cell = 0.5 / float2(grid - 1);
             d = min(d, depth.sample(nearest, uv + float2(-cell.x, 0), level(0)).r);
             d = min(d, depth.sample(nearest, uv + float2(cell.x, 0), level(0)).r);
             d = min(d, depth.sample(nearest, uv + float2(0, -cell.y), level(0)).r);
             d = min(d, depth.sample(nearest, uv + float2(0, cell.y), level(0)).r);
         }
+        return d;
+    }
+    // The view depth in game meters of the D3D depth d.
+    float depth_meters(float d, constant Uniforms &u) {
         // D3D depth with a far plane much farther than the near one: view distance ~ near / (1 - d).
         return (u.nearUnits / max(1.0 - d, 1e-6)) / u.unitsPerMeter;
     }
-    float behind_screen(float2 uv, constant Uniforms &u, texture2d<float> depth, bool dilate) {
-        return min(u.depthScale * behind_screen_raw(uv, u, depth, dilate), u.maxBehind);
+    // The game pixel's view depth in game meters.
+    float behind_screen_raw(float2 uv, constant Uniforms &u, texture2d<float> depth, bool dilate) {
+        return depth_meters(nearest_depth(uv, u.grid, depth, dilate), u);
     }
-    // Distance from the eye of the game pixel at uv. Window mode: the screen distance plus how far behind it.
-    // True-depth mode: its view depth in meters, along the ray (view depth z sits at z / cos = |ray| * z / eyeBack).
+    // Distance from the eye of a game pixel whose view depth is meters, on a ray that is toScreen long to the screen.
+    // Window mode: the screen distance plus how far behind it. True-depth mode: its view depth in meters, along
+    // the ray (view depth z sits at z / cos = |ray| * z / eyeBack).
+    float radial_at(float meters, float toScreen, constant Uniforms &u) {
+        if (u.trueDepth == 0) return toScreen + min(u.depthScale * meters, u.maxBehind);
+        return toScreen * min(meters * u.depthScale, u.maxBehind) / u.eyeBack;
+    }
+    // Distance from the eye of the game pixel at uv.
     float radial(float2 uv, float toScreen, constant Uniforms &u, texture2d<float> depth, bool dilate) {
-        if (u.trueDepth == 0) return toScreen + behind_screen(uv, u, depth, dilate);
-        return toScreen * min(behind_screen_raw(uv, u, depth, dilate) * u.depthScale, u.maxBehind) / u.eyeBack;
+        return radial_at(behind_screen_raw(uv, u, depth, dilate), toScreen, u);
     }
     float3 screen_point(float2 uv, constant Uniforms &u) {
         return float3((uv.x * 2 - 1) * u.halfSize.x + u.screenCentre.x, (1 - uv.y * 2) * u.halfSize.y + u.screenCentre.y, 0);
@@ -185,6 +291,21 @@ final class ImmersiveCompositor: @unchecked Sendable {
     float edge_fade(float2 uv) {
         float2 edge = min(uv, 1.0 - uv);
         return smoothstep(0.0, 0.04, min(edge.x, edge.y));
+    }
+    // Where the mesh's point p (in the frame's own space), showing the game image at uv, goes on the display.
+    Out place_vertex(float3 p, float2 uv, constant Uniforms &u) {
+        Out out;
+        out.uv = uv;
+        out.local = p;
+        float4 placed = u.model * float4(p, 1);
+        if (u.heldWithin > 0) {
+            // The world is shifted against the player's movement since the frame was rendered. The player's own
+            // hands and weapon moved with the camera, so they stay where the frame has them.
+            float world = smoothstep(u.heldWithin, u.heldWithin * 1.5, length(p - float3(0, 0, u.eyeBack)));
+            placed = mix(u.heldModel * float4(p, 1), placed, world);
+        }
+        out.position = u.viewProjection * placed;
+        return out;
     }
     // Two triangles per grid cell, unindexed, so each vertex knows its whole triangle. With depth, each vertex moves
     // along the ray from the viewer's starting eye through its point on the screen, by how far that pixel is in the
@@ -200,8 +321,6 @@ final class ImmersiveCompositor: @unchecked Sendable {
         float3 onScreen = screen_point(uv, u);
         float3 eye = float3(0, 0, u.eyeBack);
         float3 p = onScreen;
-        Out out;
-        out.uv = uv;
         float3 ray = onScreen - eye;
         float toScreen = length(ray);
         if (u.backplate != 0) {
@@ -228,16 +347,41 @@ final class ImmersiveCompositor: @unchecked Sendable {
             float fade = u.trueDepth != 0 ? 1.0 : edge_fade(uv);
             p = eye + ray * (1.0 + (r - toScreen) * fade / toScreen);
         }
-        out.local = p;
-        float4 placed = u.model * float4(p, 1);
-        if (u.heldWithin > 0) {
-            // The world is shifted against the player's movement since the frame was rendered. The player's own
-            // hands and weapon moved with the camera, so they stay where the frame has them.
-            float world = smoothstep(u.heldWithin, u.heldWithin * 1.5, length(p - eye));
-            placed = mix(u.heldModel * float4(p, 1), placed, world);
-        }
-        out.position = u.viewProjection * placed;
+        return place_vertex(p, uv, u);
+    }
+    // LB_IMMERSIVE_SEED. What screen_vertex takes from the depth texture changes only when the game hands over a new
+    // frame, yet it is fetched again for every corner of every triangle, for each eye, at every refresh: 15 depth
+    // fetches a corner, six corners a cell. With the switch, seed_fragment runs once per game frame instead, into a
+    // texture with one texel per grid vertex: that vertex's depth exactly as screen_vertex finds it. It holds the
+    // depth as D3D wrote it, so nothing that changes between refreshes is baked in. screen_vertex_seeded then
+    // draws the same triangles in the same order through an index buffer, each vertex shaded once with one read.
+    // Only for the mesh kept whole (the per-pixel search on): screen_vertex's flattening of triangles across a
+    // depth edge needs the whole triangle at each corner.
+    struct SeedOut { float4 position [[position]]; };
+    vertex SeedOut seed_vertex(uint id [[vertex_id]]) {
+        // One triangle over the whole target.
+        SeedOut out;
+        out.position = float4(float(id & 1) * 4 - 1, float(id >> 1) * 4 - 1, 0, 1);
         return out;
+    }
+    fragment float4 seed_fragment(SeedOut in [[stage_in]], constant uint2 &grid [[buffer(0)]],
+                                  texture2d<float> depth [[texture(1)]]) {
+        // The texel's grid vertex and its uv, as screen_vertex works them out.
+        float2 step = 1.0 / float2(grid - 1);
+        float2 uv = float2(uint2(in.position.xy)) * step;
+        return float4(nearest_depth(uv, grid, depth, true), 0, 0, 1);
+    }
+    vertex Out screen_vertex_seeded(uint id [[vertex_id]], constant Uniforms &u [[buffer(0)]],
+                                    texture2d<float> seed [[texture(1)]]) {
+        uint2 at = uint2(id % u.grid.x, id / u.grid.x);
+        float2 step = 1.0 / float2(u.grid - 1);
+        float2 uv = float2(at) * step;
+        float3 eye = float3(0, 0, u.eyeBack);
+        float3 ray = screen_point(uv, u) - eye;
+        float toScreen = length(ray);
+        float r = radial_at(depth_meters(seed.read(at).r, u), toScreen, u);
+        float fade = u.trueDepth != 0 ? 1.0 : edge_fade(uv);
+        return place_vertex(eye + ray * (1.0 + (r - toScreen) * fade / toScreen), uv, u);
     }
     // Distance from the rays' origin of the one game pixel at uv, as the mesh would place it with a vertex there.
     float pixel_radial(float2 uv, constant Uniforms &u, texture2d<float> depth) {
@@ -254,6 +398,7 @@ final class ImmersiveCompositor: @unchecked Sendable {
         float3 a = eye - origin, d = normalize(in.local - eye);
         float ad = dot(a, d), aa = dot(a, a), rBefore = 0;
         float2 uv = in.uv, before = uv;
+        float2 texels = float2(depth.get_width(), depth.get_height());
         for (int i = 0; i < int(u.eyeRefine.w); i++) {
             before = uv;
             rBefore = pixel_radial(uv, u, depth);
@@ -261,6 +406,16 @@ final class ImmersiveCompositor: @unchecked Sendable {
             float3 on = fromOrigin * (u.eyeBack / max(-fromOrigin.z, 1e-6));
             uv = saturate(float2(((on.x - u.screenCentre.x) / u.halfSize.x + 1) * 0.5,
                                  (1 - (on.y - u.screenCentre.y) / u.halfSize.y) * 0.5));
+            if (u.refineExit > 0) {
+                // Settled (LB_IMMERSIVE_REFINE_EXIT): the step moved less than refineExit game pixels and stayed on
+                // the depth texel it read, so another step would read the same depth again and move less still,
+                // and the test below would find no jump. Most pixels (those on a surface) leave here after one
+                // depth fetch. The distance alone is not enough: a short step that crosses onto the far side of
+                // a depth edge is one the next step would move by many pixels.
+                float2 moved = (uv - before) * texels;
+                if (dot(moved, moved) < u.refineExit * u.refineExit && all(floor(uv * texels) == floor(before * texels)))
+                    return uv;
+            }
         }
         // A ray that keeps jumping between a near and a far surface sees neither's own pixel: it looks past the
         // near surface's edge at something the game's camera did not see. Show the far one there.
@@ -320,6 +475,22 @@ final class ImmersiveCompositor: @unchecked Sendable {
     private let gpuTime = GPUTimeTally()
     /// Grid size: one vertex every 4 game pixels.
     private static let gridColumns: UInt32 = 321, gridRows: UInt32 = 181
+    /// LB_IMMERSIVE_GRID=<columns>x<rows> (for example 161x91): the depth mesh's size instead of 321x181. Fewer
+    /// vertices cost less in the vertex stage; the per-pixel search (LB_IMMERSIVE_REFINE) settles each pixel's depth
+    /// either way, but at a coarser grid a thin object's outline can come out a little different (see
+    /// docs/perf/IMMERSIVE_OPTIONS.md). Read when the first game frame is drawn. Unset or unreadable: 321x181.
+    private lazy var grid: SIMD2<UInt32> = {
+        let fallback = SIMD2(Self.gridColumns, Self.gridRows)
+        guard let raw = getenv("LB_IMMERSIVE_GRID") else { return fallback }
+        let parts = String(cString: raw).split(separator: "x").compactMap { UInt32($0) }
+        guard parts.count == 2 else {
+            log("mesh grid: LB_IMMERSIVE_GRID not <columns>x<rows>; \(fallback.x)x\(fallback.y)")
+            return fallback
+        }
+        let size = SIMD2(max(9, min(parts[0], 1281)), max(9, min(parts[1], 721)))
+        log("mesh grid \(size.x)x\(size.y)")
+        return size
+    }()
     private var depthSettings: (scale: Float, maxBehind: Float, near: Float, units: Float, tear: Float, on: Bool)?
     private var loggedDepth = false
     private var loggedStereo = false
@@ -499,6 +670,117 @@ final class ImmersiveCompositor: @unchecked Sendable {
         #endif
     }
 
+    /// LB_IMMERSIVE_SEED=1, with the per-pixel search on (LB_IMMERSIVE_REFINE): the depth each mesh vertex needs is
+    /// worked out once per game frame, into a small texture (one texel per grid vertex), and the mesh is drawn
+    /// indexed from it, instead of every vertex of every triangle fetching it again for each eye at every refresh
+    /// (see seed_fragment in the shaders). The picture is meant to be the same to the bit. Unset: off. Read when
+    /// the first game frame with depth is drawn.
+    private lazy var seedMesh: Bool = {
+        let on = getenv("LB_IMMERSIVE_SEED").map { String(cString: $0) == "1" } ?? false
+        if on { log("mesh seed on: depth for the mesh once per game frame, indexed mesh") }
+        return on
+    }()
+    private var library: (any MTLLibrary)?
+    private var seedPipeline: (any MTLRenderPipelineState)?
+    private var seededPipeline: (any MTLRenderPipelineState)?
+    private var seedUnavailable = false
+    /// The grid's triangles in screen_vertex's order: per cell, corners (0,0) (1,0) (0,1) and (1,0) (1,1) (0,1).
+    private var gridIndices: (buffer: any MTLBuffer, count: Int, type: MTLIndexType, grid: SIMD2<UInt32>)?
+    /// Counts the game frames taken from the bridge. The bridge hands out the same few depth textures again and
+    /// again, so a texture alone does not say which frame a seed was made from.
+    private var frameGeneration = 0
+    /// The seeds: [0] from the frame's depth, [1] from the right eye's own depth (stereo frames).
+    private var seeds: [(texture: any MTLTexture, source: ObjectIdentifier, generation: Int, grid: SIMD2<UInt32>)?] = [nil, nil]
+
+    /// The two pipelines and the index buffer LB_IMMERSIVE_SEED draws with, made when it is first used.
+    private func prepareSeed(grid: SIMD2<UInt32>) -> Bool {
+        if seedPipeline != nil, seededPipeline != nil, let gridIndices, gridIndices.grid == grid { return true }
+        guard let library else { return false }
+        do {
+            let fill = MTLRenderPipelineDescriptor()
+            fill.vertexFunction = library.makeFunction(name: "seed_vertex")
+            fill.fragmentFunction = library.makeFunction(name: "seed_fragment")
+            fill.colorAttachments[0].pixelFormat = .r32Float
+            seedPipeline = try device.makeRenderPipelineState(descriptor: fill)
+            let mesh = MTLRenderPipelineDescriptor()
+            mesh.vertexFunction = library.makeFunction(name: "screen_vertex_seeded")
+            mesh.fragmentFunction = library.makeFunction(name: "screen_fragment")
+            mesh.colorAttachments[0].pixelFormat = layer.configuration.colorFormat
+            mesh.depthAttachmentPixelFormat = layer.configuration.depthFormat
+            seededPipeline = try device.makeRenderPipelineState(descriptor: mesh)
+        } catch {
+            log("mesh seed: no pipeline: \(error)")
+            return false
+        }
+        let columns = Int(grid.x), rows = Int(grid.y)
+        let corners = [(0, 0), (1, 0), (0, 1), (1, 0), (1, 1), (0, 1)]
+        var indices: [UInt32] = []
+        indices.reserveCapacity((columns - 1) * (rows - 1) * 6)
+        for y in 0..<(rows - 1) {
+            for x in 0..<(columns - 1) {
+                for corner in corners { indices.append(UInt32((y + corner.1) * columns + x + corner.0)) }
+            }
+        }
+        // 16-bit indices while every vertex has one below 0xFFFF (321x181 has 58,101 vertices).
+        let short = columns * rows < 0xFFFF
+        let buffer: (any MTLBuffer)?
+        if short {
+            buffer = indices.map { UInt16($0) }.withUnsafeBytes { device.makeBuffer(bytes: $0.baseAddress!, length: $0.count) }
+        } else {
+            buffer = indices.withUnsafeBytes { device.makeBuffer(bytes: $0.baseAddress!, length: $0.count) }
+        }
+        guard let buffer else {
+            log("mesh seed: no index buffer")
+            return false
+        }
+        gridIndices = (buffer: buffer, count: indices.count, type: short ? MTLIndexType.uint16 : MTLIndexType.uint32, grid: grid)
+        return true
+    }
+
+    /// The seed made from depthTexture for the game frame now shown, filled in `commands` first if seeds[slot]
+    /// holds another frame's. nil (logged once) when it can't be made: the mesh is then drawn as without the switch.
+    private func seed(_ slot: Int, from depthTexture: any MTLTexture, grid: SIMD2<UInt32>,
+                      commands: any MTLCommandBuffer) -> (any MTLTexture)? {
+        guard !seedUnavailable else { return nil }
+        let source = ObjectIdentifier(depthTexture)
+        if let have = seeds[slot], have.source == source, have.generation == frameGeneration, have.grid == grid {
+            return have.texture
+        }
+        var target: (any MTLTexture)?
+        if prepareSeed(grid: grid), let seedPipeline {
+            target = seeds[slot].flatMap { $0.grid == grid ? $0.texture : nil }
+            if target == nil {
+                let description = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .r32Float, width: Int(grid.x),
+                                                                           height: Int(grid.y), mipmapped: false)
+                description.usage = [.renderTarget, .shaderRead]
+                description.storageMode = .private
+                target = device.makeTexture(descriptor: description)
+            }
+            let pass = MTLRenderPassDescriptor()
+            pass.colorAttachments[0].texture = target
+            pass.colorAttachments[0].loadAction = .dontCare
+            pass.colorAttachments[0].storeAction = .store
+            if target != nil, let encoder = commands.makeRenderCommandEncoder(descriptor: pass) {
+                var size = grid
+                encoder.setRenderPipelineState(seedPipeline)
+                encoder.setFragmentBytes(&size, length: MemoryLayout<SIMD2<UInt32>>.stride, index: 0)
+                encoder.setFragmentTexture(depthTexture, index: 1)
+                encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
+                encoder.endEncoding()
+            } else {
+                target = nil
+            }
+        }
+        guard let target else {
+            seedUnavailable = true
+            seeds = [nil, nil]
+            log("mesh seed: unavailable; drawing the mesh without it")
+            return nil
+        }
+        seeds[slot] = (texture: target, source: source, generation: frameGeneration, grid: grid)
+        return target
+    }
+
     init(layer: LayerRenderer) {
         self.layer = layer
         device = layer.device
@@ -516,6 +798,7 @@ final class ImmersiveCompositor: @unchecked Sendable {
 
     private func makePipeline() throws {
         let library = try device.makeLibrary(source: Self.shaders, options: nil)
+        self.library = library
         let description = MTLRenderPipelineDescriptor()
         description.vertexFunction = library.makeFunction(name: "screen_vertex")
         description.fragmentFunction = library.makeFunction(name: "screen_fragment")
@@ -546,6 +829,12 @@ final class ImmersiveCompositor: @unchecked Sendable {
         return settings
     }
 
+    /// One compositor at a time owns the game's frames. The space can be closed and opened again while the game
+    /// runs ("Return to Immersive"), and each opening makes a new compositor; the new one waits here until the old
+    /// one has finished, so the old one's skyrim_immersive_stop() can't land after the new one's start and switch
+    /// its frames off. The wait is bounded: an old compositor that never ends must not keep the new one dark.
+    private static let lifetime = NSLock()
+
     private func run() {
         do {
             try makePipeline()
@@ -553,6 +842,9 @@ final class ImmersiveCompositor: @unchecked Sendable {
             log("no pipeline: \(error)")
             return
         }
+        let alone = Self.lifetime.lock(before: Date(timeIntervalSinceNow: 5))
+        defer { if alone { Self.lifetime.unlock() } }
+        if !alone { log("the previous compositor has not finished after 5 s; starting anyway") }
         skyrim_immersive_start()
         skyrim_sdl_set_window_ghost(1)
         DispatchQueue.main.async { NotificationCenter.default.post(name: .skyrimImmersiveRunning, object: true) }
@@ -596,6 +888,108 @@ final class ImmersiveCompositor: @unchecked Sendable {
         return max(0, min(scale, 4))
     }()
 
+    /// LB_IMMERSIVE_REFINE_EXIT=<game pixels> (for example 0.25): the per-pixel depth search leaves a pixel as soon
+    /// as a step moves it by less than this without leaving the depth texel it read, instead of running every
+    /// step and the final test on every pixel. Unset or 0: off. tools/compositor_reference.py compares the two.
+    private lazy var refineExit: Float = {
+        let pixels = min(getenv("LB_IMMERSIVE_REFINE_EXIT").flatMap { Float(String(cString: $0)) } ?? 0, 4)
+        guard pixels > 0 else { return 0 }
+        log("per-pixel depth search: stops once a step is under \(pixels) game pixels on the same depth texel")
+        return pixels
+    }()
+
+    /// LB_FRAME_REPEAT=1: the layer shows each compositor frame for two display refreshes
+    /// (LayerRenderer.minimumFrameRepeatCount = 1), so the compositor draws at half the display rate: 45 Hz on a
+    /// 90 Hz display, every pass half as often. Only 1 is taken: the bridge's display tick (skyrim_display_tick)
+    /// paces the game by whole compositor frames, and at 45 Hz a 45 fps game is one tick a frame; at 2 (30 Hz) it
+    /// would no longer fit a whole number and fall back to its timer. Read and applied once the game is presenting
+    /// (launch-env.json arrives after this layer opens). Unset: the layer's default (no repeat).
+    private var frameRepeatSetting: Int?
+    private var frameRepeat: Int {
+        if let frameRepeatSetting { return frameRepeatSetting }
+        guard checkedDevice else { return 0 }
+        let raw = getenv("LB_FRAME_REPEAT").map { String(cString: $0) } ?? ""
+        let value = raw == "1" ? 1 : 0
+        if !raw.isEmpty, value == 0 { log("frame repeat: LB_FRAME_REPEAT=\(raw) not taken (only 1)") }
+        if value == 1 {
+            layer.minimumFrameRepeatCount = 1
+            shownGapSum = 0; shownGapCount = 0  // the check counts only frames after this
+            log("frame repeat: each frame shown for 2 refreshes (layer asks for at least \(layer.minimumFrameRepeatCount))")
+        }
+        frameRepeatSetting = value
+        return value
+    }
+    /// An easing factor tuned per compositor frame at the full display rate, for the rate the compositor runs at:
+    /// the same easing per second. Exactly f with no frame repeat.
+    private func perFrame(_ f: Float) -> Float {
+        let repeats = frameRepeat
+        return repeats == 0 ? f : 1 - pow(1 - f, Float(repeats + 1))
+    }
+    /// Pacing check for LB_FRAME_REPEAT: the time between the presentation times of successive compositor frames,
+    /// before the repeat is applied (the display's own period) and after, for the 5 s log.
+    private var lastShownAt: Double?
+    private var shownGapSum: Double = 0, shownGapCount = 0
+    private var displayPeriod: Double?
+
+    /// LB_IMMERSIVE_PASS_TIME=1: the eyes' passes' vertex and fragment stage times in the 5 s log (PassTimer).
+    /// Read once the game is presenting.
+    private var passTimerSetting: Bool?
+    private var passTimer: PassTimer?
+    private var passTiming: Bool {
+        if let passTimerSetting { return passTimerSetting }
+        guard checkedDevice else { return false }
+        let wanted = getenv("LB_IMMERSIVE_PASS_TIME").map { String(cString: $0) == "1" } ?? false
+        if wanted {
+            passTimer = PassTimer(device: device)
+            log(passTimer != nil ? "pass time on: vertex and fragment stage timestamps on each eye's pass"
+                                 : "pass time: this GPU takes no timestamps at stage boundaries")
+        }
+        passTimerSetting = wanted && passTimer != nil
+        return passTimerSetting!
+    }
+    /// What the drawables and rate maps last logged looked like, so each is logged when it changes (at most 8 times).
+    private var loggedDrawable = "", loggedDrawableCount = 0
+    private var loggedRateMaps = "", loggedRateMapCount = 0
+    /// Calls to logDrawable; it looks only at every 90th (about once a second), so a steady drawable costs no
+    /// string building at the display rate.
+    private var drawableLogTick = 0
+    /// How far the eye was from where the mesh's rays start (meters), over the drawn eyes: how much the per-pixel
+    /// search had to correct, to read next to the cost switches.
+    private var eyeOffsetSum: Double = 0, eyeOffsetMax: Double = 0, eyeOffsetCount = 0
+
+    /// Logs the drawable's texture and viewport sizes and its rasterization rate maps, when they change (checked
+    /// about once a second).
+    private func logDrawable(_ drawable: LayerRenderer.Drawable) {
+        drawableLogTick += 1
+        guard drawableLogTick % 90 == 1 else { return }
+        if loggedDrawableCount < 8 {
+            let colour = drawable.colorTextures.map { "\($0.width)x\($0.height)x\($0.arrayLength)" }.joined(separator: " ")
+            let depth = drawable.depthTextures.map { "\($0.width)x\($0.height)" }.joined(separator: " ")
+            let viewports = drawable.views.map { "\(Int($0.textureMap.viewport.width))x\(Int($0.textureMap.viewport.height))" }.joined(separator: " ")
+            let text = "drawable: colour \(colour), depth \(depth), \(drawable.views.count) views, viewports \(viewports)"
+            if text != loggedDrawable {
+                loggedDrawable = text
+                loggedDrawableCount += 1
+                log(text)
+            }
+        }
+        let maps = drawable.rasterizationRateMaps
+        if !maps.isEmpty, loggedRateMapCount < 8 {
+            let text = "rate maps: " + maps.map { map in
+                let layers = (0..<map.layerCount).map { layer -> String in
+                    let size = map.physicalSize(layer: layer)
+                    return "\(size.width)x\(size.height)"
+                }.joined(separator: " ")
+                return "screen \(map.screenSize.width)x\(map.screenSize.height), physical \(layers)"
+            }.joined(separator: "; ")
+            if text != loggedRateMaps {
+                loggedRateMaps = text
+                loggedRateMapCount += 1
+                log(text)
+            }
+        }
+    }
+
     private func finish() {
         skyrim_sdl_set_window_ghost(0)
         DispatchQueue.main.async { NotificationCenter.default.post(name: .skyrimImmersiveRunning, object: false) }
@@ -635,7 +1029,7 @@ final class ImmersiveCompositor: @unchecked Sendable {
             let rotation = simd_quatf(simd_float3x3(SIMD3(head.columns.0.x, head.columns.0.y, head.columns.0.z),
                                                     SIMD3(head.columns.1.x, head.columns.1.y, head.columns.1.z),
                                                     SIMD3(head.columns.2.x, head.columns.2.y, head.columns.2.z)))
-            let eased = followRotation.map { simd_slerp($0, rotation, 0.15) } ?? rotation
+            let eased = followRotation.map { simd_slerp($0, rotation, perFrame(0.15)) } ?? rotation
             followRotation = eased
             let m = simd_float3x3(eased)
             let position = SIMD3<Float>(head.columns.3.x, head.columns.3.y, head.columns.3.z)
@@ -655,7 +1049,7 @@ final class ImmersiveCompositor: @unchecked Sendable {
                 var eased = followYaw ?? yaw
                 var turn = yaw - eased
                 turn -= 2 * .pi * (turn / (2 * .pi)).rounded()
-                eased += turn * 0.08  // per compositor frame: about 0.15 s to catch up at 90 Hz
+                eased += turn * perFrame(0.08)  // per compositor frame: about 0.15 s to catch up at 90 Hz
                 followYaw = eased
             }
             forward = SIMD3<Float>(sin(followYaw!), 0, -cos(followYaw!))
@@ -733,6 +1127,8 @@ final class ImmersiveCompositor: @unchecked Sendable {
         var game = skyrim_immersive_frame()
         let hasImage = skyrim_immersive_acquire(&game) == 1
         skyrim_display_tick()
+        // Counted here, where the frame is taken: this refresh may still be given up before anything is drawn.
+        if hasImage, game.is_new != 0 { frameGeneration += 1 }
         // An integer so the completion handler can carry it across threads.
         let retiredState = game.retired != 0 ? UInt(bitPattern: game.retired_state) : 0
         let retiredSlot = game.retired_slot
@@ -791,8 +1187,36 @@ final class ImmersiveCompositor: @unchecked Sendable {
             }
         }
 
+        // LB_IMMERSIVE_SEED: what the mesh needs from this game frame's depth, worked out here when the frame is
+        // new, ahead of the eyes' passes that read it.
+        var seedTextures: [(any MTLTexture)?] = [nil, nil]
+        if let depthTexture, seedMesh, refineSteps > 0, readDepthSettings().on {
+            seedTextures[0] = seed(0, from: depthTexture, grid: grid, commands: commands)
+            if let depthTextureEye2 { seedTextures[1] = seed(1, from: depthTextureEye2, grid: grid, commands: commands) }
+        }
+
+        if let first = drawables.first {
+            let shownAt = LayerRenderer.Clock.Instant.epoch.duration(to: first.frameTiming.presentationTime)
+            let seconds = Double(shownAt.components.seconds) + Double(shownAt.components.attoseconds) * 1e-18
+            if let lastShownAt, seconds > lastShownAt, seconds - lastShownAt < 0.1 {
+                shownGapSum += seconds - lastShownAt
+                shownGapCount += 1
+            }
+            lastShownAt = seconds
+        }
+        let repeats = frameRepeat
+        if repeats == 0, frameRepeatSetting == nil, shownGapCount >= 90 {
+            // Before the repeat is applied: the display's period, the yardstick for the check below.
+            displayPeriod = shownGapSum / Double(shownGapCount)
+        }
+
+        let timer = passTiming ? passTimer : nil
+        let timerSlot = timer?.beginFrame() ?? 0
+        var timedPasses = 0
+
         var publishedHead = false
         for drawable in drawables {
+            logDrawable(drawable)
             let shownAt = LayerRenderer.Clock.Instant.epoch.duration(to: drawable.frameTiming.presentationTime)
             let seconds = Double(shownAt.components.seconds) + Double(shownAt.components.attoseconds) * 1e-18
             let anchor = tracking.queryDeviceAnchor(atTimestamp: seconds)
@@ -851,6 +1275,7 @@ final class ImmersiveCompositor: @unchecked Sendable {
                 pass.depthAttachment.storeAction = .store
                 let rateMaps = drawable.rasterizationRateMaps
                 if !rateMaps.isEmpty { pass.rasterizationRateMap = rateMaps[min(index, rateMaps.count - 1)] }
+                if let timer { timedPasses = timer.attach(pass) }
                 guard let encoder = commands.makeRenderCommandEncoder(descriptor: pass) else { continue }
                 encoder.setViewport(view.textureMap.viewport)
                 if let monoTexture = texture, let monoImage = image, let centreModel = model, let pipeline, let depth {
@@ -915,14 +1340,19 @@ final class ImmersiveCompositor: @unchecked Sendable {
                                                 halfSize: rectHalf, screenCentre: rectCentre,
                                                 decode: game.needs_srgb_decode != 0 ? 1 : 0,
                                                 hasDepth: useDepth ? 1 : 0,
-                                                grid: SIMD2(Self.gridColumns, Self.gridRows),
+                                                grid: grid,
                                                 eyeBack: eyeBack, nearUnits: settings.near, unitsPerMeter: settings.units,
                                                 depthScale: tracked ? headDepthScale : settings.scale,
                                                 maxBehind: tracked ? 300 : settings.maxBehind, backplate: 0,
                                                 tear: settings.tear, trueDepth: tracked && useDepth ? 1 : 0,
                                                 sharpen: sharpen,
                                                 eyeRefine: SIMD4(simd_make_float3(model.inverse * originFromEye.columns.3), useDepth ? refineSteps : 0),
-                                                heldWithin: heldModel != nil && useDepth ? motionNear : 0)
+                                                heldWithin: heldModel != nil && useDepth ? motionNear : 0,
+                                                refineExit: useDepth && refineSteps > 0 ? refineExit : 0)
+                    if useDepth {
+                        let offset = Double(simd_length(simd_make_float3(uniforms.eyeRefine) - SIMD3(0, 0, eyeBack)))
+                        eyeOffsetSum += offset; eyeOffsetMax = max(eyeOffsetMax, offset); eyeOffsetCount += 1
+                    }
                     encoder.setRenderPipelineState(pipeline)
                     encoder.setDepthStencilState(depth)
                     encoder.setCullMode(.none)
@@ -931,8 +1361,17 @@ final class ImmersiveCompositor: @unchecked Sendable {
                     encoder.setFragmentTexture(image, index: 0)
                     encoder.setVertexTexture(useDepth ? depthTexture : texture, index: 1)
                     encoder.setFragmentTexture(useDepth ? depthTexture : texture, index: 1)
-                    let vertexCount = Int((Self.gridColumns - 1) * (Self.gridRows - 1) * 6)
-                    encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: vertexCount)
+                    let vertexCount = Int((grid.x - 1) * (grid.y - 1) * 6)
+                    let seedTexture = useDepth ? seedTextures[stereoEye && index == 1 && depthTextureEye2 != nil ? 1 : 0] : nil
+                    if let seedTexture, let seededPipeline, let gridIndices, refineSteps > 0 {
+                        // LB_IMMERSIVE_SEED: the same triangles, each vertex shaded once, its depth read from the seed.
+                        encoder.setRenderPipelineState(seededPipeline)
+                        encoder.setVertexTexture(seedTexture, index: 1)
+                        encoder.drawIndexedPrimitives(type: .triangle, indexCount: gridIndices.count, indexType: gridIndices.type,
+                                                      indexBuffer: gridIndices.buffer, indexBufferOffset: 0)
+                    } else {
+                        encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: vertexCount)
+                    }
                     if useDepth && fillHoles && refineSteps == 0 {
                         // Then a blurred copy at the farthest depth, behind the mesh: it shows only through the
                         // gaps at depth edges, instead of black (LB_IMMERSIVE_HOLES=0: black as before). Drawn
@@ -950,8 +1389,9 @@ final class ImmersiveCompositor: @unchecked Sendable {
             }
             drawable.encodePresent(commandBuffer: commands)
         }
-        commands.addCompletedHandler { [gpuTime] buffer in
+        commands.addCompletedHandler { [gpuTime, timer, timerSlot, timedPasses] buffer in
             gpuTime.add(buffer.gpuEndTime - buffer.gpuStartTime)
+            timer?.finish(slot: timerSlot, passes: timedPasses)
             giveBack()
         }
         commands.commit()
@@ -968,6 +1408,28 @@ final class ImmersiveCompositor: @unchecked Sendable {
             if gpu.count > 0 {
                 log(String(format: "compositor gpu %.2f ms per frame, p95 %.2f ms, max %.2f ms", gpu.total * 1000 / Double(gpu.count), gpu.p95 * 1000, gpu.max * 1000))
             }
+            if let passTimer, passTimerSetting == true {
+                let t = passTimer.take()
+                if t.frames > 0 || t.misses > 0 {
+                    log(String(format: "compositor passes: vertex %.2f ms, fragment %.2f ms per frame (mean), max %.2f / %.2f ms, %d frames, %d unreadable",
+                               t.vertex * 1000, t.fragment * 1000, t.vertexMax * 1000, t.fragmentMax * 1000, t.frames, t.misses))
+                }
+            }
+            if eyeOffsetCount > 0 {
+                log(String(format: "eye from the rays' origin: %.1f mm (mean), max %.1f mm", eyeOffsetSum / Double(eyeOffsetCount) * 1000, eyeOffsetMax * 1000))
+                eyeOffsetSum = 0; eyeOffsetMax = 0; eyeOffsetCount = 0
+            }
+            if repeats > 0, shownGapCount > 0 {
+                let gap = shownGapSum / Double(shownGapCount)
+                var line = String(format: "frame repeat: frames %.2f ms apart (mean)", gap * 1000)
+                if let displayPeriod, displayPeriod > 0 {
+                    let ratio = gap / displayPeriod
+                    line += String(format: ", %.2fx the display's %.2f ms", ratio, displayPeriod * 1000)
+                    if abs(ratio - Double(repeats + 1)) > 0.25 { line += String(format: " (expected %dx: not paced as asked)", repeats + 1) }
+                }
+                log(line)
+            }
+            if frameRepeatSetting != nil || displayPeriod != nil { shownGapSum = 0; shownGapCount = 0 }
             if residualCount > 0 {
                 log(String(format: "eye views: shown %.2f deg from where the picture was rendered looking (mean), max %.2f",
                            residualSum / Double(residualCount), residualMax))
