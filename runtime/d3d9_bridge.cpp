@@ -576,6 +576,7 @@ struct PassFrame {
     int rt_changes;
     bool seen_main, seen_depth, seen_bb;  // a main / depth / back buffer draw happened this frame
     bool bb_post;                         // every draw since the back buffer was bound was of the post class
+    bool seen_ui;                         // an interface (ui) draw went into the back buffer this frame
     // First-person detection (d3d_first_person, below)
     bool fp_late;                         // in the late pass: after its Clear of depth only, until its projection ends
     bool fp_late_confirmed;               // ... and its projection was seen to be the first-person one
@@ -662,6 +663,57 @@ static bool stage0_render_target(void) {
     return rt;
 }
 
+// Whether the pixel shader bound declares sampler s0, so the draw reads what stage 0 holds: bindings persist across
+// draws, and a render target left there by the final image says nothing about a draw that samples only other stages,
+// or nothing. Read from the bytecode once per shader (ps_2_0 and later; shader model 1, which has no sampler
+// declarations, and the fixed-function pipeline count as not sampling it). Only back-buffer quads after a post draw
+// ask, a few shaders a frame.
+struct PsSamplesS0 {
+    IDirect3DPixelShader9 *ps;  // held, so its address is not reused while it keys the cache
+    bool s0;
+};
+static std::vector<PsSamplesS0> g_ps_s0_cache;
+static void ps_s0_forget(void) {
+    for (PsSamplesS0 &c : g_ps_s0_cache) c.ps->Release();
+    g_ps_s0_cache.clear();
+}
+static bool ps_declares_s0(const uint32_t *in, size_t count) {
+    if (count < 2 || (in[0] >> 16) != 0xFFFF || ((in[0] >> 8) & 0xFF) < 2) return false;
+    const uint32_t op_dcl = 31, sampler = 10;
+    for (size_t i = 1; i < count;) {
+        const uint32_t tok = in[i], op = tok & 0xFFFF;
+        if (tok == 0x0000FFFF) break;
+        if (op == 0xFFFE) { i += 1 + ((tok >> 16) & 0x7FFF); continue; }  // comment (CTAB...)
+        const size_t len = (tok >> 24) & 0xF;
+        if (i + 1 + len > count) return false;
+        if (op == op_dcl && len == 2) {
+            const uint32_t reg = in[i + 2], type = ((reg >> 28) & 7) | ((reg >> 8) & 0x18);
+            if (type == sampler && (reg & 0x7FF) == 0) return true;
+        }
+        i += 1 + len;
+    }
+    return false;
+}
+static bool ps_samples_s0(void) {
+    IDirect3DPixelShader9 *ps = nullptr;
+    if (!g_pass_device || FAILED(g_pass_device->GetPixelShader(&ps)) || !ps) return false;
+    for (const PsSamplesS0 &c : g_ps_s0_cache)
+        if (c.ps == ps) {
+            ps->Release();
+            return c.s0;
+        }
+    UINT size = 0;
+    std::vector<uint32_t> code;
+    if (SUCCEEDED(ps->GetFunction(nullptr, &size)) && size >= 8) {
+        code.resize(size / 4);
+        if (FAILED(ps->GetFunction(code.data(), &size))) code.clear();
+    }
+    const bool s0 = !code.empty() && ps_declares_s0(code.data(), code.size());
+    if (g_ps_s0_cache.size() >= 256) ps_s0_forget();
+    g_ps_s0_cache.push_back({ps, s0});  // keeps the reference GetPixelShader gave
+    return s0;
+}
+
 // The class of a draw, from the targets bound and what the frame drew before. Sizes are relative to the back
 // buffer (CreateDevice/Reset), never absolute. First match wins. "Seen" means it matches the Riverwood frame
 // traced with LB_D3DTRACE (docs/perf/LOG.md, 2026-11-10); everything else is unverified, check it with LB_PASSES=2.
@@ -670,12 +722,14 @@ static bool stage0_render_target(void) {
 //           in Riverwood)
 //   post    the first draw into the back buffer since it was bound, if it is a quad (<= 2 primitives): the final
 //           image (seen in Riverwood; the game also draws one quad into the back buffer earlier in the frame); and
-//           each quad right after it, while every draw since the binding has been one, that samples a render target
-//           in stage 0: an image-space effect blended over the final image (seen in the boss fight: a blur of a
-//           quarter-size target, pixel shader constants Image/BlurOffsets/BlurScale/ColorRange, drawn second; as
-//           interface it got the interface's per-eye offset and showed as a shifted copy of the picture). Interface
-//           draws sample their own textures, not render targets (none seen there in the boss fight's HUD, console,
-//           main menu and loading screen)
+//           each quad right after it, while every draw since the binding has been one, whose pixel shader samples
+//           s0 with a render target bound in stage 0: an image-space effect blended over the final image (seen in
+//           the boss fight: a blur of a quarter-size target, pixel shader constants Image/BlurOffsets/BlurScale/
+//           ColorRange, drawn second; as interface it got the interface's per-eye offset and showed as a shifted
+//           copy of the picture). Interface draws sample their own textures, not render targets (no such quad seen
+//           in the boss fight's HUD, console, main menu, loading screen, Tab menu, inventory or Escape menu).
+//           Neither applies once an interface draw has gone into the back buffer this frame: a quad drawn after the
+//           back buffer is bound again then (an interface pass that drew into its own target) stays ui
 //   fp      a first-person draw (d3d_first_person, above; seen in Riverwood with empty hands, a sword and Flames),
 //           whatever the target: the late pass, and its prepass and mask draws otherwise counted as main and refl
 //   depth   an R32F colour target of back-buffer size: the scene's depth drawn again (seen, 638 draws)
@@ -701,7 +755,8 @@ static int pass_class(uint32_t prims) {
     if (t.bb) {
         bool first = !f.seen_bb;
         f.seen_bb = true;
-        f.bb_post = prims <= 2 && (first || (f.bb_post && stage0_render_target()));
+        f.bb_post = !f.seen_ui && prims <= 2 && (first || (f.bb_post && stage0_render_target() && ps_samples_s0()));
+        if (!f.bb_post) f.seen_ui = true;
         return f.bb_post ? PASS_POST : PASS_UI;
     }
     if (bb_size && t.fmt == D3DFMT_R32F) {
@@ -1009,6 +1064,7 @@ static void passes_init(IDirect3DDevice9 *d) {
         else if (fp_wanted) LOG("first-person pass detection on (LB_FP, LB_FP_SKIP or LB_STEREO_EYE_UNITS)");
         if (g_d3d_passes) gpu_init(d);
     }
+    ps_s0_forget();  // a new device: its shaders are new objects
     if (!g_d3d_passes) return;
     d3d_passes_target(d);
     g_pass_frame.rt_changes = 0;
