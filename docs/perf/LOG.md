@@ -56,8 +56,8 @@ replaced by a copy with `LB_DEPTH_COPY`), `fp` (first-person draws), `fx` (effec
 
 ## 2026-11-10 — setup
 
-- `gen/` (manifest sha 5b68dc33…) and the game were already on the M1 in the planning session's scratch folder;
-  cloned to a private working folder (APFS clones). Mint was not contacted.
+- `gen/` (manifest sha 5b68dc33…) and the game were already on the M1 from earlier work; cloned to a private
+  working folder (APFS clones).
 - macOS build bootstrapped (`macos/bootstrap.sh`; the DirectX fetch step needs `cabextract`, which isn't
   installed and isn't needed because the game folder already has both DLLs).
 - `macos/CMakeLists.txt`: `SKYRIM_GAME_DIR` (the manifest records a path on another volume), `LB_CONST_MEM`,
@@ -182,7 +182,7 @@ verdicts use idle and report run alongside.
 - **Runtime, six interleaved pairs (idle work ms):** before 9.26, 8.93, 9.22, 9.16, 9.38, 9.26 (mean 9.20);
   after 8.72, 8.77, 9.17, 8.77, 9.20, 9.03 (mean 8.94). **−2.8% idle**, lower in all six pairs; run phase
   8.68 → 8.32 (**−4.1%**).
-- **Verdict:** keep. Not committed: the file also carries the planning session's uncommitted changes.
+- **Verdict:** keep. Not committed at the time: the file also carried other uncommitted changes.
 - **Same profile, other notes:** `0x472580` is still 8% of the main thread as a native function (so its cost
   is the memory it reads), the six-plane loop that calls it (`0xB1B6C0`) another 8%, indirect-call dispatch
   (`rt_call`) 3%.
@@ -288,9 +288,9 @@ Running total: baseline 11.47 → 8.94 ms idle (**−22%**).
   consecutive run), so B's numbers were taken in the warmer state and are, if anything, pessimistic.
 - **Not yet known:** the immersive screen's cost (compositor at 90 Hz plus the tap), busier or combat scenes,
   and long-session thermals. The depth build (`depth-v2`, binary 2569a7db…) was installed at the end of the
-  session for the "Skyrim - M1" session's immersive test.
+  session for the immersive test.
 
-## 2026-11-10 — first immersive runs on the headset (logs only; the depth build is the "Skyrim - M1" session's)
+## 2026-11-10 — first immersive runs on the headset (logs only; the depth build came from the separate depth work)
 
 Three sessions of `depth-v2` in the immersive space, logs in `bench-results/avp-immersive-20261110T1258/`:
 
@@ -324,7 +324,7 @@ Three sessions of `depth-v2` in the immersive space, logs in `bench-results/avp-
 ## 2026-11-10 — second immersive session on the headset (`depth-v5`, about 7 minutes of hand play)
 
 Log in `bench-results/avp-immersive-20261110T1458/`. Build: app 8b3bd810…, engine f3c22183… (this branch's engine work including the
-unaligned-atomics fix, plus the "Skyrim - M1" session's two-frame mailbox, five tap slots, depth scale 0.25 with
+unaligned-atomics fix, plus the depth work's two-frame mailbox, five tap slots, depth scale 0.25 with
 tear handling, and flat menus).
 
 - **The handoff fix works.** Of 77 ten-second reports, 49 show 60 game frames per second reaching the display
@@ -797,7 +797,7 @@ Measured with a scripted scene (`coc riverwood`, `bat fpflame`: iron sword and F
   the correction below**. ([#42-c9])
 - **Correction: capped GPU busy time is misleading on Apple GPUs.** With less work they clock down, so busy time
   barely moves: skipping the shadow passes or the R32F pass changed it by under 0.2 ms, while timestamp queries
-  give those passes 2.45 and 1.68 ms. Uncapped (`LB_MAX_FPS=0`, `d3d9.presentInterval = 0`), Riverwood: GPU
+  give those passes 2.45 and 1.68 ms. Uncapped (`LB_MAX_FPS=0`, and `d3d9.presentInterval = 0` in the file `DXVK_CONFIG_FILE` names), Riverwood: GPU
   busy 6.3 ms mono, 9.5 ms stereo (+50%), 8.1 ms stereo without the R32F pass. ([#42-c11])
 - **`LB_DEPTH_COPY`** (M1): copies the main pass's depth into the R32F target instead of redrawing the scene;
   equal within 1e-4 on 90% of pixels. Uncapped GPU: stereo 9.47 → 8.32 ms (−12%), mono 6.33 → 5.95 ms; stereo
@@ -885,6 +885,10 @@ Measured with a scripted scene (`coc riverwood`, `bat fpflame`: iron sword and F
 - **Correction:** `LB_SHOT`'s per-layer back-buffer capture returns the same picture for both layers on the
   headset, while depth layers are right; a fix based on "identical eyes" made things worse and was reverted.
   ([#42-c37])
+- **Budget figures from the play log** (Riverwood, capped, steady windows; re-parsed with #68's `bench.py parse`,
+  the compile counts also in #69): DXVK GPU busy 12.7–14.4 ms per frame (57–65%), game GPU latency mean 15.2 ms,
+  compositor 3.19–4.17 ms per refresh in these windows; 160 pipelines compiled at draw (906 ms in all, longest
+  200.7 ms) and 1,118 ahead, from a state cache of 3,012 entries.
 
 ## 2026-11-21 — GPU attribution in stereo (the M5; plan item 6)
 
@@ -969,6 +973,37 @@ Measured with a scripted scene (`coc riverwood`, `bat fpflame`: iron sword and F
 - `floatEmulation = False`: no effect. `LB_DEPTH_COPY=0` (the game's own R32F depth redraw) is worse: the depth
   class costs 0.46–0.74 ms more, and the boss fight's p95 rises 6–8 ms. The depth copy stays on.
 
+## 2026-11-27 — pipe logs, render-pass switches, pixel share, rate map, storm (the M1 and the M5; #42)
+
+- **Pipe log, cold cache** (M1, `boss-fight-mac`, uncapped, Mac build of main 50f0db9d with #69 #70 #71 #72 #74 #76
+  #80 and dxvk-native #8 #9 #10 #11 #13): 551 pipelines compiled at draw, 5.7 s in all, median 1.7 ms, max 477 ms;
+  43 over 22.2 ms. 99.4% of the time is inside the Vulkan pipeline creation call; MoltenVK's sub-stages read 0 in
+  this build, so that time is not split. ([#42-c38])
+- **Pipe log, warm cache** (M1, `riverwood-walk-mac` on the 550 entries the cold run wrote): 549 compiled ahead in
+  1.37 s; 73 at draw, 2.5 s in all, max 468 ms. Of the 73, 44 are new shader pairs, 28 differ from a cached entry
+  in a few fields (cull mode alone in 11; stencil, depth bias, depth write and blend factors in 11 more) and 1 is
+  an exact match. Inferred, not checked: with cull mode, depth write and stencil dynamic, about 16 of the 73 would
+  be cache hits. ([#42-c40])
+- **#80's render-pass switches with eye views** (M5, live stereo 1600×1100, eye views with test eyes, 8 rounds,
+  GPU ms per frame against base, uncapped; Riverwood idle / run / boss early / boss late): `LB_RP_UPLOAD=1`
+  −0.28 / −0.26 / −0.72 / −0.68; `LB_RP_SHADOW_DS=1` −0.12 / −0.11 / −0.43 / −0.17; both −0.39 / −0.38 / −0.81 /
+  −0.62. Riverwood sd 0.02–0.03, boss 0.5–0.9. Passes per frame with both: Riverwood 36 → 26, boss 82 → 27.
+  Capped at 45, frame time does not change. ([#42-c44], [#42-c46])
+- **Pixel share** (M5, the same stereo setup, 1600×1100 against 1132×778, half the pixels, 6 rounds): the boss
+  fight's GPU time is 23–31% pixel-bound in combat and 39–41% calm. ([#42-c45])
+- **Rate map** (the old foveated-render branch with its MoltenVK patch, mono 1600×1100 at `LB_FOV=119.8`, 0.43 of
+  the pixels through the map, 6 rounds): GPU −0.11 / +0.19 / −0.02 ms (calm / early / late), no measurable saving.
+  The rate-map route is closed. ([#42-c45])
+- **The storm** (`boss-fight-clear-mac`, #79, against the stormy boss fight, 8 rounds): GPU −0.06 / −0.09 / +0.12
+  ms, within noise; it costs nothing measurable. ([#42-c46])
+- **dxvk-native #16 (`LB_RP_ENDS`):** without #80's switches most same-target pass splits come from buffer copies
+  (38 per frame in the boss fight); with both, under one per frame remains. **dxvk-native #15
+  (`LB_DEPTH_COPY_FB`)**, on top of both switches: depth class 0.43 → 0.20 ms, GPU total −0.09 to −0.31 ms, shots
+  equal to the buffer copy's within run-to-run noise. ([#42-c46])
+- **A candidate headset stack** (both #80 switches, `Imagespace:bDoDepthOfField=0`, `Display:fShadowDistance=1000`,
+  6 rounds): GPU −1.16 / −1.15 ms in Riverwood, −1.47 / −1.85 / −2.26 ms in the boss fight (calm / early / late),
+  about −20%; capped at 45, frame time equal. The two INI keys change the picture. ([#42-c46])
+
 <!-- Issue comments cited above -->
 [#21-c2]: https://github.com/twcclegg/skyrim-apple/issues/21#issuecomment-6869056184
 [#21-c3]: https://github.com/twcclegg/skyrim-apple/issues/21#issuecomment-6869156538
@@ -1020,3 +1055,8 @@ Measured with a scripted scene (`coc riverwood`, `bat fpflame`: iron sword and F
 [#42-c34]: https://github.com/twcclegg/skyrim-apple/issues/42#issuecomment-6989573599
 [#42-c35]: https://github.com/twcclegg/skyrim-apple/issues/42#issuecomment-6989705482
 [#42-c37]: https://github.com/twcclegg/skyrim-apple/issues/42#issuecomment-7027983120
+[#42-c38]: https://github.com/twcclegg/skyrim-apple/issues/42#issuecomment-7219905158
+[#42-c40]: https://github.com/twcclegg/skyrim-apple/issues/42#issuecomment-7220194302
+[#42-c44]: https://github.com/twcclegg/skyrim-apple/issues/42#issuecomment-7225563008
+[#42-c45]: https://github.com/twcclegg/skyrim-apple/issues/42#issuecomment-7228572508
+[#42-c46]: https://github.com/twcclegg/skyrim-apple/issues/42#issuecomment-7231174154
