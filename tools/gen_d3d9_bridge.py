@@ -204,6 +204,9 @@ def gen():
                 continue
             o.append("    auto r = bridge_call(self, &%s::%s%s%s);" % (iface, name, ", " if call else "", ", ".join(call)))
             o.extend(post)
+            if iface == "IDirect3DDevice9" and name == "SetRenderState":
+                # LB_SKIP_SCENE_DEPTH: the game resolved its depth buffer into its INTZ texture (AMD's RESZ hack)
+                o.append("    if (ARG(1) == D3DRS_POINTSIZE && ARG(2) == D3D_RESZ_CODE) d3d_scene_depth_resz(self);")
             o.append("    RET((uint32_t)r, %d);" % (len(args) + 1))
             o.append("}")
             o.append("")

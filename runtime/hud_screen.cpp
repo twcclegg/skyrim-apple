@@ -370,6 +370,8 @@ bool hud_screen_in_pass(void) { return in_pass(); }
 // one bound is kept here, not referenced: use it within the frame it was bound in.
 static IDirect3DSurface9 *g_scene_depth;
 IDirect3DSurface9 *d3d_scene_depth_target(void) { return g_scene_depth; }
+// LB_SKIP_SCENE_DEPTH (d3d9_bridge.cpp): the bridge's own R32F copy of this frame's depth.
+void d3d_scene_depth_publish(IDirect3DSurface9 *s) { g_scene_depth = s; }
 // Called after each Present: a frame that never binds the depth target (menus, loading) reports none.
 void d3d_scene_depth_reset(void) { g_scene_depth = nullptr; }
 // LB_D3DTRACE: these calls define the frame's passes, so they say what the surface is, not only its handle.
@@ -388,7 +390,9 @@ void B_IDirect3DDevice9_SetRenderTarget(CPU *c) {
     if (g_d3d_trace) trace_surface("SetRenderTarget", ARG(1), s);
     if (s && ARG(1) == 0) {  // remember the scene's depth target (see d3d_scene_depth_target)
         D3DSURFACE_DESC desc;
-        if (SUCCEEDED(s->GetDesc(&desc)) && desc.Format == D3DFMT_R32F && desc.Width >= 640) g_scene_depth = s;
+        if (SUCCEEDED(s->GetDesc(&desc)) && desc.Format == D3DFMT_R32F && desc.Width >= 640 &&
+            !d3d_scene_depth_bound(s))  // LB_SKIP_SCENE_DEPTH publishes its own copy instead
+            g_scene_depth = s;
     }
     if (in_pass() && ARG(1) == 0) {
         if (s && (s == g_from_rt || s == g_from_bb || s == g_rt)) { bind_rt(d); RET(0, 3); }
