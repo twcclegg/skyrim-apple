@@ -67,7 +67,7 @@ to compare on the headset, with and without the switch.
 - The upscale costs GPU, not CPU. It only helps the CPU-bound game if the game is then run at a lower
   `LB_WINDOW` size, and render resolution costs the game mostly GPU time, so the CPU saving may be small.
 
-## Headset test (Thomas)
+## Headset test
 
 One change at a time, in `launch-env.json`:
 
