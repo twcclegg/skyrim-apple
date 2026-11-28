@@ -1,4 +1,4 @@
-# Head tracking on Vision Pro (M3a: "full immersive")
+# Head tracking on Vision Pro (the old plan's M3a: "full immersive")
 
 Goal (the project's pass/fail): the game is comfortably playable on the M2 Vision Pro in 3D immersive with
 head tracking. The depth-reprojected screen (`apple/Sources/App/ImmersiveScreen.swift`) gives 3D; this adds

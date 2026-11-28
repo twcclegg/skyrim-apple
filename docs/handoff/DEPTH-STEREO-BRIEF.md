@@ -12,7 +12,7 @@ head tracking. This brief covers the stereo and head-tracking part. You decide t
 ## The approach, and why
 
 The game keeps rendering one mono frame. The compositor draws both eyes from that frame's colour **and depth**,
-every displayed frame (90 Hz), for the newest head pose. Compared with the plan's alternate-eye hook (M3) it
+every displayed frame (90 Hz), for the newest head pose. Compared with the old plan's alternate-eye hook (M3) it
 doesn't halve each eye's frame rate and doesn't put a second frame on the game's main thread, which is the
 limit (79% of its on-CPU time is lifted code; DXVK's front end is about 3%). It also gives head translation,
 not only rotation. `docs/perf/IMMERSIVE_OPTIONS.md` compares it with the two alternatives.
@@ -51,7 +51,7 @@ not only rotation. `docs/perf/IMMERSIVE_OPTIONS.md` compares it with the two alt
    the frame per eye with depth. Two ways: a fragment-shader search as in `stereo_proto.py`, or a
    depth-displaced grid mesh drawn with each eye's real view and projection, which also covers head movement
    between game frames. Write real depth to the drawable so visionOS's own reprojection keeps working.
-4. **Head rotation into the game camera** (the plan's M3a hook), with a game FOV wider than the headset shows,
+4. **Head rotation into the game camera** (the old plan's M3a hook), with a game FOV wider than the headset shows,
    so there is picture to reproject into.
 5. **HUD and menus on their own panel**, without the scene's depth.
 

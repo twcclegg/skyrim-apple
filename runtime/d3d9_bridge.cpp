@@ -1855,9 +1855,9 @@ static void pace_present(void) {
 static void pace_present(void) {}
 #endif
 
-/* The game's main world camera as it was last set up (TESV 1.9.32.0.8, docs/VISION_PRO_PLAN.md M3): NiCamera W =
- * *(*(0x1B2E8BC)+0xB8); world rotation +0x54 (3x3, row-major), translation +0x78, frustum tangents l r t b +0xE8,
- * near/far +0xF8. Read at Present, i.e. for the frame being shown. */
+/* The game's main world camera as it was last set up (TESV 1.9.32.0.8; docs/VISION_PRO_PLAN.md, "Game camera
+ * addresses"): NiCamera W = *(*(0x1B2E8BC)+0xB8); world rotation +0x54 (3x3, row-major), translation +0x78,
+ * frustum tangents l r t b +0xE8, near/far +0xF8. Read at Present, i.e. for the frame being shown. */
 struct GameCamera { float rot[9], pos[3], frustum[6]; };  /* 18 floats */
 static bool game_camera_read(GameCamera *out) {
     uint32_t root = M32(0x1B2E8BC);

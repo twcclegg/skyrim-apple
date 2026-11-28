@@ -3,7 +3,7 @@
 Status: **windowed play works on an M2 Vision Pro** (visionOS 27.3): about 60 fps at 1280×720, with audio,
 keyboard and saves. Mouse look stops once the trackpad pointer leaves the window, because a Shared
 Space window doesn't keep pointer lock. This page records the research behind the port and the order of work;
-current status and milestones are in [VISION_PRO_PLAN.md](VISION_PRO_PLAN.md).
+current status and work list are in [VISION_PRO_PLAN.md](VISION_PRO_PLAN.md).
 
 ## Direction
 
