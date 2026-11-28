@@ -105,14 +105,12 @@ uint32_t com_wrap(void *host, int iface) {
     return g;
 }
 
-static void scene_depth_forget(void *obj);  // LB_SKIP_SCENE_DEPTH, below
 static void com_forget(uint32_t g) {
     std::lock_guard<std::recursive_mutex> l(g_lock);
     uint32_t id = M32(g + 4);
     void *h = g_objs[id];
     shadow_forget(h);
     bc_forget(h);
-    scene_depth_forget(h);
     g_host_to_guest.erase(h);
     g_objs[id] = nullptr;
     g_free_ids.push_back(id);
@@ -383,6 +381,7 @@ void B_IDirect3D9_GetAdapterDisplayMode(CPU *c) {
 static void fp_init(IDirect3DDevice9 *d);  // first-person depth, below
 static void passes_init(IDirect3DDevice9 *d);  // LB_PASSES, below
 static void d3d_passes_reset(IDirect3DDevice9 *d);
+static void scene_depth_release(void);  // LB_SKIP_SCENE_DEPTH, below
 
 void B_IDirect3D9_CreateDevice(CPU *c) {
     auto *d3d = (IDirect3D9 *)com_host(ARG(0));
@@ -435,6 +434,7 @@ void B_IDirect3DDevice9_Reset(CPU *c) {
     D3DPRESENT_PARAMETERS pp;
     pp_from_guest(ARG(1), &pp);
     { extern void hud_screen_reset(void); hud_screen_reset(); }
+    scene_depth_release();  // LB_SKIP_SCENE_DEPTH's own copy is a default-pool texture; made again at the next copy
     rt_host_affinity_begin();
     HRESULT hr = d->Reset(&pp);
     rt_host_affinity_end();
@@ -1067,23 +1067,27 @@ static bool depth_copy_draw(void) {
  * Our own readers of the R32F target (the immersive compositor's depth via the present tap, LB_SHOT's depth dumps,
  * LB_FP_FLAME_DEPTH) get a copy instead. At the frame's first resolve made with the main pass's depth-stencil bound
  * (the one bound at the frame's first PASS_MAIN draw, so the mask pass's earlier resolve never matches), that
- * depth-stencil is copied into the R32F target with dxvk_copy_depth_to_float (every stereo layer, as LB_DEPTH_COPY),
- * once per frame, and the target is named as the frame's scene depth (d3d_scene_depth_publish): third person may
- * never bind it in this mode. The target is learnt when the game creates it (an R32F render-target texture of
- * back-buffer size) or binds it at that size, and is kept by identity only: no reference, forgotten when the bridge
- * forgets the texture or its surface (com_forget). With an A8R8G8B8 scene target (bFloatPointRenderTarget=0) no draw
- * is PASS_MAIN, so no resolve matches; that is logged. The copy runs whether or not anything reads it (in the
- * immersive space on the headset something always does).
+ * depth-stencil is copied with dxvk_copy_depth_to_float (every stereo layer, as LB_DEPTH_COPY), once per frame, into
+ * an R32F texture of our own at back-buffer size, which is named as the frame's scene depth (d3d_scene_depth_publish).
+ * The game's own R32F target is not used: while it was tracked (learnt at creation or bind, forgotten when the guest
+ * released it), the M1 in live stereo had no copy target in any frame after the switch to third person, so the game
+ * most likely releases it there, and third person never binds it to teach it again. The late
+ * first-person pass binds it but draws nothing into it. Our copy costs one more back-buffer-sized R32F texture (two
+ * layers with multiview); it is released before Reset and made again at the next copy. With an A8R8G8B8 scene target
+ * (bFloatPointRenderTarget=0) no draw is PASS_MAIN, so no resolve matches; that is logged. The copy runs whether or
+ * not anything reads it (in the immersive space on the headset something always does).
  * Multiview: the fork's ResolveZ copies only layer 0 until twcclegg/dxvk-native#14 is in the build, so the game's
  * own depth reads see a stale right eye, and the start-up line warns. Remove that warning, and the note in
  * docs/perf/IMMERSIVE_OPTIONS.md, when the dxvk pin includes #14. */
 IDirect3DSurface9 *d3d_scene_depth_target(void);    // hud_screen.cpp
 void d3d_scene_depth_publish(IDirect3DSurface9 *s);  // hud_screen.cpp
 void d3d_scene_depth_reset(void);                    // hud_screen.cpp
-// The scene's R32F depth target by identity only, never AddRef'd: its texture (null for a plain surface) and that
-// texture's level 0, which shares the texture's reference count and so lives as long. Written on the device thread;
-// com_forget may compare against them from another.
-static std::atomic<void *> g_resz_tex{nullptr}, g_resz_surf{nullptr};
+// Our own R32F copy of the scene's depth (back-buffer size, render-target usage, so it has the back buffer's stereo
+// layers by the same rule as the game's target). Made at the first copy, released before Reset (scene_depth_release)
+// and made again after. The guest never sees it.
+static IDirect3DTexture9 *g_resz_own_tex;
+static IDirect3DSurface9 *g_resz_own;
+static uint32_t g_resz_own_w, g_resz_own_h;
 static int g_resz_frame;     // resolves this frame
 static bool g_resz_matched;  // ... one of them with the main pass's depth-stencil bound
 static bool g_resz_copied;   // this frame's copy is done (one per frame)
@@ -1114,44 +1118,44 @@ static void scene_depth_skip_apply(void) {
 #endif
 }
 
-static void scene_depth_learn(void *tex, void *surf, const char *how) {
-    if (g_resz_surf.load(std::memory_order_relaxed) == surf) return;
-    g_resz_tex.store(tex, std::memory_order_relaxed);
-    g_resz_surf.store(surf, std::memory_order_relaxed);
-    static int logged;
-    if (logged++ < 8) LOG("LB_SKIP_SCENE_DEPTH: the R32F depth target (%ux%u) learnt at its %s", g_bb_w, g_bb_h, how);
+// Release our copy (before Reset, which fails while a default-pool resource is alive, and on a size change).
+static void scene_depth_release(void) {
+    if (!g_resz_own) return;
+    if (d3d_scene_depth_target() == g_resz_own) d3d_scene_depth_reset();
+    g_resz_own->Release();
+    g_resz_own_tex->Release();
+    g_resz_own = nullptr;
+    g_resz_own_tex = nullptr;
 }
 
-// The game created a texture (d3d9_bcemu.cpp): an R32F render target of back-buffer size is the scene's depth target.
-void d3d_scene_depth_created(IDirect3DTexture9 *t, uint32_t w, uint32_t h, uint32_t usage, uint32_t fmt) {
-    if (!t || fmt != D3DFMT_R32F || !(usage & D3DUSAGE_RENDERTARGET) || !skip_scene_depth()) return;
-    if (!g_bb_w || w != g_bb_w || h != g_bb_h) return;
-    IDirect3DSurface9 *s = nullptr;
-    if (FAILED(t->GetSurfaceLevel(0, &s)) || !s) return;
-    s->Release();  // the level shares the texture's count: it lives as long as the texture
-    scene_depth_learn(t, s, "creation");
+// Our copy at the back buffer's current size, made if needed; null if it can't be made (logged).
+static IDirect3DSurface9 *scene_depth_own(IDirect3DDevice9 *d) {
+    if (g_resz_own && g_resz_own_w == g_bb_w && g_resz_own_h == g_bb_h) return g_resz_own;
+    scene_depth_release();
+    static int failed;
+    HRESULT hr = d->CreateTexture(g_bb_w, g_bb_h, 1, D3DUSAGE_RENDERTARGET, D3DFMT_R32F, D3DPOOL_DEFAULT,
+                                  &g_resz_own_tex, nullptr);
+    if (SUCCEEDED(hr)) hr = g_resz_own_tex->GetSurfaceLevel(0, &g_resz_own);
+    if (FAILED(hr) || !g_resz_own) {
+        if (failed++ % 600 == 0)
+            LOG("LB_SKIP_SCENE_DEPTH: can't make the %ux%u R32F depth copy (hr %08x): no depth for the compositor",
+                g_bb_w, g_bb_h, (uint32_t)hr);
+        if (g_resz_own_tex) g_resz_own_tex->Release();
+        g_resz_own_tex = nullptr;
+        g_resz_own = nullptr;
+        return nullptr;
+    }
+    g_resz_own_w = g_bb_w;
+    g_resz_own_h = g_bb_h;
+    static int made;
+    if (made++ < 8) LOG("LB_SKIP_SCENE_DEPTH: made the %ux%u R32F depth copy for the compositor", g_bb_w, g_bb_h);
+    return g_resz_own;
 }
 
-// The game bound an R32F surface as render target 0 (hud_screen.cpp). At back-buffer size it is the depth target,
-// whatever creation taught: the late first-person pass binds it in every first-person frame.
-void d3d_scene_depth_bound(IDirect3DSurface9 *s) {
-    if (g_skip_scene_depth != 1 || !s || (void *)s == g_resz_surf.load(std::memory_order_relaxed)) return;
-    D3DSURFACE_DESC desc;
-    if (FAILED(s->GetDesc(&desc)) || desc.Width != g_bb_w || desc.Height != g_bb_h) return;
-    IDirect3DTexture9 *tex = nullptr;
-    if (FAILED(s->GetContainer(__uuidof(IDirect3DTexture9), (void **)&tex))) tex = nullptr;
-    if (tex) tex->Release();
-    scene_depth_learn(tex, s, "bind");
-}
-
-// com_forget: the guest let go of obj. If it is the target (or its texture), forget it, and stop naming it.
-static void scene_depth_forget(void *obj) {
-    if (!obj || (obj != g_resz_tex.load(std::memory_order_relaxed) && obj != g_resz_surf.load(std::memory_order_relaxed)))
-        return;
-    void *surf = g_resz_surf.exchange(nullptr);
-    g_resz_tex.store(nullptr);
-    if (surf && (void *)d3d_scene_depth_target() == surf) d3d_scene_depth_reset();
-}
+// The game bound an R32F surface as render target 0 (hud_screen.cpp). True when this mode publishes its own copy,
+// so the game's target must not replace it as the frame's scene depth (the late first-person pass binds it but
+// draws nothing into it, and third person never binds it).
+bool d3d_scene_depth_bound(IDirect3DSurface9 *) { return g_skip_scene_depth == 1; }
 
 // The frame's first main-pass draw (d3d_passes_draw): remember its depth-stencil.
 static void scene_depth_main_draw(void) {
@@ -1161,16 +1165,12 @@ static void scene_depth_main_draw(void) {
     ds->Release();
 }
 
-// The main pass's resolve: copy the depth-stencil into the R32F target and name it as this frame's scene depth.
+// The main pass's resolve: copy the depth-stencil into our R32F copy and name it as this frame's scene depth.
 static void scene_depth_copy(IDirect3DDevice9 *d, IDirect3DSurface9 *ds) {
     g_resz_copied = true;  // once per frame, made or not: a later resolve could hold the late pass's first-person depth
-    auto *target = (IDirect3DSurface9 *)g_resz_surf.load(std::memory_order_relaxed);
-    static int no_target, failed;
-    if (!target) {
-        if (no_target++ % 600 == 0)
-            LOG("LB_SKIP_SCENE_DEPTH: no R32F depth target known at frame %d: no depth copy for the compositor", g_frame + 1);
-        return;
-    }
+    IDirect3DSurface9 *target = scene_depth_own(d);
+    static int failed;
+    if (!target) return;
     const long hr = dxvk_copy_depth_to_float(d, ds, target);
     if (hr != 0) {
         if (failed++ < 3) LOG("LB_SKIP_SCENE_DEPTH: depth copy for the compositor failed (hr %08lx)", (unsigned long)hr);
@@ -1180,7 +1180,7 @@ static void scene_depth_copy(IDirect3DDevice9 *d, IDirect3DSurface9 *ds) {
     static bool logged;
     if (!logged) {
         logged = true;
-        LOG("LB_SKIP_SCENE_DEPTH: the main pass's depth is copied into the R32F target for the compositor (from frame %d)",
+        LOG("LB_SKIP_SCENE_DEPTH: the main pass's depth is copied for the compositor (from frame %d)",
             g_frame + 1);
     }
 }

@@ -29,9 +29,8 @@ extern int g_d3d_trace, g_bisect, g_d3d_draws;  /* g_d3d_draws: draw calls since
  * by AMD's RESZ driver hack, which DXVK implements) instead of drawing the scene again into its R32F target. */
 #define D3D_RESZ_CODE 0x7FA05000u                       // SetRenderState(D3DRS_POINTSIZE, this) resolves depth
 void d3d_scene_depth_resz(IDirect3DDevice9 *d);        // after the game's SetRenderState(POINTSIZE, RESZ)
-void d3d_scene_depth_bound(IDirect3DSurface9 *s);      // an R32F surface was bound as render target 0 (hud_screen.cpp)
-// the game created a texture (d3d9_bcemu.cpp); an R32F render target of back-buffer size is the depth target
-void d3d_scene_depth_created(IDirect3DTexture9 *t, uint32_t w, uint32_t h, uint32_t usage, uint32_t fmt);
+// an R32F surface was bound as render target 0 (hud_screen.cpp); true: don't take it as the scene depth
+bool d3d_scene_depth_bound(IDirect3DSurface9 *s);
 bool d3d_skip_draw(void);
 void d3d_trace(CPU *c, const char *name, int nargs);
 void d3d_trace_camera(const char *why);  // LB_D3DTRACE: the game's world camera near/far and FOVs at this call
