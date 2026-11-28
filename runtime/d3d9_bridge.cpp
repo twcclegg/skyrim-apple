@@ -685,12 +685,13 @@ extern "C" void skyrim_first_person_listen(void (*fn)(int kind)) { g_fp_listener
 //   fx      the same target after the depth pass (unverified)
 //   shadow  a depth-stencil bound, target not of back-buffer aspect: the 512x1024 shadow map, also the two 512x512
 //           targets of the traced frame (unverified)
-//   mask    a depth-stencil bound, back-buffer aspect, and either smaller or (back-buffer-sized, before the main
-//           pass) in a format other than the main pass's: the deferred sun-shadow mask, an A8R8G8B8 target of the
-//           back buffer's size times iShadowMaskQuarter/4 with its own D24S8 depth-stencil of that size (seen:
-//           960x660 at 1280x880 with 3, 306 draws writing red, sampling the shadow map; 1280x880 with 4, then with the
-//           main pass's depth-stencil; skipping it removes the sun's shadows). Called "refl" before 2026-11-20;
-//           LB_SKIP_CLASS still takes that name.
+//   mask    a depth-stencil bound, back-buffer aspect, and either smaller or back-buffer-sized A8R8G8B8 before the
+//           main and depth passes: the deferred sun-shadow mask, an A8R8G8B8 target of the back buffer's size times
+//           iShadowMaskQuarter/4 with its own D24S8 depth-stencil of that size (seen: 960x660 at 1280x880 with 3, 306
+//           draws writing red, sampling the shadow map; 1280x880 with 4, then with the main pass's depth-stencil;
+//           skipping it removes the sun's shadows). With an A8R8G8B8 scene target (bFloatPointRenderTarget=0) the
+//           main pass before the depth pass is counted here too. Formerly called "refl"; LB_SKIP_CLASS still takes
+//           that name.
 //   post    no depth-stencil and <= 2 primitives: full-screen quads, the luminance chain and filters (unverified)
 //   fx      any other draw into a back-buffer-sized target after the depth pass (unverified)
 //   other   the rest
@@ -718,7 +719,7 @@ static int pass_class(uint32_t prims) {
     }
     if (f.fp) return PASS_FP;
     if (t.ds && !bb_aspect) return PASS_SHADOW;
-    if (t.ds && (smaller || (bb_size && !f.seen_main))) return PASS_MASK;
+    if (t.ds && (smaller || (bb_size && t.fmt == D3DFMT_A8R8G8B8 && !f.seen_main && !f.seen_depth))) return PASS_MASK;
     if (!t.ds && prims <= 2) return PASS_POST;
     if (bb_size && f.seen_depth) return PASS_FX;
     return PASS_OTHER;
@@ -916,7 +917,8 @@ void d3d_passes_draw(uint32_t prims) {
     if (prims <= 2) stereo_post_draw();
     if (g_reads_from >= 0) stereo_reads_draw(k, prims);
     if (g_skip_rt_on) skip_rt_draw();
-    if (k == PASS_MASK || k == PASS_MAIN) stereo_late_eyes();  // the first scene pass that has the eyes' matrices
+    // The first draws through the eyes' matrices: the mask (world or first-person draws into it), or the main pass.
+    if (k == PASS_MASK || k == PASS_MAIN || k == PASS_FP) stereo_late_eyes();
     if (g_passes_gpu) gpu_draw(k);
     PassFrame &f = g_pass_frame;
     f.cls[k].draws++;
@@ -2408,22 +2410,28 @@ static bool stereo_live_multiview(void) {
  * depth-stencil), through the scene camera, and the main pass reads it at each pixel's screen position. DXVK gives
  * two layers only to back-buffer-sized targets, so below iShadowMaskQuarter=4 the mask is drawn once, through view
  * 0's (the left eye's) matrices, and the right eye reads shadows placed for the left eye's frustum: with the
- * headset's asymmetric eye frusta, a tilted plane near the face. So the first time the mask is drawn into a
- * one-layer target, its colour target and depth-stencil are noted, and at the next Present given a second layer
- * (dxvk_stereo_make_layered): from the next frame the pass draws both views, each with its eye's matrices, and the
- * main pass samples each eye's own layer. Only targets the pass detector saw drawn as the mask, never by size.
+ * headset's asymmetric eye frusta, a tilted plane near the face. So when a draw of the mask class goes to a one-layer
+ * A8R8G8B8 target smaller than the back buffer with a depth-stencil of its own size, both are noted, and at the next
+ * Present, if a main or depth pass followed in that frame, given a second layer (dxvk_stereo_make_layered): from the
+ * next frame the pass draws both views, each with its eye's matrices, and the main pass samples each eye's own layer.
+ * The candidates are what the pass detector classed as the mask (which itself goes by size, aspect and depth-stencil);
+ * a target that does not fit is remembered and passed over, and the search goes on, so a menu or item render that
+ * happens to come first does not stop the real mask from being layered.
  * By default only with per-eye matrices (eye views; plain multiview's mono mask is off by the eye separation only).
  * The test is that eye views are set up (stereo_matrix_mode), not that the eyes' matrices are live: those stay off
- * while any menu is open, the loading screen included, so the world's first frames (about 40 on the Mac) drew the
- * mask mono and compiled mono pipelines for it that were not needed again. Layered while a menu is open, the
- * mask is drawn per eye with the plain offset the menus use, until the matrices come on.
+ * while any menu is open, the loading screen included. Where the eyes stay set through menus (LB_STEREO_TEST_EYES on
+ * the Mac), the mask is layered at the world's first frame instead of about 40 frames later, and the mono pipelines
+ * for it are never compiled; layered while a menu is open, it is drawn per eye with the plain offset the menus use.
+ * The visionOS compositor clears the eyes while a menu or the loading screen has no camera, so there the mask is
+ * layered once the world's camera is back, much as before.
  * LB_STEREO_MASK=1 also with plain multiview offsets, =0 never. Costs about one more mask pass of GPU time. */
 extern "C" int dxvk_stereo_multiview_enabled(void *device);         // dxvk_stereo.h
 extern "C" long dxvk_stereo_make_layered(void *device, void *surface);
 static IDirect3DSurface9 *g_mask_pending[2];  // colour target, depth-stencil: to be layered at the next Present
-static bool g_mask_done;                      // layered, or found not to need it, since the device's last Reset
+static bool g_mask_done;                      // layered, or multiview off, since the device's last Reset
+static void *g_mask_skip;                     // the last mask-class target found not to fit (g_pass_target.rt)
 static void stereo_mask_seen(void) {
-    if (g_mask_done || g_mask_pending[0] || !g_pass_device) return;
+    if (g_mask_done || g_mask_pending[0] || !g_pass_device || g_pass_target.rt == g_mask_skip) return;
     static int want = -1;  // 0 never, 1 always, 2 with eye views
     if (want < 0) { const char *e = getenv("LB_STEREO_MASK"); want = e && *e ? (atoi(e) ? 1 : 0) : 2; }
     if (!want || (want == 2 && !stereo_matrix_mode())) return;  // eye views may start later
@@ -2436,24 +2444,32 @@ static void stereo_mask_seen(void) {
     if (ds) ds->GetDesc(&dd);
     const int rl = rt ? dxvk_stereo_surface_layers(rt) : 0, dl = ds ? dxvk_stereo_surface_layers(ds) : 0;
     if (rl == 2 && dl == 2) {
-        g_mask_done = true;  // back-buffer-sized (iShadowMaskQuarter=4): already drawn per eye
-    } else if (rt && ds && dd.Width == rd.Width && dd.Height == rd.Height) {
+        g_mask_skip = g_pass_target.rt;  // back-buffer-sized (iShadowMaskQuarter=4): already drawn per eye
+    } else if (rt && ds && rl == 1 && rd.Format == D3DFMT_A8R8G8B8 && rd.Width < g_bb_w && dd.Width == rd.Width
+               && dd.Height == rd.Height) {
         g_mask_pending[0] = rt;
         g_mask_pending[1] = ds;
         rt = ds = nullptr;
     } else {
-        g_mask_done = true;
-        LOG("stereo: shadow mask %ux%u (%d layers) has depth-stencil %ux%u (%d layers), not its own: left mono",
-            rd.Width, rd.Height, rl, dd.Width, dd.Height, dl);
+        g_mask_skip = g_pass_target.rt;
+        static bool logged;
+        if (!logged) {
+            logged = true;
+            LOG("stereo: mask-class target %ux%u fmt %u (%d layers) with depth-stencil %ux%u (%d layers) is not a "
+                "shadow mask to layer: passed over (logged once)", rd.Width, rd.Height, (unsigned)rd.Format, rl,
+                dd.Width, dd.Height, dl);
+        }
     }
     if (rt) rt->Release();
     if (ds) ds->Release();
 }
-// At Present, or at a Reset (the game may make its targets again: look again, layer nothing now).
+// At Present, or before a Reset (the game may make its targets again: look again, layer nothing now).
 static void stereo_mask_present(bool reset) {
-    if (reset) g_mask_done = false;
+    if (reset) { g_mask_done = false; g_mask_skip = nullptr; }
     if (!g_mask_pending[0]) return;
-    if (!reset) {
+    // Only if a main or depth pass followed: the mask feeds the main pass. A frame with neither (a menu drawing a
+    // target that looks like the mask) layers nothing, and the search goes on next frame.
+    if (!reset && (g_pass_frame.seen_main || g_pass_frame.seen_depth)) {
         D3DSURFACE_DESC rd = {};
         g_mask_pending[0]->GetDesc(&rd);
         // The depth-stencil first: a two-layer colour target with a one-layer depth-stencil would stay a mono pass
@@ -2488,10 +2504,19 @@ static void stereo_mask_present(bool reset) {
  * picture, and pipelines compiled for that frame only). The luminance chain that sets the eye adaptation reduces
  * the scene to 1x1 through smaller one-layer targets (so in no chain of the bloom's) that only mono passes read,
  * so it stays one value for both eyes, from the left eye's picture, as before.
+ * Noting, chaining and reading back all happen within one frame, so every noted target is let go at each Present,
+ * layered or not: a target nothing read per eye (the first luminance level, a menu blur, a short-lived effect target)
+ * is not kept alive, and the table (16 targets; it logs once if it fills) starts empty each frame.
  * Once a chain has been layered, its size and format are a known kind: an effect that later draws into a new
  * one-layer target of that kind from a two-layer texture (the game makes such targets mid-fight) has it layered
- * before that first draw, so it never draws mono and no mono pipelines are compiled for it. Its old contents are
- * lost, which for a target first drawn now is nothing. Forgotten at a Reset, with everything else.
+ * at that draw, before the draw is made, so it draws per eye from then on and no mono pipelines are compiled for
+ * it. Its old contents are lost. The check is only that the target is not noted this frame, not that this is its
+ * first draw: a target of that kind already drawn or cleared earlier in the frame, or one that keeps history across
+ * frames, loses that once. A target whose layering failed is not tried again until the next Reset. The kinds are
+ * forgotten at a Reset, with everything else.
+ * Only samplers 0-7 are looked at (the post shaders use the first few); a read through a higher one is missed,
+ * which leaves that target mono. Like the mask, this runs from the pass hooks (d3d_passes_draw), which eye views
+ * turn on; with none of them on it does nothing.
  * Same switch and test as the mask: by default once eye views are set up (not once their matrices are live, so the
  * world's first frames, still under a menu, do not draw these passes mono); LB_STEREO_POST=1 also with plain
  * multiview, =0 never. */
@@ -2506,6 +2531,17 @@ static int g_post_n, g_post_chains;
 struct PostKind { uint32_t w, h, fmt; };
 static PostKind g_post_kinds[4];  // size and format of the targets layered so far, since the last Reset
 static int g_post_kinds_n;
+static const void *g_post_failed[8];  // targets whose layering failed, since the last Reset: not tried again
+static int g_post_failed_n;
+static bool post_failed(const void *s) {
+    for (int k = 0; k < g_post_failed_n; k++)
+        if (g_post_failed[k] == s) return true;
+    return false;
+}
+static void post_fail(const void *s) {
+    if (!post_failed(s) && g_post_failed_n < (int)(sizeof g_post_failed / sizeof g_post_failed[0]))
+        g_post_failed[g_post_failed_n++] = s;
+}
 static bool post_known_kind(const PassTarget &t) {
     for (int k = 0; k < g_post_kinds_n; k++)
         if (g_post_kinds[k].w == t.w && g_post_kinds[k].h == t.h && g_post_kinds[k].fmt == t.fmt) return true;
@@ -2539,7 +2575,12 @@ static void post_note(const PassTarget &t, int chain) {
                 if (g_post_seen[i].chain == old) g_post_seen[i].chain = chain;
         return;
     }
-    if (g_post_n >= (int)(sizeof g_post_seen / sizeof g_post_seen[0])) return;
+    if (post_failed(t.rt)) return;
+    if (g_post_n >= (int)(sizeof g_post_seen / sizeof g_post_seen[0])) {
+        static bool logged;
+        if (!logged) { logged = true; LOG("stereo: post target table full (%d): a later target stays mono", g_post_n); }
+        return;
+    }
     PostSeen &e = g_post_seen[g_post_n++];
     e.s = static_cast<IDirect3DSurface9 *>(t.rt);
     e.s->AddRef();
@@ -2563,14 +2604,22 @@ static void stereo_post_draw(void) {
     const int rl = dxvk_stereo_surface_layers(t.rt);
     bool producer = rl == 1 && !t.ds && !t.bb;
     if (!producer && rl != 2) return;
+    if (!producer && g_post_n == 0) return;  // a two-layer pass can only want a target noted this frame
     IDirect3DSurface9 *tex[8];
     const int n = bound_texture_surfaces(g_pass_device, tex);
-    if (producer && g_post_kinds_n && post_find(t.rt) < 0 && post_known_kind(t)) {
+    if (producer && g_post_kinds_n && post_find(t.rt) < 0 && !post_failed(t.rt) && post_known_kind(t)) {
         bool from2 = false;
         for (int i = 0; i < n; i++) from2 |= dxvk_stereo_surface_layers(tex[i]) == 2;
-        if (from2 && dxvk_stereo_make_layered(g_pass_device, t.rt) == 0) {
-            LOG("stereo: post target %ux%u (format %u) drawn per eye from its first draw (two layers)", t.w, t.h, t.fmt);
-            producer = false;  // now a two-layer pass: what it reads from a chain is wanted
+        if (from2) {
+            const long hr = dxvk_stereo_make_layered(g_pass_device, t.rt);
+            if (hr == 0) {
+                LOG("stereo: post target %ux%u (format %u) drawn per eye from this draw on (two layers)", t.w, t.h,
+                    t.fmt);
+                producer = false;  // now a two-layer pass: what it reads from a chain is wanted
+            } else {
+                LOG("stereo: post target %ux%u left mono: layering failed (hr %08lx)", t.w, t.h, (unsigned long)hr);
+                post_fail(t.rt);
+            }
         }
     }
     for (int i = 0; i < n; i++) {
@@ -2587,32 +2636,37 @@ static void stereo_post_draw(void) {
     }
     for (int i = 0; i < n; i++) tex[i]->Release();
 }
-// At Present (layer what is wanted), or at a Reset (forget everything: the game may make its targets again).
+// At Present (layer what is wanted, let go of everything noted), or before a Reset (also forget the kinds and the
+// failures: the game may make its targets again).
 static void stereo_post_present(bool reset) {
-    if (reset) g_post_kinds_n = 0;
+    if (reset) g_post_kinds_n = g_post_failed_n = 0;
     for (int j = 0; j < g_post_n; j++)
         if (g_post_seen[j].wanted)
             for (int i = 0; i < g_post_n; i++)
                 if (g_post_seen[i].chain == g_post_seen[j].chain) g_post_seen[i].wanted = true;
-    for (int j = 0; j < g_post_n;) {
+    for (int j = 0; j < g_post_n && !reset; j++) {
         PostSeen &e = g_post_seen[j];
-        if (!reset && e.wanted) {
+        if (e.wanted) {
             const long hr = dxvk_stereo_make_layered(g_pass_device, e.s);
             if (hr == 0) {
                 LOG("stereo: post target %ux%u (format %u) now drawn per eye (two layers)", e.w, e.h, e.fmt);
                 const PassTarget k = {nullptr, e.w, e.h, e.fmt, false, false};
                 if (!post_known_kind(k) && g_post_kinds_n < (int)(sizeof g_post_kinds / sizeof g_post_kinds[0]))
                     g_post_kinds[g_post_kinds_n++] = {e.w, e.h, e.fmt};
-            } else LOG("stereo: post target %ux%u left mono: layering failed (hr %08lx)", e.w, e.h, (unsigned long)hr);
-        }
-        if (reset || e.wanted) {  // done with it: once layered, it is only ever a source
-            e.s->Release();
-            e = g_post_seen[--g_post_n];
-            g_post_seen[g_post_n] = PostSeen();
-        } else {
-            j++;
+            } else {
+                LOG("stereo: post target %ux%u left mono: layering failed (hr %08lx)", e.w, e.h, (unsigned long)hr);
+                post_fail(e.s);
+            }
         }
     }
+    // Let go of every entry: a layered one is only ever a source from now on, and one nothing read per eye this
+    // frame is noted again if it is drawn again.
+    for (int j = 0; j < g_post_n; j++) {
+        g_post_seen[j].s->Release();
+        g_post_seen[j] = PostSeen();
+    }
+    g_post_n = 0;
+    g_post_chains = 0;
 }
 
 /* LB_STEREO_READS=<frame> (diagnostic): a read graph of the one-layer render targets under multiview, to find mono
@@ -2844,9 +2898,10 @@ static void stereo_reads_reset(void) {
 // After Present: set the eye, and the clock, for the next frame.
 /* Eye views, stage 2 of plans/eye-views.md (LB_EYE_LATE=1): the game camera trails the head (head steering is a
  * closed loop on the camera the game last presented, about 10 degrees behind a 27 deg/s sweep on the Mac), and
- * each frame is rendered where its camera points. At the frame's first draw of the sun-shadow mask or, without
- * one, of the main pass (the first passes drawn through the eyes' matrices; the camera is this frame's by then,
- * since the game culls and draws the sun's shadow maps from it before either), the eyes are turned from the
+ * each frame is rendered where its camera points. At the frame's first draw of the sun-shadow mask, of the main
+ * pass or of a first-person mesh, whichever comes first (the first draws through the eyes' matrices: the hands may
+ * be drawn into the mask before the world; the camera is this frame's by then, since the game culls and draws the
+ * sun's shadow maps from it before any of them), the eyes are turned from the
  * camera toward where the head points now (skyrim_head_now), by at most LB_EYE_LATE_MAX degrees each in heading
  * and pitch (default 2: the compositor's default margin, so the eyes stay inside what the game culls for), and the
  * matrices and the eyes this frame reports are redone with them. Turning them at the main pass instead left the
@@ -2855,13 +2910,14 @@ static void stereo_reads_reset(void) {
  * only the remaining difference is corrected there. g_late_done: once per frame. */
 static bool g_late_done;
 /* Why late eyes did or didn't apply to a frame, counted per 300 frames and logged while LB_EYE_LATE=1 is requested
- * but inactive (stereo_late_report). LATE_NOT_CALLED: no draw of the frame was classed as the mask or main pass,
- * so stereo_late_eyes never ran; the frame's largest render target is logged with it, to show what the scene used. */
+ * but inactive (stereo_late_report). LATE_NOT_CALLED: no draw of the frame was classed as the mask, main or
+ * first-person pass, so stereo_late_eyes never ran; the frame's largest render target is logged with it, to show
+ * what the scene used. */
 enum { LATE_APPLIED, LATE_NOT_CALLED, LATE_NO_MATRICES, LATE_NO_EYES, LATE_MENU, LATE_NO_CAMERA, LATE_NO_HEAD,
        LATE_STEEP, LATE_NO_FRUSTUM, LATE_COUNT };
-static const char *const k_late_why[LATE_COUNT] = {"applied", "no mask or main-pass draw", "no live eye matrices",
-    "no eyes from the compositor", "menu open", "no world camera", "no head pose (steering not anchored)",
-    "camera pitch too steep", "no valid frustum"};
+static const char *const k_late_why[LATE_COUNT] = {"applied", "no mask, main or first-person draw",
+    "no live eye matrices", "no eyes from the compositor", "menu open", "no world camera",
+    "no head pose (steering not anchored)", "camera pitch too steep", "no valid frustum"};
 static int g_late_why = LATE_NOT_CALLED;
 extern "C" int skyrim_head_now(float *heading, float *pitch);  // platform_sdl.c
 static void stereo_late_eyes(void) {
