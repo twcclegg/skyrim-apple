@@ -157,6 +157,9 @@ def gen():
                 o.append("    { extern void vr180_scene_hook(void); vr180_scene_hook(); }")
             o.append("    %s *self = (%s *)com_host(ARG(0));" % (iface, iface))
             o.append("    if (g_d3d_trace) d3d_trace(c, \"%s::%s\", %d);" % (iface, name, len(args)))
+            if iface == "IDirect3DDevice9" and name == "StretchRect":
+                # LB_STEREO_READS: a copy writes its destination (d3d_passes_copy)
+                o.append("    if (g_d3d_passes) d3d_passes_copy((IDirect3DSurface9 *)com_host(ARG(1)), (IDirect3DSurface9 *)com_host(ARG(3)));")
             if iface == "IDirect3DDevice9" and name == "SetTransform":
                 # first-person depth: the projection's near plane (d3d_fp_projection)
                 o.append("    if (g_d3d_fp && ARG(1) == D3DTS_PROJECTION && ARG(2)) d3d_fp_projection((const float *)GPTR(ARG(2)));")

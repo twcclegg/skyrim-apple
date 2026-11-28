@@ -236,6 +236,7 @@ static void B_IDirect3DDevice9_GetFrontBufferData(CPU *c) {
 static void B_IDirect3DDevice9_StretchRect(CPU *c) {
     IDirect3DDevice9 *self = (IDirect3DDevice9 *)com_host(ARG(0));
     if (g_d3d_trace) d3d_trace(c, "IDirect3DDevice9::StretchRect", 5);
+    if (g_d3d_passes) d3d_passes_copy((IDirect3DSurface9 *)com_host(ARG(1)), (IDirect3DSurface9 *)com_host(ARG(3)));
     auto r = bridge_call(self, &IDirect3DDevice9::StretchRect, (IDirect3DSurface9 *)com_host(ARG(1)), GPTR(ARG(2)), (IDirect3DSurface9 *)com_host(ARG(3)), GPTR(ARG(4)), ARG(5));
     RET((uint32_t)r, 6);
 }
