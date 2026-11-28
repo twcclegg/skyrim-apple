@@ -315,11 +315,15 @@ def search(uv0, local, eye, steps, exit_px=0.0):
 
     def step(uv, ad, d):
         r = pixel_radial(uv)
-        t = (-ad + np.sqrt(np.maximum(ad * ad - aa + r * r, F(0)))).astype(F)
+        reach = (ad * ad - aa + r * r).astype(F)
+        t = (-ad + np.sqrt(np.maximum(reach, F(0)))).astype(F)
         from_origin = eye + d * t[:, None] - ORIGIN
         on = from_origin * (EYE_BACK / np.maximum(-from_origin[:, 2], F(1e-6)))[:, None]
-        new = np.clip(np.stack([(on[:, 0] / HALF[0] + F(1)) * F(0.5), (F(1) - on[:, 1] / HALF[1]) * F(0.5)], -1), 0, 1)
-        return new.astype(F), r, t
+        new = np.stack([(on[:, 0] / HALF[0] + F(1)) * F(0.5), (F(1) - on[:, 1] / HALF[1]) * F(0.5)], -1)
+        # No point on the ray at that distance, one behind the origin, or one outside the picture: the shader
+        # keeps the pixel's last uv and stops there, without the final test.
+        lost = (reach < 0) | (from_origin[:, 2] >= 0) | (new < 0).any(1) | (new > 1).any(1)
+        return np.clip(new, 0, 1).astype(F), r, t, lost
 
     n = len(uv0)
     uv, before = uv0.copy(), uv0.copy()
@@ -329,9 +333,11 @@ def search(uv0, local, eye, steps, exit_px=0.0):
     for _ in range(steps):
         i = np.nonzero(active)[0]
         before[i] = uv[i]
-        new, r, t = step(uv[i], ad[i], d[i])
+        new, r, t, lost = step(uv[i], ad[i], d[i])
+        new[lost] = before[i[lost]]
         r_before[i], t_shown[i], uv[i] = r, t, new
         fetches[i] += 1
+        active[i[lost]] = False
         if exit_px > 0:
             moved = (new - before[i]) * SIZE
             settled = (moved * moved).sum(1) < F(exit_px) * F(exit_px)
@@ -340,7 +346,7 @@ def search(uv0, local, eye, steps, exit_px=0.0):
             active[i[settled]] = False
     if steps > 0:
         i = np.nonzero(active)[0]
-        _, r_after, t_after = step(uv[i], ad[i], d[i])
+        _, r_after, t_after, _ = step(uv[i], ad[i], d[i])
         fetches[i] += 1
         back = r_before[i] > r_after * (F(1) + TEAR)
         uv[i[back]] = before[i[back]]

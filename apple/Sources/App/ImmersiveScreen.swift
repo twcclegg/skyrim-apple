@@ -309,8 +309,10 @@ final class ImmersiveCompositor: @unchecked Sendable {
     }
     // Two triangles per grid cell, unindexed, so each vertex knows its whole triangle. With depth, each vertex moves
     // along the ray from the viewer's starting eye through its point on the screen, by how far that pixel is in the
-    // game. A triangle spanning a depth jump (an object's edge against what is behind it) is dropped instead of
-    // stretched into streaks (see below). The backplate (u.backplate) is drawn first, blurred, behind the mesh.
+    // game. With the per-pixel search off (LB_IMMERSIVE_REFINE=0), a triangle spanning a depth jump (an object's
+    // edge against what is behind it) is laid flat instead of stretched into streaks (see below), and the backplate
+    // (u.backplate, LB_IMMERSIVE_HOLES) is drawn after the mesh, blurred, behind it. With the search on (the
+    // default) the mesh stays whole and there is no backplate.
     vertex Out screen_vertex(uint id [[vertex_id]], constant Uniforms &u [[buffer(0)]],
                              texture2d<float> depth [[texture(1)]]) {
         const uint2 corners[6] = { uint2(0, 0), uint2(1, 0), uint2(0, 1), uint2(1, 0), uint2(1, 1), uint2(0, 1) };
@@ -340,8 +342,9 @@ final class ImmersiveCompositor: @unchecked Sendable {
             // stretched across the gap: the gap shows at most one cell of the edge at the background's depth. (A
             // far backplate behind dropped triangles showed whole second copies of near objects - "two heads" -
             // once the head moved away from where the rays start.)
-            // With the per-pixel search (eyeRefine.w) the mesh stays whole instead: a flat triangle leaves a gap
-            // beside the near surface, as wide as the parallax between them, and the search settles each pixel there.
+            // With the per-pixel search on (eyeRefine.w, the default) the mesh stays whole instead: a flat triangle
+            // leaves a gap beside the near surface, as wide as the parallax between them, and the search settles
+            // each pixel there.
             float rFar = max(r0, max(r1, r2));
             if (u.eyeRefine.w == 0 && rFar > min(r0, min(r1, r2)) * (1.0 + u.tear)) r = rFar;
             float fade = u.trueDepth != 0 ? 1.0 : edge_fade(uv);
@@ -402,10 +405,21 @@ final class ImmersiveCompositor: @unchecked Sendable {
         for (int i = 0; i < int(u.eyeRefine.w); i++) {
             before = uv;
             rBefore = pixel_radial(uv, u, depth);
-            float3 fromOrigin = eye + d * (-ad + sqrt(max(ad * ad - aa + rBefore * rBefore, 0.0))) - origin;
-            float3 on = fromOrigin * (u.eyeBack / max(-fromOrigin.z, 1e-6));
-            uv = saturate(float2(((on.x - u.screenCentre.x) / u.halfSize.x + 1) * 0.5,
-                                 (1 - (on.y - u.screenCentre.y) / u.halfSize.y) * 0.5));
+            // The point on the ray rBefore from the rays' origin. There is none when the eye is farther from the
+            // origin than the pixel is (something very near, such as the hands, with the head moved about that far
+            // from where the rays start), and the point can lie behind the origin, on the viewer's side, where it
+            // has no place on the screen. Neither gives a game pixel to move to: keep the last one, rather than a
+            // pixel pinned to the picture's edge.
+            float reach = ad * ad - aa + rBefore * rBefore;
+            if (reach < 0) return before;
+            float3 fromOrigin = eye + d * (-ad + sqrt(reach)) - origin;
+            if (fromOrigin.z >= 0) return before;
+            float3 on = fromOrigin * (u.eyeBack / -fromOrigin.z);
+            uv = float2(((on.x - u.screenCentre.x) / u.halfSize.x + 1) * 0.5,
+                        (1 - (on.y - u.screenCentre.y) / u.halfSize.y) * 0.5);
+            // A ray that leaves the picture: the game drew nothing there, and clamping to the border would smear
+            // its texels across the strip. Keep the last pixel inside.
+            if (any(uv < 0.0) || any(uv > 1.0)) return before;
             if (u.refineExit > 0) {
                 // Settled (LB_IMMERSIVE_REFINE_EXIT): the step moved less than refineExit game pixels and stayed on
                 // the depth texel it read, so another step would read the same depth again and move less still,
@@ -436,7 +450,11 @@ final class ImmersiveCompositor: @unchecked Sendable {
             if (u.decode) b = select(pow((b + 0.055) / 1.055, 2.4), b / 12.92, b <= 0.04045);
             return float4(b, 1);
         }
-        float2 uv = u.eyeRefine.w > 0 && u.hasDepth != 0 ? refined_uv(in, u, depth) : in.uv;
+        // Under LB_IMMERSIVE_MOTION the player's hands and weapon (nearer than heldWithin, blended into the world
+        // over the next half as far again) are placed by heldModel, while the search's eye is the viewer's in
+        // model's space: its ray there is not the one the viewer looks down. Those pixels keep the mesh's own.
+        bool held = u.heldWithin > 0 && length(in.local - float3(0, 0, u.eyeBack)) < u.heldWithin * 1.5;
+        float2 uv = u.eyeRefine.w > 0 && u.hasDepth != 0 && !held ? refined_uv(in, u, depth) : in.uv;
         float3 c = image.sample(linear_clamp, uv).rgb;
         if (u.sharpen > 0) {
             // Unsharp mask over the four neighbouring texels, limited to their range so edges don't ring.
@@ -874,16 +892,16 @@ final class ImmersiveCompositor: @unchecked Sendable {
     /// and weapon, which travel with the camera (LB_IMMERSIVE_MOTION_NEAR_M; 0 moves everything with the world).
     private lazy var motionNear: Float = getenv("LB_IMMERSIVE_MOTION_NEAR_M").flatMap { Float(String(cString: $0)) } ?? 1.0
 
-    /// Per-pixel depth search steps (LB_IMMERSIVE_REFINE; default 4, 0 = off) and the eye separation used for
-    /// drawing as a multiple of the wearer's (LB_IMMERSIVE_IPD_SCALE; above 1 gives stronger depth and a smaller
-    /// looking world). Both read when the first game frame is drawn, like the depth settings.
+    /// Per-pixel depth search steps (LB_IMMERSIVE_REFINE; default 4, 0 = off, at most 8) and the eye separation
+    /// used for drawing as a multiple of the wearer's (LB_IMMERSIVE_IPD_SCALE; above 1 gives stronger depth and a
+    /// smaller looking world). Both read when the first game frame is drawn, like the depth settings.
     private lazy var refineSteps: Float = {
         // On by default: without it the mesh's triangles at depth edges (foliage against the sky) show as shards and
-        // the hole fill behind them as dark smears. On the Vision Pro with live stereo at 1600x1100, 4 steps cost the
-        // compositor 3.4-4.2 ms per refresh (p95 4.3-6.3) with every 90 Hz refresh presented.
-        let steps = getenv("LB_IMMERSIVE_REFINE").flatMap { Float(String(cString: $0)) } ?? 4
+        // the hole fill behind them as dark smears.
+        let wanted = getenv("LB_IMMERSIVE_REFINE").flatMap { Float(String(cString: $0)) }.flatMap { $0.isNaN ? nil : $0 } ?? 4
+        let steps = max(0, min(wanted.rounded(), 8))
         log("per-pixel depth search: \(Int(steps)) steps")
-        return max(0, min(steps.rounded(), 8))
+        return steps
     }()
     private lazy var eyeSeparationScale: Float = {
         let scale = getenv("LB_IMMERSIVE_IPD_SCALE").flatMap { Float(String(cString: $0)) } ?? 1
@@ -1020,8 +1038,9 @@ final class ImmersiveCompositor: @unchecked Sendable {
     }
     private var followHead: Bool { followMode == "1" || followMode == "yaw" }
     private var followYaw: Float?
-    /// LB_IMMERSIVE_HOLES (default on): the gaps the depth mesh leaves at object edges show a blurred fill at the
-    /// farthest depth instead of black; 0 = black.
+    /// LB_IMMERSIVE_HOLES (default on), with the per-pixel search off (LB_IMMERSIVE_REFINE=0): the gaps the depth
+    /// mesh then leaves at object edges show a blurred fill at the farthest depth instead of black; 0 = black. With
+    /// the search on (the default) the mesh has no gaps and nothing is filled.
     private lazy var fillHoles: Bool = getenv("LB_IMMERSIVE_HOLES").map { String(cString: $0) != "0" } ?? true
     private var followRotation: simd_quatf?
     /// `distance`: how far ahead a head-locked screen (LB_IMMERSIVE_FOLLOW=1) sits; viewPlane when it is drawn at the
