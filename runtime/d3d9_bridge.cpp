@@ -105,12 +105,14 @@ uint32_t com_wrap(void *host, int iface) {
     return g;
 }
 
+static void scene_depth_forget(void *obj);  // LB_SKIP_SCENE_DEPTH, below
 static void com_forget(uint32_t g) {
     std::lock_guard<std::recursive_mutex> l(g_lock);
     uint32_t id = M32(g + 4);
     void *h = g_objs[id];
     shadow_forget(h);
     bc_forget(h);
+    scene_depth_forget(h);
     g_host_to_guest.erase(h);
     g_objs[id] = nullptr;
     g_free_ids.push_back(id);
@@ -433,7 +435,6 @@ void B_IDirect3DDevice9_Reset(CPU *c) {
     D3DPRESENT_PARAMETERS pp;
     pp_from_guest(ARG(1), &pp);
     { extern void hud_screen_reset(void); hud_screen_reset(); }
-    d3d_scene_depth_bound(nullptr);  // LB_SKIP_SCENE_DEPTH holds the R32F target; Reset needs it released
     rt_host_affinity_begin();
     HRESULT hr = d->Reset(&pp);
     rt_host_affinity_end();
@@ -478,6 +479,12 @@ static IDirect3DSurface9 *g_main_ds;   // the main pass's depth-stencil this fra
 static IDirect3DDevice9 *g_pass_device;
 static bool g_depth_copied;
 extern "C" long dxvk_copy_depth_to_float(void *device, void *depthStencil, void *floatTarget);
+// LB_SKIP_SCENE_DEPTH (below): the switch (-1 not read yet), and the depth-stencil bound at this frame's first main-pass
+// draw (identity only, never dereferenced; forgotten at Present).
+static int g_skip_scene_depth = -1;
+static void *g_resz_main_ds;
+static bool skip_scene_depth(void);  // reads the switch on first use
+static void scene_depth_main_draw(void);
 extern "C" void dxvk_stereo_set_view_ui_offsets(const float view0[4], const float view1[4]);
 /* Live stereo: the interface (pass class ui: menus, HUD) at LB_STEREO_HUD_DEPTH metres (default 2) instead of at
  * infinity. g_ui_k is each view's clip offset for a point at that depth, set each frame by stereo_after_present. */
@@ -625,6 +632,8 @@ static bool stereo_skip_fp(void);         // stereo captures: a frame drawn with
 static void stereo_late_eyes(void);       // eye views, LB_EYE_LATE: the eyes turned toward the head, below
 
 // The kind of the first-person draw being made, from the target bound (FP_NONE outside first-person draws).
+// With LB_SKIP_SCENE_DEPTH=1 the sun-shadow mask is drawn at the back buffer's size (A8R8G8B8), so the hands' draws into
+// it come out as FP_OTHER, not FP_MASK: LB_FP_SKIP=mask then matches nothing, and late or colour also skip them.
 static int fp_kind(void) {
     const PassFrame &f = g_pass_frame;
     if (!f.fp) return FP_NONE;
@@ -865,6 +874,7 @@ void d3d_passes_draw(uint32_t prims) {
         dxvk_stereo_set_view_ui_offsets(on0, on1);
     }
     if (k == PASS_MAIN && g_depth_copy == 1 && !g_main_ds && g_pass_device) g_pass_device->GetDepthStencilSurface(&g_main_ds);
+    if (k == PASS_MAIN && g_skip_scene_depth == 1 && !g_resz_main_ds) scene_depth_main_draw();
     if (k == PASS_MAIN) stereo_late_eyes();
     if (g_passes_gpu) gpu_draw(k);
     PassFrame &f = g_pass_frame;
@@ -977,19 +987,26 @@ static void passes_init(IDirect3DDevice9 *d) {
         // On by default with single-pass stereo (where the pass would be drawn twice); LB_DEPTH_COPY=0/1 decides.
         const char *dc = getenv("LB_DEPTH_COPY"), *mv = getenv("LB_STEREO_MULTIVIEW");
         g_depth_copy = dc ? (atoi(dc) ? 1 : 0) : (mv && !strcmp(mv, "1") ? 1 : 0);
+        // LB_SKIP_SCENE_DEPTH removes the pass LB_DEPTH_COPY replaces. Left on, its copy and skip could fire on a stray
+        // R32F draw late in the frame and put the late pass's first-person-only depth over the world's copy.
+        if (g_depth_copy && skip_scene_depth()) {
+            g_depth_copy = 0;
+            LOG("LB_DEPTH_COPY: off, LB_SKIP_SCENE_DEPTH=1 removes the pass it copies");
+        }
         if (g_depth_copy) LOG("LB_DEPTH_COPY: the R32F depth pass is a copy of the main pass's depth");
         if (const char *sc = getenv("LB_SKIP_CLASS")) {  // timing experiments: the picture is wrong by design
             for (int c = 0; c < PASS_COUNT; c++)
                 if (strstr(sc, k_pass_names[c])) g_skip_class_mask |= 1u << c;
             LOG("LB_SKIP_CLASS=%s: skipping pass classes mask %x", sc, g_skip_class_mask);
         }
+        // LB_SKIP_SCENE_DEPTH needs the classes too: the main pass's depth-stencil, and depth draws that should be gone.
         const bool fp_wanted = (fp && atoi(fp)) || getenv("LB_FP_SKIP") || (eye && atof(eye) != 0) || g_fp_flame
-                            || g_skip_class_mask || g_depth_copy == 1;
+                            || g_skip_class_mask || g_depth_copy == 1 || skip_scene_depth();
         g_d3d_passes = g_passes_log || fp_wanted;
         // without an LB_D3DTRACE range, LB_PASSES=2 looks at the first frame
         g_passdbg = g_passes_log == 2 && !getenv("LB_D3DTRACE");
         if (g_passes_log) LOG("LB_PASSES=%d: draws per pass class logged at each Present", g_passes_log);
-        else if (fp_wanted) LOG("first-person pass detection on (LB_FP, LB_FP_SKIP or LB_STEREO_EYE_UNITS)");
+        else if (fp_wanted) LOG("first-person pass detection on (LB_FP, LB_FP_SKIP, LB_STEREO_EYE_UNITS or LB_SKIP_SCENE_DEPTH)");
         if (g_d3d_passes) gpu_init(d);
     }
     if (!g_d3d_passes) return;
@@ -1021,75 +1038,191 @@ static bool depth_copy_draw(void) {
  *   NVAPI   (byte 0x1BA75FD) NVIDIA only: NvAPI copies the depth buffer. Our runtime has no nvapi.dll.
  *   RESZ    (byte 0x1BA75FF) AMD and Intel only, when CheckDeviceFormat accepts the 'RESZ' FOURCC: the game creates
  *           an INTZ depth texture (0xC73810), binds it to sampler 0, draws one point with colour and depth writes
- *           off and sets D3DRS_POINTSIZE to 0x7FA05000; the driver then copies the depth buffer into the texture.
- *           DXVK implements it (D3D9DeviceEx::ResolveZ). The game's samplers then get the INTZ texture (0xC74670).
+ *           off, sets D3DRS_POINTSIZE to 0x7FA05000 and straight back to 1.0; the driver copies the depth buffer
+ *           into the texture. DXVK implements it (D3D9DeviceEx::ResolveZ, run when POINTSIZE changes to that value,
+ *           so at every resolve here). The game's samplers then get the INTZ texture (0xC74670).
  *   redraw  otherwise (Apple GPUs report vendor 0x106B; NVIDIA without NvAPI): 0xC94C30 draws the whole batch list
- *           again with a depth technique into the back-buffer-sized R32F target (about 500-640 draws).
- * The vendor check comes from GetAdapterIdentifier (0xC71080). This switch sets the RESZ byte just after the game's
- * GetAdapterIdentifier call, before 0xC6DBF0 reads it, so the game takes the RESZ path whatever the vendor; the
- * vendor itself is not changed (it also picks the alpha-to-coverage hack). Measured on the Linux build
- * (notes/fresh-eyes-20261126/16-scene-depth-pass.md): the redraw costs 0.45-0.50 ms of main-thread time per frame
- * (5-6% of the work), 0.40-0.47 ms of it still there with LB_DEPTH_COPY skipping its draws; the RESZ path leaves
- * nothing of it.
+ *           again with a depth technique into the back-buffer-sized R32F target (500-790 draws in the runs so far).
+ * Who writes the byte (read in the lifted code): 0xC71080 turns the adapter's vendor ID into a class at 0x1BB086C
+ * (NVIDIA 1, AMD 2, Intel 3; any other vendor, Apple's included, leaves it 0). 0xC6DBF0 assigns the RESZ byte from its
+ * own CheckDeviceFormat('RESZ') result, but only for classes 2 and 3; for class 1 it tries NvAPI, and for class 0 it
+ * writes nothing. Those are the only two stores to the byte. So on Apple GPUs the 1 this switch writes after each
+ * GetAdapterIdentifier call stays (the game calls it before 0xC6DBF0 reads the byte: the Mac runs saw the depth pass
+ * at 0 draws); with LB_GPU_VENDOR=amd or intel the game assigns the byte itself, and DXVK accepts 'RESZ'. The vendor
+ * is not changed (it also picks the alpha-to-coverage hack). The first resolve is logged, and depth-pass draws seen
+ * with the switch on (the game still redrawing) are logged as a warning.
  *
- * Side effects seen on Linux: the sun-shadow mask pass is drawn at the back buffer's size instead of 3/4 of it
- * (more GPU work; shadow edges change slightly) and its depth is resolved too (a first RESZ). The R32F target is
- * still created and still bound by the late (first-person) pass, but the world's depth is no longer drawn into it.
- * Our own readers of that target (the immersive compositor's depth via the present tap, LB_SHOT's depth dumps)
- * therefore get a copy here: at the RESZ made while the main scene target is bound, the main pass's depth-stencil is
- * copied into the R32F target with dxvk_copy_depth_to_float (every stereo layer), as LB_DEPTH_COPY does.
- * The target is learnt when the game binds it (it does so every frame, after the RESZ) and held with a reference
- * until the next Reset; the first frame after a Reset has no copy.
- * Not handled yet (see the notes): DXVK's ResolveZ copies one layer, so with LB_STEREO_MULTIVIEW=1 the game's own
- * effects read a stale second layer; and whether the first-person depth still reaches the R32F target in this mode
- * is unverified. */
-static int g_skip_scene_depth = -1;
-static IDirect3DSurface9 *g_resz_depth;  // the scene's R32F depth target, held (LB_SKIP_SCENE_DEPTH only)
+ * The redraw's main-thread cost: 0.48-0.50 ms per frame on the Linux build (5.4-5.9% of the work), of which
+ * 0.40-0.47 ms is left with LB_DEPTH_COPY skipping its draws. Paired on the M5 in live stereo against LB_DEPTH_COPY=1,
+ * the median main-thread work per frame fell 0.23-0.55 ms by phase, with no measurable change in GPU time.
+ *
+ * Side effects:
+ *  - The sun-shadow mask pass is drawn at the back buffer's size instead of 3/4 of it, with its own depth-stencil,
+ *    and resolved too (a first RESZ, before the main pass draws). Its first-person draws become FP_OTHER (fp_kind).
+ *  - The late first-person pass still binds the R32F target but draws nothing into it, so the hands' and weapon's
+ *    depth is missing from it (seen on the M5 with a sword drawn). Not handled here.
+ *  - In stereo the picture changes in both eyes (on the M5 about 18% of pixels by more than 8 levels at a calm
+ *    frame, against 2-6% between runs), from the effects reading the INTZ copy; the cause is not traced.
+ *  - LB_DEPTH_COPY is turned off (passes_init).
+ * Our own readers of the R32F target (the immersive compositor's depth via the present tap, LB_SHOT's depth dumps,
+ * LB_FP_FLAME_DEPTH) get a copy instead. At the frame's first resolve made with the main pass's depth-stencil bound
+ * (the one bound at the frame's first PASS_MAIN draw, so the mask pass's earlier resolve never matches), that
+ * depth-stencil is copied into the R32F target with dxvk_copy_depth_to_float (every stereo layer, as LB_DEPTH_COPY),
+ * once per frame, and the target is named as the frame's scene depth (d3d_scene_depth_publish): third person may
+ * never bind it in this mode. The target is learnt when the game creates it (an R32F render-target texture of
+ * back-buffer size) or binds it at that size, and is kept by identity only: no reference, forgotten when the bridge
+ * forgets the texture or its surface (com_forget). With an A8R8G8B8 scene target (bFloatPointRenderTarget=0) no draw
+ * is PASS_MAIN, so no resolve matches; that is logged. The copy runs whether or not anything reads it (in the
+ * immersive space on the headset something always does).
+ * Multiview: the fork's ResolveZ copies only layer 0 until twcclegg/dxvk-native#14 is in the build, so the game's
+ * own depth reads see a stale right eye, and the start-up line warns. Remove that warning, and the note in
+ * docs/perf/IMMERSIVE_OPTIONS.md, when the dxvk pin includes #14. */
+IDirect3DSurface9 *d3d_scene_depth_target(void);    // hud_screen.cpp
+void d3d_scene_depth_publish(IDirect3DSurface9 *s);  // hud_screen.cpp
+void d3d_scene_depth_reset(void);                    // hud_screen.cpp
+// The scene's R32F depth target by identity only, never AddRef'd: its texture (null for a plain surface) and that
+// texture's level 0, which shares the texture's reference count and so lives as long. Written on the device thread;
+// com_forget may compare against them from another.
+static std::atomic<void *> g_resz_tex{nullptr}, g_resz_surf{nullptr};
+static int g_resz_frame;     // resolves this frame
+static bool g_resz_matched;  // ... one of them with the main pass's depth-stencil bound
+static bool g_resz_copied;   // this frame's copy is done (one per frame)
+
+static void scene_depth_skip_read(void) {
+    const char *e = getenv("LB_SKIP_SCENE_DEPTH");
+    g_skip_scene_depth = e && atoi(e) ? 1 : 0;
+#ifndef GAME_SKYRIM
+    g_skip_scene_depth = 0;  // the addresses are TESV 1.9.32's
+#endif
+    if (!g_skip_scene_depth) return;
+    const char *mv = getenv("LB_STEREO_MULTIVIEW");
+    // The warning belongs to twcclegg/dxvk-native#14 (ResolveZ copies every layer): drop it once the dxvk pin has it.
+    LOG("LB_SKIP_SCENE_DEPTH: the game resolves its depth buffer (RESZ) instead of drawing the scene again%s",
+        mv && !strcmp(mv, "1") ? "; WARNING: with multiview the game's own depth reads see a stale right eye unless "
+                                 "the DXVK build has twcclegg/dxvk-native#14" : "");
+}
+
+static bool skip_scene_depth(void) {
+    if (g_skip_scene_depth < 0) scene_depth_skip_read();
+    return g_skip_scene_depth == 1;
+}
 
 static void scene_depth_skip_apply(void) {
-    if (g_skip_scene_depth < 0) {
-        const char *e = getenv("LB_SKIP_SCENE_DEPTH");
-        g_skip_scene_depth = e && atoi(e) ? 1 : 0;
-#ifndef GAME_SKYRIM
-        g_skip_scene_depth = 0;  // the addresses are TESV 1.9.32's
-#endif
-        if (g_skip_scene_depth) {
-            const char *mv = getenv("LB_STEREO_MULTIVIEW");
-            LOG("LB_SKIP_SCENE_DEPTH: the game resolves its depth buffer (RESZ) instead of drawing the scene again%s",
-                mv && !strcmp(mv, "1") ? "; WARNING: with multiview the game's own depth reads see a stale right eye "
-                                         "until DXVK's ResolveZ copies every layer" : "");
-        }
-    }
+    if (!skip_scene_depth()) return;
 #ifdef GAME_SKYRIM
-    if (g_skip_scene_depth) M8(0x1BA75FF) = 1;  // the renderer's "RESZ available" byte (written by 0xC6DBF0)
+    M8(0x1BA75FF) = 1;  // the renderer's "RESZ available" byte (0xC6DBF0 writes it only on AMD and Intel, see above)
 #endif
 }
 
-void d3d_scene_depth_bound(IDirect3DSurface9 *s) {
-    if (g_skip_scene_depth != 1 || s == g_resz_depth) return;
-    if (s) s->AddRef();
-    if (g_resz_depth) g_resz_depth->Release();
-    g_resz_depth = s;
+static void scene_depth_learn(void *tex, void *surf, const char *how) {
+    if (g_resz_surf.load(std::memory_order_relaxed) == surf) return;
+    g_resz_tex.store(tex, std::memory_order_relaxed);
+    g_resz_surf.store(surf, std::memory_order_relaxed);
+    static int logged;
+    if (logged++ < 8) LOG("LB_SKIP_SCENE_DEPTH: the R32F depth target (%ux%u) learnt at its %s", g_bb_w, g_bb_h, how);
 }
 
+// The game created a texture (d3d9_bcemu.cpp): an R32F render target of back-buffer size is the scene's depth target.
+void d3d_scene_depth_created(IDirect3DTexture9 *t, uint32_t w, uint32_t h, uint32_t usage, uint32_t fmt) {
+    if (!t || fmt != D3DFMT_R32F || !(usage & D3DUSAGE_RENDERTARGET) || !skip_scene_depth()) return;
+    if (!g_bb_w || w != g_bb_w || h != g_bb_h) return;
+    IDirect3DSurface9 *s = nullptr;
+    if (FAILED(t->GetSurfaceLevel(0, &s)) || !s) return;
+    s->Release();  // the level shares the texture's count: it lives as long as the texture
+    scene_depth_learn(t, s, "creation");
+}
+
+// The game bound an R32F surface as render target 0 (hud_screen.cpp). At back-buffer size it is the depth target,
+// whatever creation taught: the late first-person pass binds it in every first-person frame.
+void d3d_scene_depth_bound(IDirect3DSurface9 *s) {
+    if (g_skip_scene_depth != 1 || !s || (void *)s == g_resz_surf.load(std::memory_order_relaxed)) return;
+    D3DSURFACE_DESC desc;
+    if (FAILED(s->GetDesc(&desc)) || desc.Width != g_bb_w || desc.Height != g_bb_h) return;
+    IDirect3DTexture9 *tex = nullptr;
+    if (FAILED(s->GetContainer(__uuidof(IDirect3DTexture9), (void **)&tex))) tex = nullptr;
+    if (tex) tex->Release();
+    scene_depth_learn(tex, s, "bind");
+}
+
+// com_forget: the guest let go of obj. If it is the target (or its texture), forget it, and stop naming it.
+static void scene_depth_forget(void *obj) {
+    if (!obj || (obj != g_resz_tex.load(std::memory_order_relaxed) && obj != g_resz_surf.load(std::memory_order_relaxed)))
+        return;
+    void *surf = g_resz_surf.exchange(nullptr);
+    g_resz_tex.store(nullptr);
+    if (surf && (void *)d3d_scene_depth_target() == surf) d3d_scene_depth_reset();
+}
+
+// The frame's first main-pass draw (d3d_passes_draw): remember its depth-stencil.
+static void scene_depth_main_draw(void) {
+    IDirect3DSurface9 *ds = nullptr;
+    if (!g_pass_device || FAILED(g_pass_device->GetDepthStencilSurface(&ds)) || !ds) return;
+    g_resz_main_ds = ds;  // identity only
+    ds->Release();
+}
+
+// The main pass's resolve: copy the depth-stencil into the R32F target and name it as this frame's scene depth.
+static void scene_depth_copy(IDirect3DDevice9 *d, IDirect3DSurface9 *ds) {
+    g_resz_copied = true;  // once per frame, made or not: a later resolve could hold the late pass's first-person depth
+    auto *target = (IDirect3DSurface9 *)g_resz_surf.load(std::memory_order_relaxed);
+    static int no_target, failed;
+    if (!target) {
+        if (no_target++ % 600 == 0)
+            LOG("LB_SKIP_SCENE_DEPTH: no R32F depth target known at frame %d: no depth copy for the compositor", g_frame + 1);
+        return;
+    }
+    const long hr = dxvk_copy_depth_to_float(d, ds, target);
+    if (hr != 0) {
+        if (failed++ < 3) LOG("LB_SKIP_SCENE_DEPTH: depth copy for the compositor failed (hr %08lx)", (unsigned long)hr);
+        return;
+    }
+    d3d_scene_depth_publish(target);  // whether or not the game binds the target later this frame
+    static bool logged;
+    if (!logged) {
+        logged = true;
+        LOG("LB_SKIP_SCENE_DEPTH: the main pass's depth is copied into the R32F target for the compositor (from frame %d)",
+            g_frame + 1);
+    }
+}
+
+// After the game's SetRenderState(D3DRS_POINTSIZE, RESZ) (generated SetRenderState): DXVK has resolved the bound
+// depth-stencil into the INTZ texture. The mask pass resolves its own depth-stencil before the main pass draws; only
+// the resolve with the main pass's depth-stencil is the world's.
 void d3d_scene_depth_resz(IDirect3DDevice9 *d) {
     if (g_skip_scene_depth != 1) return;
-    IDirect3DSurface9 *rt = nullptr, *ds = nullptr;
-    D3DSURFACE_DESC desc = {};
-    if (FAILED(d->GetRenderTarget(0, &rt)) || !rt) return;
-    rt->GetDesc(&desc);
-    rt->Release();
-    // The game resolves twice a frame: after the sun-shadow mask pass (an A8R8G8B8 target) and after the main pass
-    // (the A16B16G16R16F scene target, or A8R8G8B8 with bFloatPointRenderTarget=0). The second one is the world.
-    const bool main_target = desc.Width == g_bb_w && desc.Height == g_bb_h &&
-                             (desc.Format == D3DFMT_A16B16G16R16F || (desc.Format == D3DFMT_A8R8G8B8 && g_pass_frame.seen_main));
-    if (!main_target) return;
-    if (g_d3d_passes) g_pass_frame.seen_depth = true;  // effects after this point are "fx", as after the redraw
-    if (!g_resz_depth || FAILED(d->GetDepthStencilSurface(&ds)) || !ds) return;
-    const long hr = dxvk_copy_depth_to_float(d, ds, g_resz_depth);
+    g_resz_frame++;
+    static bool seen;
+    if (!seen) {
+        seen = true;
+        LOG("LB_SKIP_SCENE_DEPTH: the game resolved its depth (RESZ) at frame %d: its depth pass is off", g_frame + 1);
+    }
+    IDirect3DSurface9 *ds = nullptr;
+    if (FAILED(d->GetDepthStencilSurface(&ds)) || !ds) return;
+    if ((void *)ds == g_resz_main_ds) {
+        g_resz_matched = true;
+        if (g_d3d_passes) g_pass_frame.seen_depth = true;  // effects after this point are "fx", as after the redraw
+        if (!g_resz_copied) scene_depth_copy(d, ds);
+    }
     ds->Release();
-    static int logged;
-    if (hr != 0 && logged++ < 3) LOG("LB_SKIP_SCENE_DEPTH: depth copy for the compositor failed (hr %08lx)", (unsigned long)hr);
+}
+
+// At Present (passes_present, before the frame's classes are cleared): warnings about this frame, then a new frame.
+static void scene_depth_present(void) {
+    if (g_skip_scene_depth != 1) return;
+    const int depth_draws = g_d3d_passes ? g_pass_frame.cls[PASS_DEPTH].draws : 0;
+    static int warned_draws, warned_unmatched, warned_none;
+    if (depth_draws && warned_draws++ % 600 == 0)
+        LOG("LB_SKIP_SCENE_DEPTH: WARNING: %d depth-pass draws into the R32F target at frame %d (%d resolves): the game "
+            "still draws its depth pass", depth_draws, g_frame, g_resz_frame);
+    if (g_resz_frame && !g_resz_matched && warned_unmatched++ % 600 == 0)
+        LOG("LB_SKIP_SCENE_DEPTH: %d resolves at frame %d, none with the main pass's depth-stencil bound (%s): no depth "
+            "copy for the compositor", g_resz_frame, g_frame, g_resz_main_ds ? "another was" : "no main-pass draw seen");
+    if (!g_resz_frame && g_resz_main_ds && warned_none++ % 600 == 0)
+        LOG("LB_SKIP_SCENE_DEPTH: frame %d drew a main pass but made no resolve: no fresh depth for the compositor",
+            g_frame);
+    g_resz_main_ds = nullptr;
+    g_resz_frame = 0;
+    g_resz_matched = g_resz_copied = false;
 }
 
 static void passes_present(void) {
@@ -1097,6 +1230,7 @@ static void passes_present(void) {
     g_pass_biggest_now = PassTarget();
     for (int c = 0; c < PASS_COUNT && c < 16; c++) g_pass_draws_last[c] = (int)g_pass_frame.cls[c].draws;
     g_depth_copied = false;
+    scene_depth_present();
     if (g_ui_shift_on) {
         static const float zero[4] = {0, 0, 0, 0};
         dxvk_stereo_set_view_ui_offsets(zero, zero);

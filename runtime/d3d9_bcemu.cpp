@@ -165,6 +165,7 @@ void B_IDirect3DDevice9_CreateTexture(CPU *c) {
         std::lock_guard<std::mutex> l(g_bc_lock);
         g_tex[t] = BcTex{fmt};
     }
+    if (SUCCEEDED(hr)) d3d_scene_depth_created(t, ARG(1), ARG(2), ARG(4), fmt);  // LB_SKIP_SCENE_DEPTH
     if (ARG(7)) M32(ARG(7)) = SUCCEEDED(hr) ? d3d9_wrap(t, IFACE_IDirect3DTexture9) : 0;
     RET(hr, 9);
 }
