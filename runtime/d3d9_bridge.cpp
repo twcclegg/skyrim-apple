@@ -2461,10 +2461,19 @@ static void stereo_mask_present(bool reset) {
  * picture, and pipelines compiled for that frame only). The luminance chain that sets the eye adaptation reduces
  * the scene to 1x1 through smaller one-layer targets (so in no chain of the bloom's) that only mono passes read,
  * so it stays one value for both eyes, from the left eye's picture, as before.
+ * Noting, chaining and reading back all happen within one frame, so every noted target is let go at each Present,
+ * layered or not: a target nothing read per eye (the first luminance level, a menu blur, a short-lived effect target)
+ * is not kept alive, and the table (16 targets; it logs once if it fills) starts empty each frame.
  * Once a chain has been layered, its size and format are a known kind: an effect that later draws into a new
  * one-layer target of that kind from a two-layer texture (the game makes such targets mid-fight) has it layered
- * before that first draw, so it never draws mono and no mono pipelines are compiled for it. Its old contents are
- * lost, which for a target first drawn now is nothing. Forgotten at a Reset, with everything else.
+ * at that draw, before the draw is made, so it draws per eye from then on and no mono pipelines are compiled for
+ * it. Its old contents are lost. The check is only that the target is not noted this frame, not that this is its
+ * first draw: a target of that kind already drawn or cleared earlier in the frame, or one that keeps history across
+ * frames, loses that once. A target whose layering failed is not tried again until the next Reset. The kinds are
+ * forgotten at a Reset, with everything else.
+ * Only samplers 0-7 are looked at (the post shaders use the first few); a read through a higher one is missed,
+ * which leaves that target mono. Like the mask, this runs from the pass hooks (d3d_passes_draw), which eye views
+ * turn on; with none of them on it does nothing.
  * Same switch and test as the mask: by default once eye views are set up (not once their matrices are live, so the
  * world's first frames, still under a menu, do not draw these passes mono); LB_STEREO_POST=1 also with plain
  * multiview, =0 never. */
@@ -2479,6 +2488,17 @@ static int g_post_n, g_post_chains;
 struct PostKind { uint32_t w, h, fmt; };
 static PostKind g_post_kinds[4];  // size and format of the targets layered so far, since the last Reset
 static int g_post_kinds_n;
+static const void *g_post_failed[8];  // targets whose layering failed, since the last Reset: not tried again
+static int g_post_failed_n;
+static bool post_failed(const void *s) {
+    for (int k = 0; k < g_post_failed_n; k++)
+        if (g_post_failed[k] == s) return true;
+    return false;
+}
+static void post_fail(const void *s) {
+    if (!post_failed(s) && g_post_failed_n < (int)(sizeof g_post_failed / sizeof g_post_failed[0]))
+        g_post_failed[g_post_failed_n++] = s;
+}
 static bool post_known_kind(const PassTarget &t) {
     for (int k = 0; k < g_post_kinds_n; k++)
         if (g_post_kinds[k].w == t.w && g_post_kinds[k].h == t.h && g_post_kinds[k].fmt == t.fmt) return true;
@@ -2512,7 +2532,12 @@ static void post_note(const PassTarget &t, int chain) {
                 if (g_post_seen[i].chain == old) g_post_seen[i].chain = chain;
         return;
     }
-    if (g_post_n >= (int)(sizeof g_post_seen / sizeof g_post_seen[0])) return;
+    if (post_failed(t.rt)) return;
+    if (g_post_n >= (int)(sizeof g_post_seen / sizeof g_post_seen[0])) {
+        static bool logged;
+        if (!logged) { logged = true; LOG("stereo: post target table full (%d): a later target stays mono", g_post_n); }
+        return;
+    }
     PostSeen &e = g_post_seen[g_post_n++];
     e.s = static_cast<IDirect3DSurface9 *>(t.rt);
     e.s->AddRef();
@@ -2536,14 +2561,22 @@ static void stereo_post_draw(void) {
     const int rl = dxvk_stereo_surface_layers(t.rt);
     bool producer = rl == 1 && !t.ds && !t.bb;
     if (!producer && rl != 2) return;
+    if (!producer && g_post_n == 0) return;  // a two-layer pass can only want a target noted this frame
     IDirect3DSurface9 *tex[8];
     const int n = bound_texture_surfaces(g_pass_device, tex);
-    if (producer && g_post_kinds_n && post_find(t.rt) < 0 && post_known_kind(t)) {
+    if (producer && g_post_kinds_n && post_find(t.rt) < 0 && !post_failed(t.rt) && post_known_kind(t)) {
         bool from2 = false;
         for (int i = 0; i < n; i++) from2 |= dxvk_stereo_surface_layers(tex[i]) == 2;
-        if (from2 && dxvk_stereo_make_layered(g_pass_device, t.rt) == 0) {
-            LOG("stereo: post target %ux%u (format %u) drawn per eye from its first draw (two layers)", t.w, t.h, t.fmt);
-            producer = false;  // now a two-layer pass: what it reads from a chain is wanted
+        if (from2) {
+            const long hr = dxvk_stereo_make_layered(g_pass_device, t.rt);
+            if (hr == 0) {
+                LOG("stereo: post target %ux%u (format %u) drawn per eye from this draw on (two layers)", t.w, t.h,
+                    t.fmt);
+                producer = false;  // now a two-layer pass: what it reads from a chain is wanted
+            } else {
+                LOG("stereo: post target %ux%u left mono: layering failed (hr %08lx)", t.w, t.h, (unsigned long)hr);
+                post_fail(t.rt);
+            }
         }
     }
     for (int i = 0; i < n; i++) {
@@ -2560,32 +2593,37 @@ static void stereo_post_draw(void) {
     }
     for (int i = 0; i < n; i++) tex[i]->Release();
 }
-// At Present (layer what is wanted), or at a Reset (forget everything: the game may make its targets again).
+// At Present (layer what is wanted, let go of everything noted), or before a Reset (also forget the kinds and the
+// failures: the game may make its targets again).
 static void stereo_post_present(bool reset) {
-    if (reset) g_post_kinds_n = 0;
+    if (reset) g_post_kinds_n = g_post_failed_n = 0;
     for (int j = 0; j < g_post_n; j++)
         if (g_post_seen[j].wanted)
             for (int i = 0; i < g_post_n; i++)
                 if (g_post_seen[i].chain == g_post_seen[j].chain) g_post_seen[i].wanted = true;
-    for (int j = 0; j < g_post_n;) {
+    for (int j = 0; j < g_post_n && !reset; j++) {
         PostSeen &e = g_post_seen[j];
-        if (!reset && e.wanted) {
+        if (e.wanted) {
             const long hr = dxvk_stereo_make_layered(g_pass_device, e.s);
             if (hr == 0) {
                 LOG("stereo: post target %ux%u (format %u) now drawn per eye (two layers)", e.w, e.h, e.fmt);
                 const PassTarget k = {nullptr, e.w, e.h, e.fmt, false, false};
                 if (!post_known_kind(k) && g_post_kinds_n < (int)(sizeof g_post_kinds / sizeof g_post_kinds[0]))
                     g_post_kinds[g_post_kinds_n++] = {e.w, e.h, e.fmt};
-            } else LOG("stereo: post target %ux%u left mono: layering failed (hr %08lx)", e.w, e.h, (unsigned long)hr);
-        }
-        if (reset || e.wanted) {  // done with it: once layered, it is only ever a source
-            e.s->Release();
-            e = g_post_seen[--g_post_n];
-            g_post_seen[g_post_n] = PostSeen();
-        } else {
-            j++;
+            } else {
+                LOG("stereo: post target %ux%u left mono: layering failed (hr %08lx)", e.w, e.h, (unsigned long)hr);
+                post_fail(e.s);
+            }
         }
     }
+    // Let go of every entry: a layered one is only ever a source from now on, and one nothing read per eye this
+    // frame is noted again if it is drawn again.
+    for (int j = 0; j < g_post_n; j++) {
+        g_post_seen[j].s->Release();
+        g_post_seen[j] = PostSeen();
+    }
+    g_post_n = 0;
+    g_post_chains = 0;
 }
 
 // After Present: set the eye, and the clock, for the next frame.
