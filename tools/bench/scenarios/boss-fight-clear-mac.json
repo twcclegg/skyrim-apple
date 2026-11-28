@@ -1,92 +1,10 @@
 {
-  "description": "The boss fight (boss-fight-mac) without the storm, to measure the fight without rain and its effects. Identical to boss-fight-mac except the batch file: at frame 1900 the console runs `bat bossclear` (same length as `bat benchboss`, so every key lands on the same frame), and bossclear.txt forces SkyrimClear (fw 0000081A) where benchboss.txt forces the storm (fw 000C8220); god mode and the same spawns (two high-level dragons, 14 bandits, 2 storm atronachs) follow in the same order. The weather batch at frame 1510 (benchwx: SkyrimClear) is unchanged, so the sky is clear for the whole run. Run with --env LB_VPAD=0 (see boss-fight-mac). Phases and shots as in boss-fight-mac.",
+  "description": "The boss fight (boss-fight-mac) without the storm, to measure the fight without rain and its effects. Identical to boss-fight-mac except the batch file: at frame 1900 the console runs `bat bossclear` (same length as `bat benchboss`, so every key lands on the same frame; typed through console_later, which gives the same keys and frames as boss-fight-mac's hand-written ones, with the command readable in one place), and bossclear.txt forces SkyrimClear (fw 0000081A) where benchboss.txt forces the storm (fw 000C8220); god mode and the same spawns (two high-level dragons, 14 bandits, 2 storm atronachs) follow in the same order. The weather batch at frame 1510 (benchwx: SkyrimClear) is unchanged, so the sky is clear for the whole run. LB_VPAD=0 is set by the scenario's env, as in boss-fight-mac. Phases and shots as in boss-fight-mac.",
   "console_at": 600,
   "console": [
     "coc whiterunorigin"
   ],
   "console_close": false,
-  "keys": [
-    {
-      "key": "`",
-      "start": 1900,
-      "frames": 2
-    },
-    {
-      "key": "B",
-      "start": 1920,
-      "frames": 2
-    },
-    {
-      "key": "A",
-      "start": 1926,
-      "frames": 2
-    },
-    {
-      "key": "T",
-      "start": 1932,
-      "frames": 2
-    },
-    {
-      "key": "Space",
-      "start": 1938,
-      "frames": 2
-    },
-    {
-      "key": "B",
-      "start": 1944,
-      "frames": 2
-    },
-    {
-      "key": "O",
-      "start": 1950,
-      "frames": 2
-    },
-    {
-      "key": "S",
-      "start": 1956,
-      "frames": 2
-    },
-    {
-      "key": "S",
-      "start": 1962,
-      "frames": 2
-    },
-    {
-      "key": "C",
-      "start": 1968,
-      "frames": 2
-    },
-    {
-      "key": "L",
-      "start": 1974,
-      "frames": 2
-    },
-    {
-      "key": "E",
-      "start": 1980,
-      "frames": 2
-    },
-    {
-      "key": "A",
-      "start": 1986,
-      "frames": 2
-    },
-    {
-      "key": "R",
-      "start": 1992,
-      "frames": 2
-    },
-    {
-      "key": "Return",
-      "start": 1998,
-      "frames": 2
-    },
-    {
-      "key": "`",
-      "start": 2028,
-      "frames": 2
-    }
-  ],
   "phases": {
     "calm": [
       1660,
@@ -133,6 +51,10 @@
     {
       "at": 1510,
       "command": "bat benchwx"
+    },
+    {
+      "at": 1900,
+      "command": "bat bossclear"
     }
   ]
 }
