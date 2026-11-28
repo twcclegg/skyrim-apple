@@ -31,10 +31,13 @@ void d3d_trace_camera(const char *why);  // LB_D3DTRACE: the game's world camera
 
 /* LB_PASSES (d3d9_bridge.cpp): draws and primitives per kind of pass, logged at each Present. 0 off, 1 the
  * per-frame "pass" line, 2 also "passdbg" and "fpdbg" lines. The hooks are called only while g_d3d_passes is set:
- * with LB_PASSES, or without logs when the first-person flag is wanted (LB_FP=1, LB_FP_SKIP, LB_STEREO_EYE_UNITS).
- * LB_PASSES_GPU=1 adds "passgpu" lines with GPU ms per class from timestamp queries. */
+ * with LB_PASSES, or without logs when the first-person flag is wanted (LB_FP=1, LB_FP_SKIP, LB_STEREO_EYE_UNITS,
+ * LB_SKIP_CLASS, LB_DEPTH_COPY), or with LB_PASS_STATS (its own lines only).
+ * LB_PASSES_GPU=1 (with LB_PASSES) adds "passgpu" lines with GPU ms per class from timestamp queries. */
 extern int g_d3d_passes;
-void d3d_passes_draw(uint32_t prims);          // every Draw*Primitive*, with its primitive count
+// every Draw*Primitive*, with its primitive count and, for DrawPrimitiveUP / DrawIndexedPrimitiveUP, the vertex
+// stride it passes (-1 for the others)
+void d3d_passes_draw(uint32_t prims, int up_stride);
 void d3d_passes_target(IDirect3DDevice9 *d);   // after the render target 0 or the depth-stencil surface changed
 void d3d_passes_clear(uint32_t flags);         // before a Clear, with its D3DCLEAR_* flags
 void d3d_passes_projection(const float *m);    // SetTransform(D3DTS_PROJECTION), the guest's matrix

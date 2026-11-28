@@ -131,6 +131,9 @@ VOID_RET = {"PreLoad", "GenerateMipSubLevels"}
 
 # The argument holding the primitive count of each draw call, for LB_PASSES (d3d_passes_draw).
 DRAW_PRIMS = {"DrawPrimitive": 3, "DrawIndexedPrimitive": 6, "DrawPrimitiveUP": 2, "DrawIndexedPrimitiveUP": 4}
+# The argument holding VertexStreamZeroStride of the draws that pass their vertices directly (stream 0 is not
+# used, and DXVK clears it after them), for LB_PASS_STATS; -1 for the others.
+DRAW_UP_STRIDE = {"DrawPrimitiveUP": 4, "DrawIndexedPrimitiveUP": 8}
 
 
 def gen():
@@ -165,7 +168,8 @@ def gen():
             if name.startswith("Draw") and not name.endswith("Patch"):
                 o.append("    g_d3d_draws++;")
                 o.append("    if (g_d3d_fp) d3d_fp_draw();")
-                o.append("    if (g_d3d_passes) d3d_passes_draw(ARG(%d));" % DRAW_PRIMS[name])
+                up = "(int)ARG(%d)" % DRAW_UP_STRIDE[name] if name in DRAW_UP_STRIDE else "-1"
+                o.append("    if (g_d3d_passes) d3d_passes_draw(ARG(%d), %s);" % (DRAW_PRIMS[name], up))
                 if name == "DrawIndexedPrimitive":
                     o.append("    if (g_fp_flame) d3d_fp_flame_draw(self, 1, ARG(1), ARG(2), ARG(3), ARG(4), ARG(5), ARG(6));")
                 elif name == "DrawPrimitive":
