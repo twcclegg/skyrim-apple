@@ -185,6 +185,12 @@ enum SpatialEventLog {
     }
 }
 
+private struct HudUniforms {
+    var mvp: simd_float4x4
+    var rect: SIMD4<Float>
+    var z: Float
+}
+
 private struct QuadUniforms {
     var viewProjection: simd_float4x4
     var model: simd_float4x4
@@ -451,6 +457,30 @@ final class ImmersiveCompositor: @unchecked Sendable {
         if (u.decode) c = select(pow((c + 0.055) / 1.055, 2.4), c / 12.92, c <= 0.04045);
         return float4(c, 1);
     }
+    // LB_HUD_LAYER: the interface as a flat quad (rect: centre xy, half size zw, on the plane z of the frame's space).
+    struct HudUniforms { float4x4 mvp; float4 rect; float z; };
+    struct HudOut { float4 position [[position]]; float2 uv; };
+    vertex HudOut hud_vertex(uint id [[vertex_id]], constant HudUniforms &h [[buffer(0)]]) {
+        float2 uv = float2(id & 1, id >> 1);
+        HudOut o;
+        o.uv = uv;
+        o.position = h.mvp * float4(h.rect.x + (uv.x * 2 - 1) * h.rect.z, h.rect.y + (1 - uv.y * 2) * h.rect.w, h.z, 1);
+        return o;
+    }
+    // The runtime drew the interface onto transparent black with alpha forced to coverage: colour is sRGB-encoded
+    // and premultiplied by coverage, alpha is the coverage. The texture is sampled as stored, so un-premultiply,
+    // decode and premultiply again (decoding the premultiplied value would darken translucent pixels), then put it
+    // over the scene with that coverage. Additive interface draws add colour without coverage, so colour can exceed
+    // alpha: dividing by m = max(alpha, colour) keeps them, and is plain un-premultiplying otherwise.
+    fragment float4 hud_fragment(HudOut in [[stage_in]], texture2d<float> hud [[texture(0)]]) {
+        constexpr sampler linear_clamp(filter::linear, address::clamp_to_edge);
+        float4 c = hud.sample(linear_clamp, in.uv);
+        float m = max(c.a, max(c.r, max(c.g, c.b)));
+        if (m <= 0.0) return float4(0);
+        float3 g = saturate(c.rgb / m);
+        float3 l = select(pow((g + 0.055) / 1.055, 2.4), g / 12.92, g <= 0.04045);
+        return float4(l * m, saturate(c.a));
+    }
     """
 
     /// Distance to the screen and its width, in meters.
@@ -462,6 +492,10 @@ final class ImmersiveCompositor: @unchecked Sendable {
     private let queue: any MTLCommandQueue
     private var pipeline: (any MTLRenderPipelineState)?
     private var depth: (any MTLDepthStencilState)?
+    private var hudPipeline: (any MTLRenderPipelineState)?
+    private var hudDepth: (any MTLDepthStencilState)?
+    /// LB_HUD_DISTANCE: metres ahead of the frame's camera at which the interface layer (LB_HUD_LAYER) is shown.
+    private lazy var hudDistance: Float = getenv("LB_HUD_DISTANCE").flatMap { Float(String(cString: $0)) }.map { max(0.3, $0) } ?? 2.0
     private let session = ARKitSession()
     private let tracking = WorldTrackingProvider()
     private var screen: simd_float4x4?
@@ -809,6 +843,23 @@ final class ImmersiveCompositor: @unchecked Sendable {
         stencil.depthCompareFunction = .greater
         stencil.isDepthWriteEnabled = true
         depth = device.makeDepthStencilState(descriptor: stencil)
+        let hud = MTLRenderPipelineDescriptor()
+        hud.vertexFunction = library.makeFunction(name: "hud_vertex")
+        hud.fragmentFunction = library.makeFunction(name: "hud_fragment")
+        hud.colorAttachments[0].pixelFormat = layer.configuration.colorFormat
+        hud.colorAttachments[0].isBlendingEnabled = true
+        hud.colorAttachments[0].sourceRGBBlendFactor = .one
+        hud.colorAttachments[0].destinationRGBBlendFactor = .oneMinusSourceAlpha
+        hud.colorAttachments[0].sourceAlphaBlendFactor = .one
+        hud.colorAttachments[0].destinationAlphaBlendFactor = .oneMinusSourceAlpha
+        hud.depthAttachmentPixelFormat = layer.configuration.depthFormat
+        // Optional: without it the interface stays out of the layer, and the picture is still shown.
+        do { hudPipeline = try device.makeRenderPipelineState(descriptor: hud) } catch { log("hud pipeline: \(error)") }
+        // The interface writes no depth, so visionOS's own late reprojection still sees the scene's depth under it.
+        let always = MTLDepthStencilDescriptor()
+        always.depthCompareFunction = .always
+        always.isDepthWriteEnabled = false
+        hudDepth = device.makeDepthStencilState(descriptor: always)
     }
 
     /// Depth tuning from the launch environment (LB_ prefix, Documents/SkyrimNative/launch-env.json), read once the
@@ -1226,11 +1277,13 @@ final class ImmersiveCompositor: @unchecked Sendable {
             var model = anchor != nil ? place(head: head, distance: atFOV ? Self.viewPlane : Self.distance) : screen
             var halfSize: SIMD2<Float>? = nil
             var heldModel: simd_float4x4? = nil
+            var hudCamera: [Float]? = nil  // LB_HUD_LAYER: the frame's camera when the frame is placed by it
             if atFOV, anchor != nil {
                 // Locked to the head and as wide as the game's field of view: the frame fills the angles it was
                 // rendered for whichever way the head faces, at true depth.
                 let c = withUnsafeBytes(of: game.camera) { Array($0.bindMemory(to: Float.self)) }
                 halfSize = SIMD2(Self.viewPlane * c[13], Self.viewPlane * c[14])
+                hudCamera = c
             }
             if anchor == nil { dropEyes() }
             if headMode, anchor != nil {
@@ -1252,6 +1305,7 @@ final class ImmersiveCompositor: @unchecked Sendable {
                         heldModel = poses.held
                         // Frustum tangents right and top: the frame covers exactly the angles it was rendered for.
                         halfSize = SIMD2(Self.viewPlane * c[13], Self.viewPlane * c[14])
+                        hudCamera = c
                     }
                 }
                 // Menus and loading come without a camera: show them on a screen placed ahead of where the head
@@ -1384,6 +1438,34 @@ final class ImmersiveCompositor: @unchecked Sendable {
                         encoder.setFragmentBytes(&plate, length: MemoryLayout<QuadUniforms>.stride, index: 0)
                         encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: vertexCount)
                     }
+                }
+                if let hudPointer = game.hud_texture, let hudPipeline, let hudDepth, let place = heldModel ?? model,
+                   let hud = Unmanaged<AnyObject>.fromOpaque(hudPointer).takeUnretainedValue() as? any MTLTexture {
+                    // LB_HUD_LAYER: the interface as a flat layer, never moved by the depth mesh. With a camera, a
+                    // plane hudDistance ahead of it spanning the game's field of view (so the reticle stays on the
+                    // aim point), placed as the frame is but without the movement shift; without one (menus), over
+                    // the screen the picture is shown on, just in front of it.
+                    var rect: SIMD4<Float>
+                    var z: Float
+                    if let c = hudCamera {
+                        let d = hudDistance
+                        rect = SIMD4(d * (c[13] + c[12]) / 2, d * (c[14] + c[15]) / 2, d * (c[13] - c[12]) / 2, d * (c[14] - c[15]) / 2)
+                        z = Self.viewPlane - d  // the plane's space has the eye at z = viewPlane, looking to -z
+                    } else {
+                        let aspect = game.height > 0 ? Float(game.width) / Float(game.height) : 16.0 / 9.0
+                        let half = halfSize ?? SIMD2(Self.width / 2, Self.width / 2 / aspect)
+                        rect = SIMD4(0, 0, half.x, half.y)
+                        z = 0.002
+                    }
+                    var eyeFromDevice = view.transform
+                    eyeFromDevice.columns.3 = eyesCentre + (eyeFromDevice.columns.3 - eyesCentre) * eyeSeparationScale
+                    let viewProjection = drawable.computeProjection(convention: .rightUpBack, viewIndex: index) * (head * eyeFromDevice).inverse
+                    var hudUniforms = HudUniforms(mvp: viewProjection * place, rect: rect, z: z)
+                    encoder.setRenderPipelineState(hudPipeline)
+                    encoder.setDepthStencilState(hudDepth)
+                    encoder.setVertexBytes(&hudUniforms, length: MemoryLayout<HudUniforms>.stride, index: 0)
+                    encoder.setFragmentTexture(hud, index: 0)
+                    encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
                 }
                 encoder.endEncoding()
             }

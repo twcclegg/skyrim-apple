@@ -426,11 +426,13 @@ void B_IDirect3DDevice9_CreateAdditionalSwapChain(CPU *c) {
     RET(hr, 3);
 }
 
+static void hud_layer_release(void);  // LB_HUD_LAYER, below
 void B_IDirect3DDevice9_Reset(CPU *c) {
     auto *d = (IDirect3DDevice9 *)com_host(ARG(0));
     D3DPRESENT_PARAMETERS pp;
     pp_from_guest(ARG(1), &pp);
     { extern void hud_screen_reset(void); hud_screen_reset(); }
+    hud_layer_release();  // default-pool surfaces and the held back buffer: Reset refuses while they live
     rt_host_affinity_begin();
     HRESULT hr = d->Reset(&pp);
     rt_host_affinity_end();
@@ -479,6 +481,210 @@ extern "C" void dxvk_stereo_set_view_ui_offsets(const float view0[4], const floa
 /* Live stereo: the interface (pass class ui: menus, HUD) at LB_STEREO_HUD_DEPTH metres (default 2) instead of at
  * infinity. g_ui_k is each view's clip offset for a point at that depth, set each frame by stereo_after_present. */
 static float g_ui_k[2][2];  // [view][x, y]
+
+/* LB_HUD_LAYER=1 (immersive): the interface is drawn on its own. Its draws (the ui pass class: into the back buffer
+ * after the final image) go to a transparent RGBA target of the back buffer's size instead, and that target goes to
+ * the compositor beside the frame (dxvk_present_tap_set_hud), which shows it as a flat layer ahead of the frame's
+ * camera. Then the depth mesh never moves it: before, panning tore the reticle in two (each pixel was placed at the
+ * depth of the scene behind it). Stereo HUD offsets are off with it (the layer is drawn once, as a plane).
+ *  - Only while the immersive layer has the present tap to itself (skyrim_hud_layer_exclusive, from
+ *    ipad/immersive_bridge.mm), decided at each frame's first ui draw. Otherwise the window shows the game, and the
+ *    interface stays in the picture as before.
+ *  - The game's depth-stencil stays bound: menu and loading-screen models are depth-tested, and the interface may
+ *    mask with stencil. It already served draws into the back buffer, so it fits a target of that size; one that
+ *    does not (multisampled, or smaller) is swapped for the target's own D24S8 while the target is bound.
+ *  - Alpha is coverage. The game blends colour onto the target as it would onto the back buffer, but alpha gets its
+ *    own blend (SEPARATEALPHABLENDENABLE): ONE, INVSRCALPHA, or ZERO, ONE when the colour blend is additive
+ *    (DESTBLEND ONE). So the target holds the interface's gamma-space colour premultiplied by coverage, and its
+ *    coverage in alpha (overlapping layers included), which the compositor puts over the scene. The game's own
+ *    separate-alpha states come back at its next draw outside the ui pass, and before Present.
+ *  - The target has one layer under multiview (dxvk_stereo_create_mono), so the pass stays mono, as it was into the
+ *    back buffer.
+ *  - The target is cleared once per frame over its whole area, whatever the game's viewport and scissor rect.
+ *    SetRenderTarget resets both, so the game's are put back after each switch, and again when the back buffer is
+ *    put back before Present.
+ *  - The pass tracking (d3d_passes_target, d3d_fp_target) sees the target as the back buffer. */
+static int g_hud_layer = -1;
+static std::atomic<bool> g_hud_exclusive{false};
+static IDirect3DSurface9 *g_hud_rt, *g_hud_ds;              // the target; its own depth-stencil, made only if needed
+static IDirect3DSurface9 *g_hud_saved_rt, *g_hud_saved_ds;  // to put back: the back buffer; a game DS swapped out
+static uint32_t g_hud_failed_w, g_hud_failed_h;             // a size the target could not be made at (not retried)
+static bool g_hud_used, g_hud_ds_cleared;
+static const D3DRENDERSTATETYPE k_hud_blend_states[4] = {D3DRS_SEPARATEALPHABLENDENABLE, D3DRS_SRCBLENDALPHA,
+                                                         D3DRS_DESTBLENDALPHA, D3DRS_BLENDOPALPHA};
+static DWORD g_hud_blend_game[4], g_hud_blend_set[4];  // the game's values; the ones forced last
+static bool g_hud_blend_on;
+extern "C" void dxvk_present_tap_set_hud(void *surface);
+extern "C" void dxvk_stereo_create_mono(int on);
+/* 1 while the immersive layer has the present tap to itself, 0 otherwise (ipad/immersive_bridge.mm). Any thread. */
+extern "C" void skyrim_hud_layer_exclusive(int on) { g_hud_exclusive.store(on != 0, std::memory_order_release); }
+static bool hud_layer_on(void) {
+#if !defined(__APPLE__)
+    return false;  // the present tap is Apple-only
+#endif
+    if (g_hud_layer < 0) {
+        const char *e = getenv("LB_HUD_LAYER");
+        g_hud_layer = e && !strcmp(e, "1");
+        if (g_hud_layer) LOG("hud layer: the interface is drawn on its own while the immersive layer runs");
+    }
+    return g_hud_layer == 1;
+}
+static void hud_target_release(void) {
+    if (g_hud_rt) { g_hud_rt->Release(); g_hud_rt = nullptr; }
+    if (g_hud_ds) { g_hud_ds->Release(); g_hud_ds = nullptr; }
+}
+/* Before Reset (default-pool surfaces: Reset refuses while they live): the targets and anything held for the frame.
+ * Reset puts every device state back, so nothing is restored. */
+static void hud_layer_release(void) {
+    hud_target_release();
+    if (g_hud_saved_rt) { g_hud_saved_rt->Release(); g_hud_saved_rt = nullptr; }
+    if (g_hud_saved_ds) { g_hud_saved_ds->Release(); g_hud_saved_ds = nullptr; }
+    g_hud_used = g_hud_blend_on = false;
+    g_hud_failed_w = g_hud_failed_h = 0;
+}
+static IDirect3DSurface9 *hud_create(IDirect3DDevice9 *d, bool depth) {
+    IDirect3DSurface9 *s = nullptr;
+#if defined(__APPLE__)
+    dxvk_stereo_create_mono(1);
+#endif
+    const HRESULT hr =
+        depth ? d->CreateDepthStencilSurface(g_bb_w, g_bb_h, D3DFMT_D24S8, D3DMULTISAMPLE_NONE, 0, FALSE, &s, nullptr)
+              : d->CreateRenderTarget(g_bb_w, g_bb_h, D3DFMT_A8R8G8B8, D3DMULTISAMPLE_NONE, 0, FALSE, &s, nullptr);
+#if defined(__APPLE__)
+    dxvk_stereo_create_mono(0);
+#endif
+    return SUCCEEDED(hr) ? s : nullptr;
+}
+/* Clear the bound target over its whole area: Clear is limited to the viewport and, when enabled, the scissor rect. */
+static void hud_clear(IDirect3DDevice9 *d, DWORD flags) {
+    D3DVIEWPORT9 vp;
+    RECT sc;
+    d->GetViewport(&vp);
+    d->GetScissorRect(&sc);
+    const D3DVIEWPORT9 full = {0, 0, g_bb_w, g_bb_h, 0.0f, 1.0f};
+    const RECT all = {0, 0, (LONG)g_bb_w, (LONG)g_bb_h};
+    d->SetViewport(&full);
+    d->SetScissorRect(&all);
+    d->Clear(0, nullptr, flags, 0x00000000, 1.0f, 0);
+    d->SetViewport(&vp);
+    d->SetScissorRect(&sc);
+}
+/* Alpha as coverage for the draw about to go into the target. A state that no longer holds the value forced last
+ * was set by the game since, so that is the game's value to put back. (A game that sets exactly the forced value
+ * meanwhile gets its earlier one back; the bridge does not hook SetRenderState.) */
+static void hud_blend_force(IDirect3DDevice9 *d) {
+    DWORD dst = D3DBLEND_ZERO;
+    d->GetRenderState(D3DRS_DESTBLEND, &dst);
+    const bool add = dst == D3DBLEND_ONE;  // additive: colour added, the scene behind not covered
+    const DWORD want[4] = {TRUE, (DWORD)(add ? D3DBLEND_ZERO : D3DBLEND_ONE),
+                           (DWORD)(add ? D3DBLEND_ONE : D3DBLEND_INVSRCALPHA), D3DBLENDOP_ADD};
+    for (int i = 0; i < 4; i++) {
+        DWORD now = 0;
+        d->GetRenderState(k_hud_blend_states[i], &now);
+        if (!g_hud_blend_on || now != g_hud_blend_set[i]) g_hud_blend_game[i] = now;
+        if (now != want[i]) d->SetRenderState(k_hud_blend_states[i], want[i]);
+        g_hud_blend_set[i] = want[i];
+    }
+    g_hud_blend_on = true;
+}
+static void hud_blend_restore(IDirect3DDevice9 *d) {
+    if (!g_hud_blend_on || !d) return;
+    for (int i = 0; i < 4; i++) {
+        DWORD now = 0;
+        d->GetRenderState(k_hud_blend_states[i], &now);
+        if (now == g_hud_blend_set[i] && now != g_hud_blend_game[i])
+            d->SetRenderState(k_hud_blend_states[i], g_hud_blend_game[i]);
+    }
+    g_hud_blend_on = false;
+}
+/* With the target bound: keep the game's depth-stencil if it fits, else use the target's own. */
+static void hud_layer_depth(IDirect3DDevice9 *d) {
+    IDirect3DSurface9 *ds = nullptr;
+    d->GetDepthStencilSurface(&ds);
+    if (ds) ds->Release();
+    if (!ds || ds == g_hud_ds) return;
+    D3DSURFACE_DESC desc;
+    if (SUCCEEDED(ds->GetDesc(&desc)) && desc.MultiSampleType == D3DMULTISAMPLE_NONE && desc.Width >= g_bb_w &&
+        desc.Height >= g_bb_h)
+        return;
+    if (!g_hud_ds && !(g_hud_ds = hud_create(d, true))) return;
+    if (g_hud_saved_ds) g_hud_saved_ds->Release();
+    g_hud_saved_ds = ds;
+    ds->AddRef();
+    d->SetDepthStencilSurface(g_hud_ds);
+    if (!g_hud_ds_cleared) {
+        hud_clear(d, D3DCLEAR_ZBUFFER | D3DCLEAR_STENCIL);
+        g_hud_ds_cleared = true;
+    }
+}
+/* At a ui draw: make sure it lands in the target (cleared once per frame), with alpha as coverage. */
+static void hud_layer_draw(IDirect3DDevice9 *d) {
+    if (!d || !g_bb_w || !g_bb_h) return;
+    if (!g_hud_used && !g_hud_exclusive.load(std::memory_order_acquire)) return;
+    if (g_hud_rt && !g_hud_used) {
+        D3DSURFACE_DESC desc;
+        if (FAILED(g_hud_rt->GetDesc(&desc)) || desc.Width != g_bb_w || desc.Height != g_bb_h) hud_target_release();
+    }
+    if (!g_hud_rt) {
+        if (g_hud_failed_w == g_bb_w && g_hud_failed_h == g_bb_h) return;
+        if (!(g_hud_rt = hud_create(d, false))) {
+            g_hud_failed_w = g_bb_w;
+            g_hud_failed_h = g_bb_h;
+            LOG("hud layer: could not create a %ux%u target; the interface stays in the picture", g_bb_w, g_bb_h);
+            return;
+        }
+    }
+    IDirect3DSurface9 *rt = nullptr;
+    d->GetRenderTarget(0, &rt);
+    if (rt) rt->Release();
+    if (rt != g_hud_rt) {
+        if (!g_hud_used) {
+            // First ui draw of the frame: remember what to put back.
+            g_hud_saved_rt = rt;
+            if (g_hud_saved_rt) g_hud_saved_rt->AddRef();
+        }
+        D3DVIEWPORT9 vp;
+        RECT sc;
+        d->GetViewport(&vp);
+        d->GetScissorRect(&sc);
+        d->SetRenderTarget(0, g_hud_rt);
+        if (!g_hud_used) {
+            hud_clear(d, D3DCLEAR_TARGET);
+            g_hud_used = true;
+            g_hud_ds_cleared = false;
+        }
+        d->SetViewport(&vp);
+        d->SetScissorRect(&sc);
+    }
+    hud_layer_depth(d);
+    hud_blend_force(d);
+}
+/* Before Present: name the target for the tap and put the game's targets and states back. */
+static void hud_layer_present(IDirect3DDevice9 *d) {
+#if defined(__APPLE__)
+    dxvk_present_tap_set_hud(g_hud_used ? g_hud_rt : nullptr);
+#endif
+    if (!g_hud_used) return;
+    hud_blend_restore(d);
+    IDirect3DSurface9 *rt = nullptr, *ds = nullptr;
+    d->GetRenderTarget(0, &rt);
+    if (rt) rt->Release();
+    d->GetDepthStencilSurface(&ds);
+    if (ds) ds->Release();
+    if (rt == g_hud_rt && g_hud_saved_rt) {
+        D3DVIEWPORT9 vp;
+        RECT sc;
+        d->GetViewport(&vp);
+        d->GetScissorRect(&sc);
+        d->SetRenderTarget(0, g_hud_saved_rt);
+        d->SetViewport(&vp);
+        d->SetScissorRect(&sc);
+    }
+    if (g_hud_ds && ds == g_hud_ds) d->SetDepthStencilSurface(g_hud_saved_ds);
+    if (g_hud_saved_rt) { g_hud_saved_rt->Release(); g_hud_saved_rt = nullptr; }
+    if (g_hud_saved_ds) { g_hud_saved_ds->Release(); g_hud_saved_ds = nullptr; }
+    g_hud_used = false;
+}
 static bool g_ui_shift_on;
 static uint32_t g_skip_class_mask;  // LB_SKIP_CLASS=depth,shadow,...: skip every draw of those classes (timing only)
 static int g_bisect_from = -1, g_draw_no;
@@ -855,7 +1061,9 @@ void d3d_passes_draw(uint32_t prims) {
     }
     int k = pass_class(prims);
     g_last_class = k;
-    if ((g_ui_k[0][0] != 0 || g_ui_k[1][0] != 0 || g_ui_k[0][1] != 0 || g_ui_k[1][1] != 0) && (k == PASS_UI) != g_ui_shift_on) {
+    if (k == PASS_UI && hud_layer_on()) hud_layer_draw(g_pass_device);
+    else if (g_hud_blend_on) hud_blend_restore(g_pass_device);
+    if (!hud_layer_on() && (g_ui_k[0][0] != 0 || g_ui_k[1][0] != 0 || g_ui_k[0][1] != 0 || g_ui_k[1][1] != 0) && (k == PASS_UI) != g_ui_shift_on) {
         g_ui_shift_on = k == PASS_UI;
         const float on0[4] = {g_ui_shift_on ? g_ui_k[0][0] : 0.0f, g_ui_shift_on ? g_ui_k[0][1] : 0.0f, 0, 0},
                     on1[4] = {g_ui_shift_on ? g_ui_k[1][0] : 0.0f, g_ui_shift_on ? g_ui_k[1][1] : 0.0f, 0, 0};
@@ -892,17 +1100,18 @@ void d3d_passes_target(IDirect3DDevice9 *d) {
     d->GetRenderTarget(0, &rt);
     d->GetDepthStencilSurface(&ds);
     d->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb);
-    if (rt) rt->GetDesc(&desc);
-    if ((void *)rt != g_pass_target.rt) g_pass_frame.rt_changes++;
+    IDirect3DSurface9 *seen = rt && rt == g_hud_rt && bb ? bb : rt;  // LB_HUD_LAYER: its target is the back buffer
+    if (seen) seen->GetDesc(&desc);
+    if ((void *)seen != g_pass_target.rt) g_pass_frame.rt_changes++;
     // Each time the back buffer is bound again its first quad is the final image (post), not the interface: the
     // game also draws a quad into the back buffer earlier in the frame, as a scratch target (Riverwood, frame 2700
     // traced with LB_PASSES=2: a 1-draw run long before the final image and the HUD).
-    if ((void *)rt != g_pass_target.rt && rt && rt == bb) g_pass_frame.seen_bb = false;
-    if (g_passes_gpu && ((void *)rt != g_pass_target.rt || (ds != nullptr) != g_pass_target.ds)) gpu_target();
-    g_pass_target = {rt, desc.Width, desc.Height, (uint32_t)desc.Format, ds != nullptr, rt && rt == bb};
+    if ((void *)seen != g_pass_target.rt && seen && seen == bb) g_pass_frame.seen_bb = false;
+    if (g_passes_gpu && ((void *)seen != g_pass_target.rt || (ds != nullptr) != g_pass_target.ds)) gpu_target();
+    g_pass_target = {seen, desc.Width, desc.Height, (uint32_t)desc.Format, ds != nullptr, seen && seen == bb};
     const PassTarget &t = g_pass_target;
     // the late first-person pass goes on into other back-buffer-sized targets, and ends at any other
-    if (g_pass_frame.fp_late && (!rt || t.bb || t.w != g_bb_w || t.h != g_bb_h)) g_pass_frame.fp_late = false;
+    if (g_pass_frame.fp_late && (!seen || t.bb || t.w != g_bb_w || t.h != g_bb_h)) g_pass_frame.fp_late = false;
     fp_update();
     if (rt) rt->Release();
     if (ds) ds->Release();
@@ -981,12 +1190,14 @@ static void passes_init(IDirect3DDevice9 *d) {
             LOG("LB_SKIP_CLASS=%s: skipping pass classes mask %x", sc, g_skip_class_mask);
         }
         const bool fp_wanted = (fp && atoi(fp)) || getenv("LB_FP_SKIP") || (eye && atof(eye) != 0) || g_fp_flame
-                            || g_skip_class_mask || g_depth_copy == 1;
+                            || g_skip_class_mask || g_depth_copy == 1 || hud_layer_on();
         g_d3d_passes = g_passes_log || fp_wanted;
         // without an LB_D3DTRACE range, LB_PASSES=2 looks at the first frame
         g_passdbg = g_passes_log == 2 && !getenv("LB_D3DTRACE");
         if (g_passes_log) LOG("LB_PASSES=%d: draws per pass class logged at each Present", g_passes_log);
-        else if (fp_wanted) LOG("first-person pass detection on (LB_FP, LB_FP_SKIP or LB_STEREO_EYE_UNITS)");
+        else if (fp_wanted)
+            LOG("pass classification on (LB_FP, LB_FP_SKIP, LB_STEREO_EYE_UNITS, LB_FP_FLAME_DEPTH, LB_SKIP_CLASS, "
+                "LB_DEPTH_COPY or LB_HUD_LAYER)");
         if (g_d3d_passes) gpu_init(d);
     }
     if (!g_d3d_passes) return;
@@ -1157,11 +1368,12 @@ void d3d_fp_target(IDirect3DDevice9 *d) {
     d->GetRenderTarget(0, &rt);
     d->GetDepthStencilSurface(&ds);
     d->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb);
-    if (rt) rt->GetDesc(&desc);
-    g_fp_target = {rt, desc.Width, desc.Height, (uint32_t)desc.Format, ds != nullptr, rt && rt == bb};
+    IDirect3DSurface9 *seen = rt && rt == g_hud_rt && bb ? bb : rt;  // LB_HUD_LAYER: its target is the back buffer
+    if (seen) seen->GetDesc(&desc);
+    g_fp_target = {seen, desc.Width, desc.Height, (uint32_t)desc.Format, ds != nullptr, seen && seen == bb};
     const FpTarget &t = g_fp_target;
     // the late pass goes on into other back-buffer-sized targets, and ends at any other
-    if (g_fp_frame.late && (!rt || t.bb || t.w != g_bb_w || t.h != g_bb_h)) g_fp_frame.late = false;
+    if (g_fp_frame.late && (!seen || t.bb || t.w != g_bb_w || t.h != g_bb_h)) g_fp_frame.late = false;
     fpd_update();
     if (rt) rt->Release();
     if (ds) ds->Release();
@@ -2793,6 +3005,7 @@ void B_IDirect3DDevice9_Present(CPU *c) {
     g_frame_eye_k = g_stereo.on ? g_stereo.k_applied : 0.0f;
     game_fov_apply();
     dxvk_present_tap_set_depth(menu_open() ? nullptr : d3d_scene_depth_target());
+    if (hud_layer_on()) hud_layer_present(d);
 #endif
     platform_present_draws(g_d3d_draws);
     g_d3d_draws = 0;
@@ -2802,6 +3015,7 @@ void B_IDirect3DDevice9_Present(CPU *c) {
     platform_present_end();
 #if defined(__APPLE__)
     dxvk_present_tap_set_depth(nullptr);
+    if (hud_layer_on()) dxvk_present_tap_set_hud(nullptr);
     d3d_scene_depth_reset();
 #endif
     stereo_after_present();
