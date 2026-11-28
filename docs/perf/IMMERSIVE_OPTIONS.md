@@ -127,6 +127,38 @@ Two lines report GPU cost on the headset. Neither had ever been read from a head
 Read them together: if the game latency is far above the compositor's GPU time, the game's frame is the slow part,
 on the GPU or on DXVK's command thread; the line alone does not say which.
 
+For the compositor cost switches below, four more lines from `ImmersiveScreen.swift`:
+
+- `immersive: drawable: colour WxHxL …, depth WxH …, N views, viewports WxH …`, when it changes (at most 8 times):
+  the size of what the compositor actually draws into, per texture (L is the texture's array length) and view.
+- `immersive: rate maps: screen WxH, physical WxH WxH; …`, when foveation is on (`LB_FOVEATION=1`) and the maps
+  change (at most 8 times): each rasterization rate map's screen size and the physical size of each of its layers,
+  which is what the fragment stage pays for.
+- `immersive: compositor passes: vertex X ms, fragment Y ms per frame (mean), max V / F ms, N frames, M unreadable`,
+  every 5 s, only with `LB_IMMERSIVE_PASS_TIME=1`: the eyes' passes timed at the stage boundaries with a Metal
+  counter sample buffer, summed over a frame's passes. GPU ticks are converted with two GPU timestamp readings
+  against the wall clock. On a tile-based GPU the two stages of a pass overlap, so they need not add up to the
+  pass, and the whole-buffer line above stays the total. Logs `pass time: this GPU takes no timestamps at stage
+  boundaries` if it can't.
+- `immersive: eye from the rays' origin: X mm (mean), max Y mm`, every 5 s while depth is on: how far the eye is
+  from where the mesh's rays start, which is what the per-pixel search corrects and where a coarser grid
+  (`LB_IMMERSIVE_GRID`) shows its differences (larger above about 30 mm in the reference).
+
+## Compositor cost switches
+
+The compositor redraws both eyes at every refresh from the newest game frame (`ImmersiveScreen.swift`). These
+switches cut what one refresh costs without meaning to change the picture; each is off unless set, and with all
+of them unset the compositor draws as before. `tools/compositor_reference.py` (numpy, no GPU) compares each with
+the unswitched path on a capture; `tools/immersive_shader_check.swift` times them on a Mac. None has been timed
+or looked at on the headset yet.
+
+| Switch | What it does |
+|---|---|
+| `LB_IMMERSIVE_REFINE_EXIT=px` | The per-pixel depth search (`LB_IMMERSIVE_REFINE` steps) leaves a pixel as soon as a step moves the game pixel it shows by less than px game pixels (try 0.25) without leaving the depth texel that step read. Without it every pixel runs every step and one more depth fetch for the final test. In the reference, on two captures with foliage and the eye 10 to 100 mm from where the frame's rays start, 58 to 89% of pixels left after one fetch, depth fetches per pixel went from 5 to between 1.15 and 1.61 at 4 steps (3 to between 1.13 and 1.49 at 2), and at most 0.001% of pixels showed a game pixel more than a quarter pixel away from the one they show without the switch. Logged as `per-pixel depth search: stops once a step is under …`. |
+| `LB_IMMERSIVE_SEED=1` | With the per-pixel search on. The mesh has 345,600 triangle corners an eye, and without the switch the vertex shader runs for each of them at every refresh and makes 15 depth fetches each time, although the depth changes only when the game hands over a frame. With it, one small pass per game frame (and per eye's depth in stereo) writes the depth each of the 58,101 grid vertices needs into a 321x181 `R32Float` texture, and the mesh is drawn through an index buffer: each vertex is shaded once and reads one texel. The texture holds the depth as D3D wrote it (the nearest of the same five taps), so the vertices land where they did; the reference finds every triangle corner bit for bit the same. With the search off (`LB_IMMERSIVE_REFINE=0`) the switch does nothing: the mesh there flattens triangles across depth edges, which needs the whole triangle at each corner. Logged as `mesh seed on: …`; `mesh seed: unavailable; drawing the mesh without it` if the pass or its pipelines cannot be made. |
+| `LB_IMMERSIVE_GRID=<columns>x<rows>` | The depth mesh's size, default 321x181 (a vertex every 4 game pixels at 1280x720). `161x91` has a quarter of the vertices. It is **not** the same picture: the mesh decides which surface a pixel's search starts on, and on thin alpha-tested foliage a coarser mesh starts some pixels on the wrong side. In `tools/compositor_reference.py` on two 1280x720 captures with the search at 4 steps, 161x91 moved 0.003-0.85% of pixels by more than one game pixel (more with larger head offsets), and against a ray-walked truth it added up to +0.07% wrong pixels at 10-32 mm head offsets but +0.23% at 100 mm on one capture, past the reference's 0.2% tolerance; on a synthetic scene of 1-pixel needles, +1.1%. Judge it on the headset on foliage. Logged as `mesh grid …`. |
+| `LB_FRAME_REPEAT=1` | Sets the layer's `minimumFrameRepeatCount` to 1 once the game is presenting: each compositor frame is shown for two display refreshes, so the compositor runs at 45 Hz on a 90 Hz display and every pass costs half as much per second. The reprojection then corrects to a pose up to 22 ms old instead of 11, which the headset has to judge. Only 1 is taken: the bridge's display tick paces the game in whole compositor frames, and a 45 fps game is then one frame a tick (the bridge's cadence log, which counts compositor frames, covers twice the time). The two per-frame easings (the head-locked screen's follow) are converted so they ease at the same speed per second. Logged as `frame repeat: each frame shown for 2 refreshes …`, then every 5 s `frame repeat: frames X ms apart (mean), Rx the display's P ms`, with `(expected 2x: not paced as asked)` when the ratio is off by more than 0.25. |
+
 ## Live stereo switches (headset session stereo-1)
 
 Live single-pass stereo is what option B above became: DXVK renders each scene draw into two image layers with

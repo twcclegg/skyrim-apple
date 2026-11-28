@@ -25,6 +25,24 @@ come from private game files).
    system swapped during the run (`meta.paging_mb`) and warns past 1 GB: with little memory, swapping can make
    a run several times slower for no reason in the build under test.
 
+## Leaving and re-entering the immersive space (`BENCH_REENTER`)
+
+`BENCH_IMMERSIVE=1` plays through Play Immersive. With `BENCH_REENTER=<seconds>` as well, that long after the game
+and the immersive layer are both running the launcher closes the space, waits for the layer to end, and opens the
+space again. It is the scripted form of "press the Digital Crown, then Return to Immersive": it checks that a second
+compositor attaches to a game that is already running. The console shows, in about this order,
+
+    bench: re-entry: closing the immersive space
+    immersive: layer ended
+    bench: re-entry: the layer ended, game session running
+    bench: re-entry: immersive space reopened: opened
+    immersive: layer ..., started
+    bench: re-entry: the layer is running again
+
+and the `ft` lines carry on through all of it (an unattended run is never paused for leaving the space; a person
+playing is). It works on the headset and in the visionOS simulator. Not with `LB_GAME_SCENE=1`, which closes the
+launcher window that runs the hook.
+
 ## Draws per pass (`LB_PASSES`)
 
 `--env LB_PASSES=1` adds one line per frame next to the `ft` line, with the frame's draw calls and primitives by
