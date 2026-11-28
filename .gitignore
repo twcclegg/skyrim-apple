@@ -52,6 +52,9 @@ __pycache__/
 /ipad/evidence/
 # Saves, signing material and app packages stay private.
 *.ess
+# DXVK caches: the bytecode cache holds the game's shader code, the state cache derives from it
+*.dxso-cache
+*.dxvk-cache
 *.skse
 *.mobileprovision
 *.provisionprofile
