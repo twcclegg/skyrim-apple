@@ -962,6 +962,12 @@ void d3d_passes_projection(const float *m) {
     fp_update();
 }
 
+#if defined(__APPLE__)
+/* 1 when the device renders single-pass stereo: LB_STEREO_MULTIVIEW=1 and a Vulkan device with multiview and
+ * layered rendering. Otherwise DXVK renders mono (dxvk_stereo.h). */
+extern "C" int dxvk_stereo_multiview_enabled(void *device);
+#endif
+
 // After CreateDevice: reads the switches once and learns the targets the device starts with.
 static void flame_init(void);
 static void passes_init(IDirect3DDevice9 *d) {
@@ -972,8 +978,13 @@ static void passes_init(IDirect3DDevice9 *d) {
         const char *e = getenv("LB_PASSES"), *fp = getenv("LB_FP"), *eye = getenv("LB_STEREO_EYE_UNITS");
         g_passes_log = e ? atoi(e) : 0;
         // On by default with single-pass stereo (where the pass would be drawn twice); LB_DEPTH_COPY=0/1 decides.
+        // Off by default when DXVK falls back to mono, as in any mono run.
         const char *dc = getenv("LB_DEPTH_COPY"), *mv = getenv("LB_STEREO_MULTIVIEW");
-        g_depth_copy = dc ? (atoi(dc) ? 1 : 0) : (mv && !strcmp(mv, "1") ? 1 : 0);
+        bool multiview = mv && !strcmp(mv, "1");
+#if defined(__APPLE__)
+        if (multiview) multiview = dxvk_stereo_multiview_enabled(d) != 0;
+#endif
+        g_depth_copy = dc ? (atoi(dc) ? 1 : 0) : (multiview ? 1 : 0);
         if (g_depth_copy) LOG("LB_DEPTH_COPY: the R32F depth pass is a copy of the main pass's depth");
         if (const char *sc = getenv("LB_SKIP_CLASS")) {  // timing experiments: the picture is wrong by design
             for (int c = 0; c < PASS_COUNT; c++)
@@ -1918,8 +1929,13 @@ extern "C" int skyrim_frame_eye(float *k_out) {
  * both eyes' whole frusta, plus its margin, fit inside it (skyrim_eye_fov_request). With LB_FOV unset or
  * LB_FOV=eyes, the field of view is set from that and the back buffer's aspect: the game's vertical tangent is
  * 0.75 tan(fov/2) and its horizontal one that times the aspect, so tan(fov/2) = max(y, x / aspect) / 0.75. A number
- * in LB_FOV always wins. Without eye views no request is made and nothing changes. */
+ * in LB_FOV always wins. Without eye views no request is made and nothing changes. Eye views only take effect with
+ * live single-pass stereo, so without it (LB_STEREO_MULTIVIEW unset, or DXVK rendering mono) the request is
+ * ignored and the game keeps its own field of view. */
 static std::atomic<float> g_eye_fov_x{0}, g_eye_fov_y{0};
+#if defined(__APPLE__)
+static bool stereo_live_multiview(void);
+#endif
 extern "C" void skyrim_eye_fov_request(float tan_x, float tan_y) {
     g_eye_fov_x = tan_x;
     g_eye_fov_y = tan_y;
@@ -1935,7 +1951,15 @@ static void game_fov_apply(void) {
     float use = fov;
     if (from_eyes) {
         static float last;
-        const float x = g_eye_fov_x, y = g_eye_fov_y;
+        float x = g_eye_fov_x, y = g_eye_fov_y;
+#if defined(__APPLE__)
+        if (x > 0 && y > 0 && !stereo_live_multiview()) {
+            static bool logged;
+            if (!logged) LOG("eye views: no live single-pass stereo; the game keeps its field of view");
+            logged = true;
+            x = y = 0;
+        }
+#endif
         if (x > 0 && y > 0 && g_bb_w && g_bb_h) {
             const float t = fmaxf(y, x * (float)g_bb_h / (float)g_bb_w) / 0.75f;
             use = fminf(2.0f * atanf(t) * 57.29578f, 150.0f);
@@ -2193,6 +2217,7 @@ struct StereoState {
 };
 static StereoState g_stereo;
 static bool stereo_live_multiview(void);
+static IDirect3DDevice9 *g_stereo_device;  // the presenting device, set before stereo_init
 
 static void stereo_init(void) {
     StereoState &st = g_stereo;
@@ -2312,6 +2337,7 @@ static void stereo_write_info(const char *tag, const StereoSlot &slot, int base)
 
 // Before Present: capture the frame if it belongs to a group.
 static void stereo_before_present(IDirect3DDevice9 *d) {
+    g_stereo_device = d;
     if (!g_stereo.init) stereo_init();
     if (!g_stereo.on) return;
     int base = 0;
@@ -2338,9 +2364,20 @@ static void stereo_fp_changed(int kind) {
 }
 static bool stereo_skip_fp(void) { return g_stereo.skip_fp; }
 
+/* LB_STEREO_MULTIVIEW=1 and the device really renders multiview: DXVK falls back to mono when the Vulkan device
+ * lacks multiview or layered rendering (the visionOS simulator). Then the eye offset must not be applied either,
+ * or the one picture is the left eye's. Decided at the first Present, when the device is known. */
 static bool stereo_live_multiview(void) {
     static int on = -1;
-    if (on < 0) { const char *e = getenv("LB_STEREO_MULTIVIEW"); on = e && !strcmp(e, "1"); }
+    if (on < 0) {
+        const char *e = getenv("LB_STEREO_MULTIVIEW");
+        if (!e || strcmp(e, "1")) on = 0;
+        else if (!g_stereo_device) return false;
+        else {
+            on = dxvk_stereo_multiview_enabled(g_stereo_device) ? 1 : 0;
+            if (!on) LOG("stereo: LB_STEREO_MULTIVIEW=1 but the device renders mono (see DXVK's log); no eye offset");
+        }
+    }
     return on == 1;
 }
 
