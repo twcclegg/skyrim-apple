@@ -1,6 +1,6 @@
 # Following the player's movement between game frames
 
-Issue #21, item 2. Written 2026-11-13 on the Linux machine, for the "Skyrim - M1" session to build and try.
+Issue #21, item 2. Written 2026-11-13, to build and try on the headset.
 
 **State:** the runtime part compiles and is tested on Linux. The Swift and Metal part has never been compiled.
 Nothing here has run on a Mac, in the simulator or on the headset. It is off unless `LB_IMMERSIVE_MOTION=1`, and
@@ -109,7 +109,7 @@ picked up by the existing glob.
    large: walk and strafe past something near (a fence, a doorway), turn with the right stick, then draw a
    weapon and do it again. Wanted: the world slides instead of stepping; hands and weapon steady; no jump when
    stopping; the 5 s log line mostly "between frames". A screen recording at 30 fps game rate with the setting
-   on and off would let Thomas judge it without the headset.
+   on and off would let the change be judged without the headset.
 5. **Hands.** If the weapon shakes with the setting on, the 1 m test is missing it: try
    `LB_IMMERSIVE_MOTION_NEAR_M=2`, and dump one first-person frame's depth (`LB_SHOT`) to see what distance the
    hands come out at.

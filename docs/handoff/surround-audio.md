@@ -65,7 +65,7 @@ This is one run, so there is no run-to-run spread; the counts depend on what the
   unrolled fast paths only cover stereo destinations.
 - 7.1 and other layouts are not offered.
 
-## Headset test (Thomas)
+## Headset test
 
 Set `LB_AUDIO_CHANNELS=6` in `launch-env.json` (one change; leave the others unset first).
 

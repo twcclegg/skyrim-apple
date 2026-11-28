@@ -16,8 +16,8 @@ git.
 
 ## 2026-11-10 — setup
 
-- `gen/` (manifest sha 5b68dc33…) and the game were already on the M1 in the planning session's scratch folder;
-  cloned to `~/SkyrimAVP/` (APFS clones). Mint was not contacted.
+- `gen/` (manifest sha 5b68dc33…) and the game were already on the M1; cloned to `~/SkyrimAVP/`
+  (APFS clones).
 - macOS build bootstrapped (`macos/bootstrap.sh`; the DirectX fetch step needs `cabextract`, which isn't
   installed and isn't needed because the game folder already has both DLLs).
 - `macos/CMakeLists.txt`: `SKYRIM_GAME_DIR` (the manifest records a path on another volume), `LB_CONST_MEM`,
@@ -237,7 +237,7 @@ Running total: baseline 11.47 → 8.94 ms idle (**−22%**).
   thermal state nominal.
 - **Builds:** A = the app installed on 2026-11-09 (binary 17339b74…); B = the same launcher with the engine
   from this branch at commit 0b5b053 (binary 11835a06…, engine e4849f52…: x87 cache, constant guest base,
-  native `0x472580`, lock-free COM lookup). Thomas approved the install and wore the headset.
+  native `0x472580`, lock-free COM lookup). Played on the headset.
 - **Idle, mean frame ms (fps):** A 12.7 (78), 11.7 (85); B 9.0 (111), 9.0 (111). **About −26%**, two runs a
   side, each B run below each A run by more than the A runs differ from each other.
 - **Run phase:** A 9.7, 9.4 ms; B 8.4, 8.4 ms, which is the 120 fps cap, so the gain there is clipped; B's own
@@ -248,9 +248,9 @@ Running total: baseline 11.47 → 8.94 ms idle (**−22%**).
   consecutive run), so B's numbers were taken in the warmer state and are, if anything, pessimistic.
 - **Not yet known:** the immersive screen's cost (compositor at 90 Hz plus the tap), busier or combat scenes,
   and long-session thermals. The depth build (`depth-v2`, binary 2569a7db…) was installed at the end of the
-  session for the "Skyrim - M1" session's immersive test.
+  session for the immersive test.
 
-## 2026-11-10 — first immersive runs on the headset (logs only; the depth build is the "Skyrim - M1" session's)
+## 2026-11-10 — first immersive runs on the headset (logs only)
 
 Three sessions of `depth-v2` in the immersive space, logs in `bench-results/avp-immersive-20261110T1258/`:
 
@@ -284,7 +284,7 @@ Three sessions of `depth-v2` in the immersive space, logs in `bench-results/avp-
 ## 2026-11-10 — second immersive session on the headset (`depth-v5`, about 7 minutes of hand play)
 
 Log in `bench-results/avp-immersive-20261110T1458/`. Build: app 8b3bd810…, engine f3c22183… (this branch's engine work including the
-unaligned-atomics fix, plus the "Skyrim - M1" session's two-frame mailbox, five tap slots, depth scale 0.25 with
+unaligned-atomics fix, plus the immersive work's two-frame mailbox, five tap slots, depth scale 0.25 with
 tear handling, and flat menus).
 
 - **The handoff fix works.** Of 77 ten-second reports, 49 show 60 game frames per second reaching the display
@@ -294,7 +294,7 @@ tear handling, and flat menus).
 - **Menus:** 18 changes logged. Flat with 3 open/1 pausing, 4 open/1 pausing, 5 open/2 pausing, and with 2 or
   3 open and none pausing (non-pausing menus, as the rule intended); depth with only the HUD open.
 - **CPU:** the process used 43–70% of one core, the main thread 21–28%. Thermal state stayed nominal.
-- **Thomas's verdict:** "Much better." His screenshots show clean edges on a rock and the sword at the
+- **Wearer's verdict:** "Much better." The screenshots show clean edges on a rock and the sword at the
   reduced depth, and a flat main menu.
 
 ## 2026-11-15 — first-person depth in the world's encoding (M5, Riverwood, 1280×720 low; twcclegg/skyrim-apple#23)

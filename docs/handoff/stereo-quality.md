@@ -105,7 +105,7 @@ Checked: the shader compiles on the Mac GPU; `ImmersiveScreen.swift` type-checks
 run, nothing on the headset.** The eye-separation switch has only been drawn on the Mac harness, where it is a
 plain camera offset; how it feels is a headset question.
 
-## For the headset (Thomas)
+## For the headset
 
 One change per test, each with the usual head-mode settings (`LB_IMMERSIVE_HEAD=1`, `LB_ANY_PAD=1`):
 

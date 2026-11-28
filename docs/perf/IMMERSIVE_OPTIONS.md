@@ -13,7 +13,7 @@ is already the limit.
 
 ## The goal, and the path I'd take to it
 
-Pass/fail for the project (Thomas, 2026-11-10): the game is comfortably playable on the M2 Vision Pro in 3D
+Pass/fail for the project: the game is comfortably playable on the M2 Vision Pro in 3D
 immersive with head tracking. "Comfortable" in a headset mostly means three things: the world stays still when
 the head moves (the compositor redraws at the display's 90 Hz with the newest head pose, whatever the game's
 frame rate), both eyes get a new image every displayed frame, and the game itself stays near 60 fps.

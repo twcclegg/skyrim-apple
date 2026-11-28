@@ -1,15 +1,15 @@
 # Plan: trackpad and mouse on Vision Pro
 
-> **Implemented 2026-11-10 (Skyrim - M1 session), not yet run on the headset:** step 1 diagnostics; the `key`
+> **Implemented 2026-11-10, not yet run on the headset:** step 1 diagnostics; the `key`
 > lock variant (`LB_POINTER_LOCK=key`); the game in its own window, which is the pointer surface
 > (`LB_GAME_SCENE=1`: `apple/Sources/App/GameSurface.swift`, plain style, 2400x1300, 0.001-opacity fill with a
 > content shape, hover feeding the edge turn, `.pointerStyle(.shape(Circle(), size: 0.01))`; the launcher window
 > closes at Play; SDL's view hides during immersive play); indirect-pinch clicks deduplicated against GCMouse.
 > Without `LB_GAME_SCENE`, the launcher window turns nearly invisible during immersive play instead. Not done:
-> reopen-on-background, the menu-cursor sync (step 8). The performance session's update (Minecraft port's
-> headset results: lock refused, tracking areas useless, the window form that works) is in its worktree copy.
+> reopen-on-background, the menu-cursor sync (step 8). Headset results from another visionOS port (lock refused, tracking
+> areas useless, the window form that works) informed the design.
 
-For the "Skyrim - M1" session, 2026-11-10, from the performance session. Planning only; nothing here is built.
+Plan, 2026-11-10. Planning only; nothing here is built.
 "Verified" means read in the XROS27.2 SDK on this Mac, in this repo's code, or in a headset log. Everything else
 is marked as a guess. Nothing in this plan has run on the headset.
 
@@ -45,7 +45,7 @@ is marked as a guess. Nothing in this plan has run on the headset.
 - **Clicks with the pointer off every window (immersive):** take `indirectPinch` and `pointer` spatial events from
   `LayerRenderer.onSpatialEvent`, press on `.active`, release on `.ended`/`.cancelled`, and drop one that falls
   within 0.25 s of a GCMouse press (mc-avp's `Mouse.clicked(near:)`). A hand pinch arrives the same way; I'd let
-  it be a left click (attack / select) and say so to Thomas.
+  it be a left click (attack / select) and say so in the PR.
 - **Menu cursor:** Skyrim draws its own cursor from relative deltas. With lock (design L) the system hides its
   pointer on iPadOS; on visionOS that is a guess. Without lock, don't try to hide the dot: **keep the game cursor
   under it**. While `skyrim_menu_open()` and the pointer is over the game view, steer the game cursor to the
@@ -72,7 +72,7 @@ is marked as a guess. Nothing in this plan has run on the headset.
 
 ## 4. Steps
 
-Local checks first; headset runs are marked **[headset]** and each needs Thomas's OK.
+Local checks first; headset runs are marked **[headset]** and each needs the wearer's OK.
 
 1. **Diagnostics, no behaviour change.** `ipad/visionos/sdl/SDL_uikit_xros.m` (`skyrim_xr_pointer_edge` log) and
    `simulator/prepare_sdl.py` (button/scroll handlers call a counter like `SDLXR_MouseDelta`). Add to the
@@ -96,7 +96,7 @@ Local checks first; headset runs are marked **[headset]** and each needs Thomas'
      `childViewControllerForPointerLock`/`prefersPointerLocked` to follow `SDL_GetRelativeMouseMode()`.
      Only build this one if `key` and `scene` are cheap and you want all three in one run; otherwise it's run 2.
    *Check:* simulator: the log shows which controller answers and that `prefersPointerLocked` is 1.
-3. **[headset] Run 1: diagnostics and lock variants.** One install. Thomas plays windowed and immersive for a
+3. **[headset] Run 1: diagnostics and lock variants.** One install. The wearer plays windowed and immersive for a
    minute each per variant; variants switch by copying a new `launch-env.json` with `devicectl`, no reinstall.
    Read from the logs: is `locked 1` ever seen (and in which variant, windowed or immersive); are clicks and
    scroll gated like deltas; do deltas arrive in immersive with the pointer off the window; which spatial events
@@ -113,7 +113,7 @@ Local checks first; headset runs are marked **[headset]** and each needs Thomas'
    *Check:* Mac/simulator: hold a button, deactivate the scene, log shows the release.
 6. **Design L (if run 1 shows `locked 1`):** make the granting variant the default; `edge_turn` already turns
    itself off when locked. Menus need nothing more if the dot is hidden while locked; if it isn't, add step 8.
-   *Check* **[headset] run 2:** "locked 1" throughout, "edge turn 0 frames", Thomas reports no lost trackpad.
+   *Check* **[headset] run 2:** "locked 1" throughout, "edge turn 0 frames", the wearer reports no lost trackpad.
 7. **Design S (if never locked):**
    a. Immersive pointer surface as in section 3 (`SkyrimLauncherApp.swift`: `.windowStyle(.plain)` for the game
       scene while immersive; the overlay hides the Metal layer but keeps the view hit-testable). Keep

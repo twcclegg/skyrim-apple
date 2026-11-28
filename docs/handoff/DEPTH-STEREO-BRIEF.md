@@ -1,12 +1,11 @@
 # Brief: stereo and head tracking by depth reprojection
 
-For the "Skyrim - M1" session, which owns the Vision Pro work. Written 2026-11-10 by the performance session
-(the one that took `FABLE-RECOMPILER-BRIEF.md`). Thomas asked for this to be handed to you. Everything is
-observed on the M1 unless marked *untested*; nothing here has run on the headset.
+Design note, 2026-11-10. Everything is observed on an M1 Mac unless marked *untested*; nothing here had run on
+the headset when it was written.
 
 ## Goal
 
-Thomas's pass/fail for the project: the game is comfortably playable on the M2 Vision Pro in 3D immersive with
+The pass/fail for the project: the game is comfortably playable on the M2 Vision Pro in 3D immersive with
 head tracking. This brief covers the stereo and head-tracking part. You decide the order and the details.
 
 ## The approach, and why
@@ -66,31 +65,3 @@ depth. That proves the depth path on the device before any camera hook.
 - Don't make the unresolved slivers worse than they need to be: put the mono camera between the eyes, and
   consider a smaller separation than 64 mm for near objects.
 - The mono immersive screen (`Play Immersive`) hasn't run on the device yet. Verify that first.
-
-## State of the working tree (please read before editing)
-
-- The checkout is now on local branch **`perf/lifted-arm64`**, created from `visionos/port-v2` with your
-  uncommitted changes carried along untouched. It has five commits of mine (lifter x87 cache, constant guest
-  base, a native function, tests, tracing, the prototype, docs). Nothing is pushed.
-- **I edited files that also hold your uncommitted work**, and left those edits uncommitted so your changes and
-  mine aren't mixed in a commit:
-  - `runtime/platform_sdl.c`: frame pacing and the benchmark hooks also on the Mac build; a per-frame work time
-    as a fourth `ft` column.
-  - `runtime/d3d9_bridge.cpp`, `.h`: `platform_present_slept`; the COM object table is lock-free for readers
-    (`com_host`); `shot_depth`.
-  - `ipad/CMakeLists.txt`: `LB_CONST_MEM` option (on by default) for the generated code.
-  - `tools/bench/bench.py` and a `riverwood-walk-mac` scenario: a `--mac` target; summaries include work time.
-- **The lifter changed**, so the build's manifest check requires regenerated code. It is at
-  `~/SkyrimAVP/gen-x87` on the M1 (same 96,653 functions). `~/SkyrimAVP/gen` is the original. Game files:
-  `~/SkyrimAVP/game/Skyrim`.
-- `ipad/build/visionos/out/libSkyrimNative.a` is now my build from `gen-x87` (sha256 e4849f52…); your
-  previous engine and app receipt are in `~/SkyrimAVP/engines/`.
-- Measurements and method: `docs/perf/LOG.md`. The Mac build runs the game on the M1
-  (`tools/bench/bench.py run riverwood-walk-mac --mac macos/build/perf-x87 --game ~/SkyrimAVP/game/Skyrim`),
-  which is a quick way to try bridge and DXVK changes without the headset.
-
-## Rules (unchanged)
-
-Private data stays on Thomas's machines; commit only locally; ask Thomas before installing on the headset, one
-change per headset test; the recompiler has no license, so only DXVK, MoltenVK and SDL patches and our own code
-can go to other projects.
