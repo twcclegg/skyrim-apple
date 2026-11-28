@@ -1,33 +1,46 @@
 #!/usr/bin/env python3
-"""cache-overlap.py: compare two DXVK state cache files (*.dxvk-cache).
+"""cache_overlap.py: compare two DXVK state cache files (*.dxvk-cache).
 
 Usage:
-    python3 -I cache-overlap.py A.dxvk-cache B.dxvk-cache [--normalize] [--show N] [--top N]
+    python3 -I cache_overlap.py A.dxvk-cache B.dxvk-cache [--normalize] [--show N] [--top N]
 
 Reports, for each file: header version, entries read, invalid entries skipped, graphics/compute split;
-then entries in both, only in A and only in B. Each "only in" entry is matched against the other file:
+then what the two files share and what only one has. Entries that are identical field for field count as one
+"unique state"; "in both", "only in A/B" and the "only in" breakdowns below count unique states. The share
+lines give both: the share of unique states, and the share of entries (each entry counted, duplicates too),
+which is the share of the file the other cache would hit. Each state found in only one file is matched
+against the other file:
 
   new shaders   no entry in the other file uses the same shader set. Split by whether the other file
                 has seen the vertex / fragment shader at all (the "near none" case of LB_PIPE_LOG=2).
-  differs       the other file has entries with the same shaders; the closest one (fewest differing
-                fields) is diffed field by field, and the entry is filed under the key parts that differ:
-                render pass (samples, view mask, attachment formats and layouts), spec constants
-                (scN, D3D9 names), and state (everything else: input layout, rasterizer, depth/stencil,
-                blend, swizzle, binding mask). "dc-only" counts entries whose only differences are state
-                Vulkan ignores (the rules of dxvkNormalizePipelineState), i.e. what twcclegg/dxvk-native#10
-                removes. The fragment shader's output mask is not in the file, so "dc" here only uses the
-                render pass's attachments, not the shader's outputs: it can undercount dc.
+  differs       the other file has entries with the same shaders. The closest one is picked as
+                LB_PIPE_LOG=2 picks it: fewest differing fields that matter (not "dc", below), then fewest
+                differing fields in all. It is diffed field by field, and the state is filed under the key
+                parts that differ: render pass (samples, view mask, attachment formats and layouts), spec
+                constants (scN, D3D9 names), and state (everything else: input layout, rasterizer,
+                depth/stencil, blend, swizzle, binding mask).
+  dc-only       states whose only differences are state Vulkan ignores ("dc"), the state dxvk-native's
+                pipeline normalize clears: blend factors and ops of a colour attachment with blending off;
+                all blend, write mask and swizzle state of a colour attachment the render pass doesn't have;
+                all depth and stencil state without a depth attachment; depth compare and depth write with
+                the depth test off; stencil ops and masks with the stencil test off; the logic op with logic
+                ops off. A field is dc only when it is dc for both entries. dxvk-native also treats colour
+                attachments the fragment shader doesn't write as absent, but that output mask is not in the
+                file, so here only the render pass's attachments count: dc can be undercounted.
 
   --normalize   compare with that ignored state cleared first (same caveat: attachment-based only), to see
-                how far two caches written before and after #10 agree.
+                how far two caches written with and without dxvk-native's pipeline normalize agree.
   --show N      print up to N example entries per category (shader SHA-1 prefixes and differing fields,
-                in LB_PIPE_LOG=2's "name old->new" style, A's value first).
+                as LB_PIPE_LOG=2 prints them: "name old->new" in hex, A's value first, " dc" when ignored;
+                swizzle as r | g<<4 | b<<8 | a<<12, a differing binding mask as 0->1).
   --top N       how many of the most common differing fields to list (default 12).
 
 Format: twcclegg/dxvk-native's state cache (src/dxvk/dxvk_state_cache.cpp, dxvk_state_cache_types.h), versions
 8-11. v11 is that fork's own (adds the render pass view mask); upstream DXVK's numbering differs. Versions
-below 8 (fixed-size entries) are not supported. Apple builds use 13 spec constants; sc12 is shown as its two halves,
-sc12:depthFilter (low 16 bits) and sc12:stereoLayers (bits 16+, the per-sampler two-layer bits of stereo).
+below 8 (fixed-size entries) are not supported. Entries DXVK would reject on load (bad attachment layout, more
+than 32 vertex attributes or bindings) are counted as unparsed. Apple builds use 13 spec constants; sc12 is
+shown as its two halves, sc12.depthFilter (low 16 bits) and sc12.stereoLayers (bits 16+, the per-sampler
+two-layer bits of stereo). LB_PIPE_LOG=2 prints sc12 whole, as sc12.depthFilter.
 
 The file holds shader SHA-1s and pipeline state only, but it derives from the game's shaders: read caches
 where they are, don't copy or upload them. This script only reads the two files and prints counts.
@@ -43,7 +56,12 @@ STAGES = ["vs", "tcs", "tes", "gs", "fs", "cs"]
 COMPUTE_BIT = 0x20
 NUM_RT = 8
 VK_FORMAT_UNDEFINED = 0
-# D3D9SpecConstantId, as in describeMissFields
+MAX_ATTRS = MAX_BINDINGS = 32   # MaxNumVertexAttributes / MaxNumVertexBindings
+# Packed attachment layouts DXVK accepts (validateRenderPassFormat): GENERAL, the attachment layouts, and the
+# two mixed depth/stencil layouts the cache packs as 0x80 / 0x81
+DEPTH_LAYOUTS = {1, 3, 4, 0x80, 0x81}
+COLOR_LAYOUTS = {1, 2}
+# D3D9SpecConstantId (dxvk-native src/d3d9/d3d9_spec_constants.h)
 SC_NAMES = ["alphaOp", "samplerType", "fogEnabled", "vsFogMode", "psFogMode", "pointMode", "projection",
             "vsBools", "psBools", "fetch4", "depthMode", "vsScale", "depthFilter"]
 
@@ -113,6 +131,10 @@ def parse_entry(stage_mask, data, version):
             e.rp["rt%dFmt" % i] = r.u8()
             e.rp["rt%dLayout" % i] = r.u8()
         e.rp["viewMask"] = r.u8() if version >= 11 else 0
+        if e.rp["depthFmt"] and e.rp["depthLayout"] not in DEPTH_LAYOUTS:
+            raise ValueError("depth layout DXVK rejects")
+        if any(e.rp["rt%dFmt" % i] and e.rp["rt%dLayout" % i] not in COLOR_LAYOUTS for i in range(NUM_RT)):
+            raise ValueError("colour layout DXVK rejects")
 
         f.append(("bindingMask", r.take(mask_len), "state"))
         ia = r.u16()
@@ -120,6 +142,8 @@ def parse_entry(stage_mask, data, version):
               ("patchVerts", bits(ia, 5, 6), "state")]
         n_attr, n_bind = r.u8(), r.u8()
         f += [("attrCount", n_attr, "state"), ("bindCount", n_bind, "state")]
+        if n_attr > MAX_ATTRS or n_bind > MAX_BINDINGS:
+            raise ValueError("more vertex attributes or bindings than DXVK accepts")
         rs = r.u32()
         f += [("depthClip", bits(rs, 0, 1), "state"), ("depthBias", bits(rs, 1, 1), "state"),
               ("polygonMode", bits(rs, 2, 2), "state"), ("cullMode", bits(rs, 4, 2), "state"),
@@ -140,7 +164,9 @@ def parse_entry(stage_mask, data, version):
                   (face + ".depthFail", bits(s, 6, 3), "state"), (face + ".op", bits(s, 9, 3), "state"),
                   (face + ".readMask", bits(s, 16, 8), "state"), (face + ".writeMask", bits(s, 24, 8), "state")]
         f += logic
-        swz = [r.u8() for _ in range(NUM_RT)]
+        # swizzle: 2 bits per channel in the file; shown as LB_PIPE_LOG=2 shows it, r | g<<4 | b<<8 | a<<12
+        swz = [bits(z, 0, 2) | bits(z, 2, 2) << 4 | bits(z, 4, 2) << 8 | bits(z, 6, 2) << 12
+               for z in (r.u8() for _ in range(NUM_RT))]
         for i in range(NUM_RT):
             b = r.u32()
             f += [("rt%d.blend" % i, bits(b, 0, 1), "state"), ("rt%d.srcColor" % i, bits(b, 1, 5), "state"),
@@ -157,17 +183,18 @@ def parse_entry(stage_mask, data, version):
             div = bits(b, 18, 14) if version >= 10 else r.u32()
             f += [("vb%d.bind" % i, bits(b, 0, 5), "state"), ("vb%d.stride" % i, bits(b, 5, 12), "state"),
                   ("vb%d.rate" % i, bits(b, 17, 1), "state"), ("vb%d.divisor" % i, div, "state")]
-    # Spec constants: DXVK writes only the non-zero ones. All 32 mask slots are kept (absent = 0) so a constant
-    # set in one entry and unset in another diffs as x->0. sc12 (Apple) is split: low 16 bits = depth-compare
-    # PCF per sampler, high 16 bits = stereo layer bits (sampler reads layer gl_ViewIndex).
+    # Spec constants: DXVK writes only the non-zero ones. The named ones are always listed; any other slot set
+    # in the mask is listed only where non-zero (diff() treats a missing field as 0, so it still diffs as x->0).
+    # Names as LB_PIPE_LOG=2 prints them (scN.name, "sc" for unnamed slots). sc12 (Apple) is split: low 16 bits
+    # = depth-compare PCF per sampler, high 16 bits = stereo layer bits (sampler reads layer gl_ViewIndex).
     sc_mask = r.u32()
     sc = [r.u32() if sc_mask & (1 << i) else 0 for i in range(32)]
     for i in range(32):
         if i == 12:
-            f += [("sc12:depthFilter", sc[i] & 0xFFFF, "spec"), ("sc12:stereoLayers", sc[i] >> 16, "spec")]
+            f += [("sc12.depthFilter", sc[i] & 0xFFFF, "spec"), ("sc12.stereoLayers", sc[i] >> 16, "spec")]
         elif sc[i] or i < len(SC_NAMES):
-            name = SC_NAMES[i] if i < len(SC_NAMES) else "sc%d" % i
-            f.append(("sc%d:%s" % (i, name), sc[i], "spec"))
+            name = SC_NAMES[i] if i < len(SC_NAMES) else "sc"
+            f.append(("sc%d.%s" % (i, name), sc[i], "spec"))
     if r.p != len(data):
         raise ValueError("entry has %d unread bytes" % (len(data) - r.p))
     e.fields = f
@@ -190,12 +217,17 @@ def read_cache(path):
     while p + 24 <= len(data):
         hdr, = struct.unpack_from("<I", data, p)
         stage_mask, size = hdr & 0xFF, hdr >> 8
+        if size > 1024:
+            # A corrupt size. DXVK counts the entry invalid and reads on from the same place, i.e. reads the
+            # data as the next header, and rewrites the file. Nothing after it can be trusted: stop, and
+            # report what is left as trailing bytes.
+            invalid += 1
+            break
+        if p + 24 + size > len(data):
+            break                 # truncated last entry: DXVK hits end of file and counts nothing; trailing
         digest = data[p + 4:p + 24]
         blob = data[p + 24:p + 24 + size]
         p += 24 + size
-        if len(blob) != size or size > 1024:
-            invalid += 1          # truncated tail or a corrupt size: DXVK stops here too
-            break
         if hashlib.sha1(blob).digest() != digest:
             invalid += 1
             continue
@@ -203,12 +235,12 @@ def read_cache(path):
             entries.append(parse_entry(stage_mask, blob, version))
         except ValueError:
             bad_parse += 1
-    trailing = len(data) - p if p < len(data) else 0
+    trailing = len(data) - p
     return {"path": path, "version": version, "entries": entries, "invalid": invalid,
             "bad_parse": bad_parse, "trailing": trailing}
 
 
-# --- state Vulkan ignores (dxvkNormalizePipelineState, attachment-based part only) ---------------------------
+# --- state Vulkan ignores (dxvk-native's pipeline normalize, attachment-based part only) ---------------------
 
 def dc_fields(rp, vals):
     """Names of fields whose value can't change the pipeline, given this entry's render pass and state."""
@@ -250,19 +282,23 @@ def diff(a, b):
     vb = collections.OrderedDict((n, (v, g)) for n, v, g in b.fields)
     dca = dc_fields(a.rp, {n: v for n, (v, _) in va.items()})
     dcb = dc_fields(b.rp, {n: v for n, (v, _) in vb.items()})
+    # A field one side lacks is 0 there: vertex attributes / bindings past the count, unnamed spec constants
     for n in list(va) + [n for n in vb if n not in va]:
-        x, gx = va.get(n, (None, None))
-        y, gy = vb.get(n, (None, None))
+        x, gx = va.get(n, (0, None))
+        y, gy = vb.get(n, (0, None))
         if x != y:
+            if isinstance(x, bytes):
+                x, y = 0, 1       # binding mask: LB_PIPE_LOG=2 prints only that it differs
             out.append((n, x, y, gx or gy, n in dca and n in dcb))
     return out
 
 
+def rank(d):
+    """Closest-entry order, as LB_PIPE_LOG=2: fewest differing fields that matter, then fewest in all."""
+    return (sum(1 for *_, dc in d if not dc), len(d))
+
+
 def fmt_val(v):
-    if v is None:
-        return "-"
-    if isinstance(v, bytes):
-        return v.hex()[:8] + ".."
     return "%x" % v
 
 
@@ -271,8 +307,9 @@ def summarize(name, only, other, args):
     vs_seen, fs_seen = set(), set()
     for e in other["entries"]:
         by_set[e.shader_set()].append(e)
-        vs_seen.add(e.keys.get("vs"))
-        fs_seen.add(e.keys.get("fs"))
+        for stage, seen in (("vs", vs_seen), ("fs", fs_seen)):
+            if stage in e.keys:
+                seen.add(e.keys[stage])
 
     cats = collections.Counter()
     examples = collections.defaultdict(list)
@@ -293,7 +330,7 @@ def summarize(name, only, other, args):
             if len(examples[cat]) < args.show:
                 examples[cat].append(e.short())
             continue
-        best = min((diff(e, o) for o in same), key=len)
+        best = min((diff(e, o) for o in same), key=rank)
         groups = sorted({g for _, _, _, g, _ in best})
         cat = "differs: " + " + ".join(groups) if groups else "differs: (nothing parsed differs)"
         cats[cat] += 1
@@ -305,7 +342,7 @@ def summarize(name, only, other, args):
             examples[cat].append(e.short() + "  " + ",".join(
                 "%s %s->%s%s" % (n, fmt_val(x), fmt_val(y), " dc" if dc else "") for n, x, y, _, dc in best))
 
-    print("\nOnly in %s: %d" % (name, len(only)))
+    print("\nOnly in %s: %d unique states" % (name, len(only)))
     for cat, n in sorted(cats.items(), key=lambda kv: (-kv[1], kv[0])):
         print("  %-42s %5d" % (cat, n))
         for ex in examples[cat]:
@@ -342,6 +379,7 @@ def main():
         print("   graphics by view mask: " + ", ".join("%x: %d" % kv for kv in sorted(vm.items())))
 
     a, b = caches
+    # a["ids"] / b["ids"] count entries per unique state; "both" and "only in" are unique states
     both = set(a["ids"]) & set(b["ids"])
     only_a = [e for e in a["entries"] if e.identity() not in b["ids"]]
     only_b = [e for e in b["entries"] if e.identity() not in a["ids"]]
@@ -351,12 +389,15 @@ def main():
     sa = {e.shader_set() for e in a["entries"]}
     sb = {e.shader_set() for e in b["entries"]}
 
-    print("\n%sIn both: %d   only in A: %d   only in B: %d" % (
+    print("\n%sUnique states in both: %d   only in A: %d   only in B: %d" % (
         "(normalized) " if args.normalize else "", len(both), len(only_a), len(only_b)))
     print("Shader sets: A %d, B %d, in both %d" % (len(sa), len(sb), len(sa & sb)))
-    if a["ids"]:
-        print("Share of A found in B: %.1f%%   share of B found in A: %.1f%%" % (
-            100.0 * len(both) / len(a["ids"]), 100.0 * len(both) / max(1, len(b["ids"]))))
+    for x, y, xn, yn in ((a, b, "A", "B"), (b, a, "B", "A")):
+        if x["entries"]:
+            hit = sum(x["ids"][i] for i in both)
+            print("Share of %s found in %s: %.1f%% of unique states, %.1f%% of entries (%d of %d)" % (
+                xn, yn, 100.0 * len(both) / len(x["ids"]), 100.0 * hit / len(x["entries"]), hit,
+                len(x["entries"])))
     summarize("A", only_a, b, args)
     summarize("B", only_b, a, args)
 
