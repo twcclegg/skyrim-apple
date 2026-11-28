@@ -13,6 +13,10 @@
 #include <os/proc.h>
 #include <pthread.h>
 #include <atomic>
+#include <set>
+#include <string>
+#include <utility>
+#include <vector>
 #include <errno.h>
 #include <stdio.h>
 #include <sys/resource.h>
@@ -159,6 +163,131 @@ static void applyLaunchEnvironment(void) {
     }
 }
 
+/* Seed caches: DXVK state caches (*.dxvk-cache) and bytecode caches (*.dxso-cache) placed by the developer at
+ * Documents/SkyrimNative/seed/, for example recorded on a Mac in the headset's configuration. Before the renderer
+ * starts, their entries that the saves folder's own caches don't have yet are appended to them, so the first
+ * launch compiles those pipelines while loading instead of at draw time. Entries are checked against their SHA-1;
+ * only files of the same format version are merged; nothing already in the saves folder is changed, except a cut-off
+ * last entry (an interrupted write), which is dropped. LB_SEED=0 skips it. */
+namespace {
+struct CacheFormat {
+    const char *magic;     // 4 bytes
+    unsigned headerSize;   // magic, version and (state cache) entry size
+};
+const CacheFormat kStateCache = {"DXVK", 12};
+const CacheFormat kBytecodeCache = {"DXSO", 8};
+
+/* Entries of a cache file as (key, bytes) in file order; false if the header is wrong or the version is not one
+ * this reads. complete is where the last whole entry ends. */
+bool parseCache(const std::string &file, const CacheFormat &format, uint32_t &version,
+                std::vector<std::pair<std::string, std::string>> &entries, size_t &complete) {
+    entries.clear();
+    complete = 0;
+    if (file.size() < format.headerSize || memcmp(file.data(), format.magic, 4) != 0) return false;
+    memcpy(&version, file.data() + 4, 4);
+    const bool state = format.headerSize == 12;
+    if (state ? version < 8 : version != 1) return false;  // v8+: size-prefixed entries with a SHA-1
+    size_t p = format.headerSize;
+    complete = p;
+    while (true) {
+        size_t keyAt, codeAt, size;
+        if (state) {  // u32 (stage mask | size << 8), SHA-1 of the blob, blob
+            if (p + 24 > file.size()) break;
+            uint32_t header;
+            memcpy(&header, file.data() + p, 4);
+            size = header >> 8;
+            keyAt = p + 4;
+            codeAt = p + 24;
+        } else {      // u32 stage, u32 length, 20-byte key (SHA-1 of the code), code
+            if (p + 28 > file.size()) break;
+            uint32_t length;
+            memcpy(&length, file.data() + p + 4, 4);
+            size = length;
+            keyAt = p + 8;
+            codeAt = p + 28;
+        }
+        if (size > (1u << 20) || codeAt + size > file.size()) break;  // DXVK's own cap: a damaged length stops here
+        unsigned char digest[CC_SHA1_DIGEST_LENGTH];
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"  // DXVK's own entry checksum, not a security use
+        CC_SHA1(file.data() + codeAt, (CC_LONG)size, digest);
+#pragma clang diagnostic pop
+        if (memcmp(digest, file.data() + keyAt, CC_SHA1_DIGEST_LENGTH) == 0)
+            entries.emplace_back(std::string(file.data() + keyAt, CC_SHA1_DIGEST_LENGTH),
+                                 std::string(file.data() + p, codeAt + size - p));
+        p = codeAt + size;
+        complete = p;
+    }
+    return true;
+}
+
+void mergeSeed(NSString *seedPath, NSString *savePath, const CacheFormat &format) {
+    NSData *seedData = [NSData dataWithContentsOfFile:seedPath];
+    std::string seed(seedData ? (const char *)seedData.bytes : "", seedData ? seedData.length : 0);
+    uint32_t seedVersion = 0;
+    std::vector<std::pair<std::string, std::string>> seedEntries, saveEntries;
+    size_t seedEnd = 0, saveEnd = 0;
+    if (!parseCache(seed, format, seedVersion, seedEntries, seedEnd)) {
+        fprintf(stderr, "native: seed: %s is not a cache this build reads; skipped\n", seedPath.lastPathComponent.UTF8String);
+        return;
+    }
+    NSData *saveData = [NSData dataWithContentsOfFile:savePath];
+    std::string save(saveData ? (const char *)saveData.bytes : "", saveData ? saveData.length : 0);
+    uint32_t saveVersion = 0;
+    std::string out;
+    if (save.empty()) {
+        out.assign(seed.data(), format.headerSize);
+    } else if (!parseCache(save, format, saveVersion, saveEntries, saveEnd) || saveVersion != seedVersion) {
+        fprintf(stderr, "native: seed: %s is v%u, %s is %s; not merged\n", seedPath.lastPathComponent.UTF8String,
+                seedVersion, savePath.lastPathComponent.UTF8String,
+                saveVersion ? [NSString stringWithFormat:@"v%u", saveVersion].UTF8String : "unreadable");
+        return;
+    } else {
+        out.assign(save.data(), saveEnd);  // drops a cut-off last entry
+    }
+    std::set<std::string> have;
+    for (const auto &entry : saveEntries) have.insert(entry.first);
+    size_t added = 0;
+    for (const auto &entry : seedEntries)
+        if (have.insert(entry.first).second) { out += entry.second; added++; }
+    if (!added && out.size() == save.size()) {
+        fprintf(stderr, "native: seed: %s adds nothing to %s (%zu entries)\n", seedPath.lastPathComponent.UTF8String,
+                savePath.lastPathComponent.UTF8String, saveEntries.size());
+        return;
+    }
+    NSData *merged = [NSData dataWithBytes:out.data() length:out.size()];
+    if (![merged writeToFile:savePath atomically:YES]) {
+        fprintf(stderr, "native: seed: couldn't write %s\n", savePath.UTF8String);
+        return;
+    }
+    const bool dropped = !save.empty() && saveEnd < save.size();
+    fprintf(stderr, "native: seed: %zu of %zu entries from %s added to %s (now %zu)%s\n", added, seedEntries.size(),
+            seedPath.lastPathComponent.UTF8String, savePath.lastPathComponent.UTF8String, saveEntries.size() + added,
+            dropped ? "; a cut-off last entry was dropped" : "");
+}
+} // namespace
+
+static void mergeSeeds(void) {
+    const char *off = getenv("LB_SEED");
+    if (off && !strcmp(off, "0")) return;
+    const char *cachePath = getenv("DXVK_STATE_CACHE_PATH");  // where DXVK will read them (launch-env.json may move it)
+    if (!cachePath || !*cachePath) return;
+    NSString *saves = @(cachePath);
+    NSString *dir = [documents() stringByAppendingPathComponent:@"SkyrimNative/seed"];
+    NSArray<NSString *> *names = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:dir error:nil];
+    if (!names.count) return;
+    /* DXVK names both caches after the executable (dxvk_state_cache.cpp, getCacheFileName). */
+    NSString *exe = NSBundle.mainBundle.executablePath.lastPathComponent.stringByDeletingPathExtension;
+    for (NSString *name in [names sortedArrayUsingSelector:@selector(compare:)]) {
+        NSString *ext = name.pathExtension.lowercaseString;
+        const CacheFormat *format = [ext isEqualToString:@"dxvk-cache"] ? &kStateCache
+                                  : [ext isEqualToString:@"dxso-cache"] ? &kBytecodeCache : nullptr;
+        if (!format) continue;
+        mergeSeed([dir stringByAppendingPathComponent:name],
+                  [saves stringByAppendingPathComponent:[exe stringByAppendingPathExtension:ext]], *format);
+    }
+}
+
 static void logIdentity(NSString *game, NSString *saves) {
     struct utsname host;
     uname(&host);
@@ -256,6 +385,7 @@ extern "C" int skyrim_native_run(const char *save_root, char *error, size_t erro
         }
         setenv("DXVK_CONFIG_FILE", config.fileSystemRepresentation, 1);
         setenv("DXVK_STATE_CACHE_PATH", saves.fileSystemRepresentation, 0);
+        mergeSeeds();  /* before the renderer reads the caches */
         setenv("DXVK_LOG_PATH", logs.fileSystemRepresentation, 0);
         /* GPU work rejected while the app goes inactive must not leave the device lost for good. */
         setenv("MVK_CONFIG_RESUME_LOST_DEVICE", "1", 0);
