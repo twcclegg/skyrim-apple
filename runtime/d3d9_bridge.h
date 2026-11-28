@@ -38,6 +38,7 @@ void d3d_passes_draw(uint32_t prims);          // every Draw*Primitive*, with it
 void d3d_passes_target(IDirect3DDevice9 *d);   // after the render target 0 or the depth-stencil surface changed
 void d3d_passes_clear(uint32_t flags);         // before a Clear, with its D3DCLEAR_* flags
 void d3d_passes_projection(const float *m);    // SetTransform(D3DTS_PROJECTION), the guest's matrix
+void d3d_passes_copy(IDirect3DSurface9 *src, IDirect3DSurface9 *dst);  // before a StretchRect (LB_STEREO_READS)
 bool hud_screen_in_pass(void);                 // drawing a menu into the second screen's image (hud_screen.cpp)
 /* First-person draws (arms, weapon, spell hand and its effect; d3d9_bridge.cpp): whether the draw being made is one,
  * and of which kind. C callers: skyrim_first_person_pass() returns the kind, skyrim_first_person_listen(fn) has fn

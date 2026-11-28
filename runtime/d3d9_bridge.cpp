@@ -8,6 +8,7 @@
 #include <TargetConditionals.h>
 #endif
 #include <ctype.h>
+#include <stdarg.h>
 #include <functional>
 #include <vector>
 void shadow_flush(void *obj);
@@ -381,6 +382,7 @@ static void passes_init(IDirect3DDevice9 *d);  // LB_PASSES, below
 static void d3d_passes_reset(IDirect3DDevice9 *d);
 static void stereo_mask_present(bool reset);  // eye views' per-eye targets, below
 static void stereo_post_present(bool reset);
+static void stereo_reads_reset(void);  // LB_STEREO_READS, below
 
 void B_IDirect3D9_CreateDevice(CPU *c) {
     auto *d3d = (IDirect3D9 *)com_host(ARG(0));
@@ -437,6 +439,7 @@ void B_IDirect3DDevice9_Reset(CPU *c) {
     // referenced, and a failed Reset must not leave them held. They are looked for again afterwards.
     stereo_mask_present(true);
     stereo_post_present(true);
+    stereo_reads_reset();
     rt_host_affinity_begin();
     HRESULT hr = d->Reset(&pp);
     rt_host_affinity_end();
@@ -487,6 +490,11 @@ extern "C" void dxvk_stereo_set_view_ui_offsets(const float view0[4], const floa
 static float g_ui_k[2][2];  // [view][x, y]
 static bool g_ui_shift_on;
 static uint32_t g_skip_class_mask;  // LB_SKIP_CLASS=depth,shadow,...: skip every draw of those classes (timing only)
+static bool g_skip_rt_on;      // LB_SKIP_RT: draws into targets of the listed sizes are skipped (skip_rt_draw, below)
+static bool g_skip_rt_now;     // ... and the draw being made is one of them
+static int g_reads_from = -1;  // LB_STEREO_READS: first frame of the read graph (stereo_reads_draw, below); -1 off
+static uint32_t g_last_prims;  // the primitive count of the draw being made (d3d_passes_draw), for LB_STEREO_READS
+static void stereo_reads_draw(int k, uint32_t prims);
 static int g_bisect_from = -1, g_draw_no;
 static bool g_bisect_window;  // inside LB_BISECT's 160 frames (g_bisect is also set for LB_SKIP_DRAWS / LB_FP_SKIP)
 
@@ -517,9 +525,17 @@ static bool skip_ranges_hit(void) {
 static bool fp_skip_now(void);  // LB_FP_SKIP, below
 
 static bool depth_copy_draw(void);
+static bool skip_decide(void);
 bool d3d_skip_draw(void) {
+    const bool skip = skip_decide();
+    // LB_STEREO_READS records only the draws that are made (with g_bisect off, d3d_passes_draw records them all).
+    if (g_reads_from >= 0 && !skip) stereo_reads_draw(g_last_class, g_last_prims);
+    return skip;
+}
+static bool skip_decide(void) {
     if (g_depth_copy == 1 && depth_copy_draw()) return true;
     if (g_skip_class_mask && g_last_class >= 0 && (g_skip_class_mask >> g_last_class & 1)) return true;
+    if (g_skip_rt_now) return true;
     if (!g_skip_ranges.empty() && skip_ranges_hit()) return true;
     if (fp_skip_now()) return true;
     if (!g_bisect_window) return false;
@@ -551,7 +567,7 @@ static void bisect_present(void) {
     if (!g_skip_ranges_read) skip_ranges_read();
     static const bool fp_skip = getenv("LB_FP_SKIP") || getenv("LB_STEREO_HYBRID");  // both skip draws
     g_bisect_window = g_frame >= g_bisect_from && g_frame < g_bisect_from + 160;
-    g_bisect = g_bisect_window || !g_skip_ranges.empty() || fp_skip || g_skip_class_mask || g_depth_copy == 1;
+    g_bisect = g_bisect_window || !g_skip_ranges.empty() || fp_skip || g_skip_class_mask || g_depth_copy == 1 || g_skip_rt_on;
 }
 
 // LB_PASSES=1 logs, at each Present, the frame's draw calls and primitives by the kind of pass they belong to, so
@@ -565,7 +581,8 @@ static void bisect_present(void) {
 //   fpdbg <frame> runs=<n> mask=<draws> prepass=<draws> colour=<draws> other=<draws> depth=<draws>
 //         draws=#<first>-#<last> near=<first-person near plane> [UNEXPECTED]
 // Off, it costs one branch per draw call, target change and Clear. g_d3d_passes turns the hooks on: also without
-// LB_PASSES when the first-person flag is wanted (LB_FP=1, LB_FP_SKIP, or LB_STEREO_EYE_UNITS set), then with no logs.
+// LB_PASSES when the first-person flag is wanted (LB_FP=1, LB_FP_SKIP, or LB_STEREO_EYE_UNITS set), then with no logs,
+// and for the switches that use the pass class or the target bound (LB_SKIP_CLASS, LB_SKIP_RT, LB_STEREO_READS).
 int g_d3d_passes;
 static int g_passes_log;  // LB_PASSES: 0 no lines, 1 pass lines, 2 also passdbg and fpdbg lines
 enum PassClass {
@@ -630,6 +647,9 @@ static void stereo_mask_seen(void);       // eye views: the sun-shadow mask give
 static void stereo_mask_present(bool reset);
 static void stereo_post_draw(void);           // eye views: the post chain's per-eye targets given a layer per eye, below
 static void stereo_post_present(bool reset);
+static void stereo_reads_init(void);                   // LB_STEREO_READS, below
+static void stereo_reads_draw(int k, uint32_t prims);
+static void stereo_reads_present(void);
 
 // The kind of the first-person draw being made, from the target bound (FP_NONE outside first-person draws).
 static int fp_kind(void) {
@@ -861,6 +881,35 @@ static void gpu_init(IDirect3DDevice9 *d) {
         (unsigned long long)freq);
 }
 
+/* LB_SKIP_RT=WxH[,WxH...] (diagnostic): skip every draw into a render target of one of those sizes (never the back
+ * buffer), to see in a screenshot what those targets give the picture. LB_SKIP_RT_FRAME=F skips them on frame F only
+ * (numbered as in LB_SHOT and LB_SKIP_DRAWS: the number the frame's Present will have, so LB_SHOT=F shows it; the pass
+ * lines call that frame F-1), LB_SKIP_RT_FMT=n only in targets of D3DFORMAT n. The picture is wrong by design.
+ * Off by default, and then it costs one branch per draw. Set, it turns the pass hooks on (they know the target bound)
+ * and logs "LB_SKIP_RT: skipping draws into <n> target sizes". */
+static std::vector<std::pair<uint32_t, uint32_t>> g_skip_rt_sizes;
+static int g_skip_rt_frame = -1, g_skip_rt_fmt = -1;
+static void skip_rt_init(void) {
+    for (const char *e = getenv("LB_SKIP_RT"); e && *e;) {
+        unsigned w = 0, h = 0;
+        if (sscanf(e, "%ux%u", &w, &h) == 2) g_skip_rt_sizes.push_back({w, h});
+        e = strchr(e, ',');
+        if (e) e++;
+    }
+    g_skip_rt_on = !g_skip_rt_sizes.empty();
+    if (const char *e = getenv("LB_SKIP_RT_FRAME")) g_skip_rt_frame = atoi(e);
+    if (const char *e = getenv("LB_SKIP_RT_FMT")) g_skip_rt_fmt = atoi(e);
+    if (g_skip_rt_on) LOG("LB_SKIP_RT: skipping draws into %zu target sizes", g_skip_rt_sizes.size());
+}
+// At each draw while LB_SKIP_RT is set: whether d3d_skip_draw skips it.
+static void skip_rt_draw(void) {
+    const PassTarget &t = g_pass_target;
+    g_skip_rt_now = false;
+    for (const auto &sz : g_skip_rt_sizes) g_skip_rt_now |= !t.bb && t.w == sz.first && t.h == sz.second;
+    if (g_skip_rt_frame >= 0 && g_frame + 1 != g_skip_rt_frame) g_skip_rt_now = false;  // as skip_ranges_hit
+    if (g_skip_rt_fmt >= 0 && (int)t.fmt != g_skip_rt_fmt) g_skip_rt_now = false;
+}
+
 void d3d_passes_draw(uint32_t prims) {
     {
         const PassTarget &t = g_pass_target;
@@ -877,6 +926,9 @@ void d3d_passes_draw(uint32_t prims) {
     if (k == PASS_MAIN && g_depth_copy == 1 && !g_main_ds && g_pass_device) g_pass_device->GetDepthStencilSurface(&g_main_ds);
     if (k == PASS_MASK) stereo_mask_seen();
     if (prims <= 2) stereo_post_draw();
+    g_last_prims = prims;
+    if (g_reads_from >= 0 && !g_bisect) stereo_reads_draw(k, prims);  // else from d3d_skip_draw, if not skipped
+    if (g_skip_rt_on) skip_rt_draw();
     // The first draws through the eyes' matrices: the mask (world or first-person draws into it), or the main pass.
     if (k == PASS_MASK || k == PASS_MAIN || k == PASS_FP) stereo_late_eyes();
     if (g_passes_gpu) gpu_draw(k);
@@ -996,9 +1048,11 @@ static void passes_init(IDirect3DDevice9 *d) {
                 if (strstr(sc, k_pass_names[c]) || (c == PASS_MASK && strstr(sc, "refl"))) g_skip_class_mask |= 1u << c;
             LOG("LB_SKIP_CLASS=%s: skipping pass classes mask %x", sc, g_skip_class_mask);
         }
+        skip_rt_init();
+        stereo_reads_init();
         const bool fp_wanted = (fp && atoi(fp)) || getenv("LB_FP_SKIP") || (eye && atof(eye) != 0) || g_fp_flame
                             || g_skip_class_mask || g_depth_copy == 1;
-        g_d3d_passes = g_passes_log || fp_wanted;
+        g_d3d_passes = g_passes_log || fp_wanted || g_skip_rt_on || g_reads_from >= 0;  // both need the hooks
         // without an LB_D3DTRACE range, LB_PASSES=2 looks at the first frame
         g_passdbg = g_passes_log == 2 && !getenv("LB_D3DTRACE");
         if (g_passes_log) LOG("LB_PASSES=%d: draws per pass class logged at each Present", g_passes_log);
@@ -1040,6 +1094,7 @@ static void passes_present(void) {
     if (g_main_ds) { g_main_ds->Release(); g_main_ds = nullptr; }
     stereo_mask_present(false);
     stereo_post_present(false);
+    if (g_reads_from >= 0) stereo_reads_present();
     if (!g_d3d_passes) return;
     g_pass_frame.fp_late = g_pass_frame.fp_proj = false;
     fp_update();
@@ -2626,6 +2681,352 @@ static void stereo_post_present(bool reset) {
     g_post_chains = 0;
 }
 
+/* LB_STEREO_READS=<frame> (diagnostic): a read graph of the one-layer render targets under multiview, to find mono
+ * passes whose output a per-eye pass reads. DXVK gives a second layer only to back-buffer-sized targets, so a pass
+ * into a smaller target draws one view, from the left eye's layer of what it samples, and a per-eye pass that samples
+ * its output gives the right eye the left eye's picture of it. From frame <frame> on, for 8 frames in a row out of
+ * every 100, each frame's Present logs:
+ *   mvread  <frame> <surface> <w>x<h> fmt=<n> usage=<x> layers=<n> read: <class>=<draws> ... stages=<mask> vpos=<0|1>
+ *           | <class>=<draws> ... copy=<n> prims=<n> ds=<0|1> vp=<w>x<h> from2=<0|1>  (or "| not written this frame")
+ *     A one-layer render-target or depth-stencil texture sampled by draws into a two-layer target. Before the bar:
+ *     the reading draws by pass class, the samplers they read it on (a bit per stage; bits 16-19 are the vertex
+ *     samplers) and whether a reading pixel shader declares vPos (screen-position lookups). After it: the draws that
+ *     wrote it this frame by class (as colour target 0, or as the depth-stencil for a depth-stencil texture), the
+ *     StretchRect copies into it (copy, shown when there are any), the draws' primitives, whether a depth-stencil was
+ *     bound, the last draw's viewport, and whether a writer sampled a two-layer texture or copied from one (from2=1:
+ *     it was made from the eyes' pictures, so the right eye's half was lost on the way). "not written this frame"
+ *     means no draw or StretchRect wrote it in the logged frame: an earlier frame, or a path not followed here
+ *     (UpdateSurface, LockRect, colour targets 1-3), may have.
+ *   mvwrite <frame> <surface> <w>x<h> fmt=<n> layers=<n> <class>=<draws> ... copy=<n> prims=<n> ds=<0|1> vp=<w>x<h>
+ *           from2=<0|1>
+ *     A one-layer target written this frame that no draw into a two-layer target sampled; the fields as above.
+ *   mvread1 <frame> <surface> <w>x<h> fmt=<n> by <target> <w>x<h> <class>=<draws>
+ *     A one-layer render-target texture sampled by draws of one class into a one-layer target (the post chain, and
+ *     anything else mono, reading it).
+ *   mvread2 <frame> <surface> <w>x<h> fmt=<n> <class>=<with vPos>/<without> ...
+ *     A two-layer texture sampled by geometry draws (> 2 primitives) into two-layer targets: per class, the draws whose
+ *     pixel shader declares vPos (a per-eye screen lookup) and those without (coordinates from the vertex shader, which
+ *     are the game camera's, not the eye's).
+ *   mvcopy2 <frame> <surface> <w>x<h> fmt=<n> from <surface> <w>x<h> layers=<n> copies=<n>
+ *     A two-layer target written by StretchRect, which copies layer 0 only: its layer 1 (the right eye) keeps what it
+ *     had. The source's layers are given.
+ *   mvdropped <frame> mvread/mvwrite=<n> mvread1=<n> mvread2=<n> mvcopy2=<n>
+ *     Only when a table was full: how many records of each kind the frame could not keep, so the lines above are
+ *     not the whole frame.
+ * <surface> and <target> are addresses, to match lines within a frame. Every face and level of a texture is one
+ * record, named by its level 0 (face +X of a cube), so a write into any of them meets the reads of that texture.
+ * A sampler counts only if the pixel shader declares it; the four vertex samplers always count, and without a pixel
+ * shader all 16 stages do, so a stale binding can show as a read. ps_1_x shaders declare no samplers, so their reads
+ * are missed. layers is read at Present, after stereo_post_present has layered what it wanted this frame. At most 64
+ * mvread/mvwrite, 128 mvread1, 64 mvread2 and 32 mvcopy2 entries a frame. Draws that are skipped (LB_DEPTH_COPY,
+ * LB_SKIP_RT, LB_SKIP_CLASS, LB_FP_SKIP, ...) are not recorded.
+ * Each surface recorded is held (a ref) until the frame's Present, so an address names one surface for the whole
+ * frame and nothing reads a surface the game has released (a device Reset drops them first, unlogged); the pixel
+ * shaders whose declarations are cached are held for the run, for the same reason (which also keeps the device
+ * alive for the run, as each holds it; acceptable for a diagnostic).
+ * Off by default, and then it costs one branch per draw and per Present. Set, it turns the pass hooks on (the classes
+ * are theirs) and logs "LB_STEREO_READS: read graph of one-layer targets from frame <frame>". The picture is not
+ * changed. With LB_STEREO_POST=0 the bloom and distance-blur targets (above) show as mvread lines with from2=1; that
+ * is how they were found. With them layered, the one-layer targets per-eye passes still read in Riverwood are the
+ * sun's shadow map, a cube map, the 1x1 luminance and, when it is drawn, the water's 512x512 reflection. */
+struct ReadRec {
+    void *s;
+    uint32_t w, h, fmt, usage, stages;
+    int rd[PASS_COUNT], wr[PASS_COUNT], wr_copy;
+    uint32_t wr_prims;
+    bool vpos, wr_ds, wr_from2;
+    uint32_t vp_w, vp_h;
+};
+static std::vector<ReadRec> g_reads;     // mvread / mvwrite
+struct Read2Rec { void *s; uint32_t w, h, fmt; int v[PASS_COUNT], nv[PASS_COUNT]; };
+static std::vector<Read2Rec> g_reads2;   // mvread2
+struct Read1Rec { void *s, *rt; uint32_t w, h, fmt, rw, rh; int k, n; };
+static std::vector<Read1Rec> g_reads1;   // mvread1
+struct Copy2Rec { void *dst, *src; uint32_t w, h, fmt, sw, sh; int sl, n; };
+static std::vector<Copy2Rec> g_copies2;  // mvcopy2
+static int g_reads_dropped[4];           // records the tables had no room for this frame: reads, reads1, reads2, copies2
+static void reads_hold(void *s) { static_cast<IDirect3DSurface9 *>(s)->AddRef(); }
+static void reads_drop(void *s) { static_cast<IDirect3DSurface9 *>(s)->Release(); }
+// Appends to line, keeping n inside the buffer however long the text gets.
+static void reads_cat(char *line, size_t cap, int &n, const char *fmt, ...) {
+    if (n < 0 || (size_t)n >= cap) return;
+    va_list ap;
+    va_start(ap, fmt);
+    const int w = vsnprintf(line + n, cap - n, fmt, ap);
+    va_end(ap);
+    if (w > 0) n = (size_t)n + (size_t)w >= cap ? (int)cap - 1 : n + w;
+}
+static bool reads_logged_frame(int frame) {
+    return frame >= g_reads_from && (frame - g_reads_from) % 100 <= 7;  // 8 frames in a row, every 100
+}
+static void stereo_reads_init(void) {
+    const char *e = getenv("LB_STEREO_READS");
+    if (!e || !*e) return;
+    if (atoi(e) < 0) return;
+    g_reads_from = atoi(e);
+    LOG("LB_STEREO_READS: read graph of one-layer targets from frame %d", g_reads_from);
+}
+// The surface records are keyed on: level 0 (face +X of a cube) of the texture `s` belongs to, or `s` itself for a
+// standalone surface; ref held. *in_texture: whether it belongs to a texture.
+static IDirect3DSurface9 *reads_canon(IDirect3DSurface9 *s, bool *in_texture) {
+    IUnknown *c = nullptr;
+    IDirect3DDevice9 *dev = nullptr;
+    IDirect3DSurface9 *out = nullptr;
+    // Asked for IUnknown: a standalone surface's container is the device, which logs a warning for an interface it
+    // lacks (IDirect3DBaseTexture9).
+    if (SUCCEEDED(s->GetContainer(__uuidof(IUnknown), (void **)&c)) && c) {
+        s->GetDevice(&dev);
+        IDirect3DBaseTexture9 *bt = nullptr;
+        if ((void *)c != (void *)dev && SUCCEEDED(c->QueryInterface(__uuidof(IDirect3DBaseTexture9), (void **)&bt))
+            && bt) {
+            if (bt->GetType() == D3DRTYPE_TEXTURE) static_cast<IDirect3DTexture9 *>(bt)->GetSurfaceLevel(0, &out);
+            else if (bt->GetType() == D3DRTYPE_CUBETEXTURE)
+                static_cast<IDirect3DCubeTexture9 *>(bt)->GetCubeMapSurface(D3DCUBEMAP_FACE_POSITIVE_X, 0, &out);
+            bt->Release();
+        }
+        if (dev) dev->Release();
+        c->Release();
+    }
+    if (in_texture) *in_texture = out != nullptr;
+    if (!out) { out = s; s->AddRef(); }
+    return out;
+}
+static ReadRec *reads_rec(void *s) {
+    for (ReadRec &r : g_reads) if (r.s == s) return &r;
+    if (g_reads.size() >= 64) { g_reads_dropped[0]++; return nullptr; }
+    g_reads.push_back(ReadRec());
+    ReadRec &r = g_reads.back();
+    r.s = s;
+    reads_hold(s);
+    D3DSURFACE_DESC d = {};
+    static_cast<IDirect3DSurface9 *>(s)->GetDesc(&d);
+    r.w = d.Width; r.h = d.Height; r.fmt = (uint32_t)d.Format; r.usage = (uint32_t)d.Usage;
+    return &r;
+}
+// A write by the draw being made into `s` (a canonical surface).
+static void reads_write(void *s, int k, uint32_t prims, bool from2) {
+    ReadRec *r = reads_rec(s);
+    if (!r) return;
+    r->wr[k]++;
+    r->wr_prims += prims;
+    r->wr_ds |= g_pass_target.ds;
+    r->wr_from2 |= from2;
+    D3DVIEWPORT9 vp = {};
+    g_pass_device->GetViewport(&vp);
+    r->vp_w = vp.Width; r->vp_h = vp.Height;
+}
+// Samplers the pixel shader declares (bit per sampler) and whether it declares vPos; all 16 and false without one.
+// Cached by shader, each cached shader held so that its address stays its own.
+static uint32_t ps_samplers(IDirect3DDevice9 *d, bool *vpos) {
+    struct Info { void *ps; uint32_t mask; bool vpos; };
+    static std::vector<Info> cache;
+    *vpos = false;
+    IDirect3DPixelShader9 *ps = nullptr;
+    if (FAILED(d->GetPixelShader(&ps)) || !ps) return 0xFFFF;
+    for (const Info &i : cache) if (i.ps == ps) { ps->Release(); *vpos = i.vpos; return i.mask; }
+    UINT size = 0;
+    Info info = {ps, 0, false};
+    if (SUCCEEDED(ps->GetFunction(nullptr, &size)) && size >= 8) {
+        std::vector<uint32_t> tok(size / 4);
+        ps->GetFunction(tok.data(), &size);
+        for (size_t i = 1; i < tok.size();) {
+            const uint32_t t = tok[i], op = t & 0xFFFF;
+            if (op == 0xFFFF) break;
+            if (op == 0xFFFE) { i += 1 + ((t >> 16) & 0x7FFF); continue; }
+            const uint32_t len = (t >> 24) & 0xF;
+            if (op == 0x1F && i + 2 < tok.size()) {
+                const uint32_t p = tok[i + 2], type = ((p >> 28) & 7) | ((p >> 8) & 0x18), idx = p & 0x7FF;
+                if (type == 10 && idx < 16) info.mask |= 1u << idx;  // D3DSPR_SAMPLER
+                if (type == 17 && idx == 0) info.vpos = true;        // D3DSPR_MISCTYPE, D3DSMO_POSITION
+            }
+            i += 1 + len;
+        }
+    }
+    if (cache.size() < 4096) cache.push_back(info);  // keeps the ref GetPixelShader gave
+    else ps->Release();
+    *vpos = info.vpos;
+    return info.mask;
+}
+// Level-0 surface (face 0 of a cube) of the texture on sampler s, ref held, or null.
+static IDirect3DSurface9 *sampler_surface(IDirect3DDevice9 *d, DWORD s) {
+    IDirect3DBaseTexture9 *bt = nullptr;
+    IDirect3DSurface9 *out = nullptr;
+    if (FAILED(d->GetTexture(s, &bt)) || !bt) return nullptr;
+    if (bt->GetType() == D3DRTYPE_TEXTURE) static_cast<IDirect3DTexture9 *>(bt)->GetSurfaceLevel(0, &out);
+    else if (bt->GetType() == D3DRTYPE_CUBETEXTURE)
+        static_cast<IDirect3DCubeTexture9 *>(bt)->GetCubeMapSurface(D3DCUBEMAP_FACE_POSITIVE_X, 0, &out);
+    bt->Release();
+    return out;
+}
+// At each draw that is made while LB_STEREO_READS is set (after the skip decision).
+static void stereo_reads_draw(int k, uint32_t prims) {
+    if (k < 0 || !reads_logged_frame(platform_frame_count())) return;
+    const PassTarget &t = g_pass_target;
+    if (!t.rt || !g_pass_device || !dxvk_stereo_multiview_enabled(g_pass_device)) return;
+    const int rl = dxvk_stereo_surface_layers(t.rt) == 2 ? 2 : 1;  // a cube map (6 layers) is one view too
+    IDirect3DSurface9 *rt = reads_canon(static_cast<IDirect3DSurface9 *>(t.rt), nullptr);
+    bool vpos = false;
+    const uint32_t mask = ps_samplers(g_pass_device, &vpos);
+    bool from2 = false;
+    for (DWORD s = 0; s < 20; s++) {
+        if (s < 16 && !(mask >> s & 1)) continue;
+        IDirect3DSurface9 *surf = sampler_surface(g_pass_device, s < 16 ? s : D3DVERTEXTEXTURESAMPLER0 + (s - 16));
+        if (!surf) continue;
+        const int tl = dxvk_stereo_surface_layers(surf) == 2 ? 2 : 1;
+        from2 |= tl == 2;
+        D3DSURFACE_DESC d = {};
+        surf->GetDesc(&d);
+        if (rl == 1 && tl == 1 && (d.Usage & (D3DUSAGE_RENDERTARGET | D3DUSAGE_DEPTHSTENCIL))) {
+            Read1Rec *r = nullptr;
+            for (Read1Rec &x : g_reads1) if (x.s == surf && x.rt == rt && x.k == k) r = &x;
+            if (!r && g_reads1.size() < 128) {
+                g_reads1.push_back(Read1Rec{surf, rt, d.Width, d.Height, (uint32_t)d.Format, t.w, t.h, k, 0});
+                r = &g_reads1.back();
+                reads_hold(surf);
+                reads_hold(rt);
+            } else if (!r) {
+                g_reads_dropped[1]++;
+            }
+            if (r) r->n++;
+        }
+        if (rl == 2 && tl == 2 && prims > 2) {
+            Read2Rec *r = nullptr;
+            for (Read2Rec &x : g_reads2) if (x.s == surf) r = &x;
+            if (!r && g_reads2.size() < 64) {
+                g_reads2.push_back(Read2Rec());
+                r = &g_reads2.back();
+                r->s = surf; r->w = d.Width; r->h = d.Height; r->fmt = (uint32_t)d.Format;
+                reads_hold(surf);
+            } else if (!r) {
+                g_reads_dropped[2]++;
+            }
+            if (r) (vpos ? r->v : r->nv)[k]++;
+        }
+        if (rl == 2 && tl == 1 && (d.Usage & (D3DUSAGE_RENDERTARGET | D3DUSAGE_DEPTHSTENCIL))) {
+            if (ReadRec *r = reads_rec(surf)) { r->rd[k]++; r->stages |= 1u << s; r->vpos |= vpos; }
+        }
+        surf->Release();
+    }
+    if (rl == 1 && !t.bb) reads_write(rt, k, prims, from2);
+    rt->Release();
+    // A depth-stencil texture (a shadow map drawn with a dummy colour target) is written too; the device's own
+    // depth buffer and other standalone depth-stencil surfaces are not textures, so nothing samples them.
+    if (t.ds) {
+        IDirect3DSurface9 *ds = nullptr;
+        if (SUCCEEDED(g_pass_device->GetDepthStencilSurface(&ds)) && ds) {
+            bool in_texture = false;
+            IDirect3DSurface9 *dc = reads_canon(ds, &in_texture);
+            if (in_texture && dxvk_stereo_surface_layers(dc) != 2) reads_write(dc, k, prims, from2);
+            dc->Release();
+            ds->Release();
+        }
+    }
+}
+// At each StretchRect while LB_STEREO_READS is set: the copy writes its destination, from its source.
+static void stereo_reads_copy(IDirect3DSurface9 *src, IDirect3DSurface9 *dst) {
+    if (!src || !dst || !g_pass_device || !reads_logged_frame(platform_frame_count())) return;
+    if (!dxvk_stereo_multiview_enabled(g_pass_device)) return;
+    IDirect3DSurface9 *s = reads_canon(src, nullptr), *d = reads_canon(dst, nullptr);
+    const int sl = dxvk_stereo_surface_layers(s) == 2 ? 2 : 1, dl = dxvk_stereo_surface_layers(d) == 2 ? 2 : 1;
+    if (dl == 1) {
+        if (ReadRec *r = reads_rec(d)) { r->wr_copy++; r->wr_from2 |= sl == 2; }
+    } else {
+        Copy2Rec *r = nullptr;
+        for (Copy2Rec &x : g_copies2) if (x.dst == d && x.src == s) r = &x;
+        if (!r && g_copies2.size() < 32) {
+            D3DSURFACE_DESC dd = {}, sd = {};
+            d->GetDesc(&dd);
+            s->GetDesc(&sd);
+            g_copies2.push_back(Copy2Rec{d, s, dd.Width, dd.Height, (uint32_t)dd.Format, sd.Width, sd.Height, sl, 0});
+            r = &g_copies2.back();
+            reads_hold(d);
+            reads_hold(s);
+        } else if (!r) {
+            g_reads_dropped[3]++;
+        }
+        if (r) r->n++;
+    }
+    s->Release();
+    d->Release();
+}
+void d3d_passes_copy(IDirect3DSurface9 *src, IDirect3DSurface9 *dst) {
+    if (g_reads_from >= 0) stereo_reads_copy(src, dst);
+}
+// The writers' part of an mvread or mvwrite line.
+static void reads_cat_writers(char *line, size_t cap, int &n, const ReadRec &r) {
+    for (int c = 0; c < PASS_COUNT; c++)
+        if (r.wr[c]) reads_cat(line, cap, n, " %s=%d", k_pass_names[c], r.wr[c]);
+    if (r.wr_copy) reads_cat(line, cap, n, " copy=%d", r.wr_copy);
+    reads_cat(line, cap, n, " prims=%u ds=%d vp=%ux%u from2=%d", r.wr_prims, r.wr_ds ? 1 : 0, r.vp_w, r.vp_h,
+              r.wr_from2 ? 1 : 0);
+}
+// At Present while LB_STEREO_READS is set: the frame's lines (none outside the logged frames), then let go.
+static void stereo_reads_present(void) {
+    const int frame = platform_frame_count();
+    for (const Read2Rec &r : g_reads2) {
+        char line[512];
+        int n = 0;
+        reads_cat(line, sizeof line, n, "mvread2 %d %p %ux%u fmt=%u", frame, r.s, r.w, r.h, r.fmt);
+        for (int c = 0; c < PASS_COUNT; c++)
+            if (r.v[c] || r.nv[c]) reads_cat(line, sizeof line, n, " %s=%d/%d", k_pass_names[c], r.v[c], r.nv[c]);
+        LOG("%s", line);
+        reads_drop(r.s);
+    }
+    g_reads2.clear();
+    for (const Read1Rec &r : g_reads1) {
+        LOG("mvread1 %d %p %ux%u fmt=%u by %p %ux%u %s=%d", frame, r.s, r.w, r.h, r.fmt, r.rt, r.rw, r.rh,
+            k_pass_names[r.k], r.n);
+        reads_drop(r.s);
+        reads_drop(r.rt);
+    }
+    g_reads1.clear();
+    for (const Copy2Rec &r : g_copies2) {
+        LOG("mvcopy2 %d %p %ux%u fmt=%u from %p %ux%u layers=%d copies=%d", frame, r.dst, r.w, r.h, r.fmt, r.src, r.sw,
+            r.sh, r.sl, r.n);
+        reads_drop(r.dst);
+        reads_drop(r.src);
+    }
+    g_copies2.clear();
+    for (const ReadRec &r : g_reads) {
+        int nr = 0, nw = r.wr_copy;
+        for (int c = 0; c < PASS_COUNT; c++) { nr += r.rd[c]; nw += r.wr[c]; }
+        char line[768];
+        int n = 0;
+        if (!nr) {  // written but not read by a two-layer pass
+            reads_cat(line, sizeof line, n, "mvwrite %d %p %ux%u fmt=%u layers=%d", frame, r.s, r.w, r.h, r.fmt,
+                      dxvk_stereo_surface_layers(r.s));
+            reads_cat_writers(line, sizeof line, n, r);
+        } else {
+            reads_cat(line, sizeof line, n, "mvread %d %p %ux%u fmt=%u usage=%x layers=%d read:", frame, r.s, r.w, r.h,
+                      r.fmt, r.usage, dxvk_stereo_surface_layers(r.s));
+            for (int c = 0; c < PASS_COUNT; c++)
+                if (r.rd[c]) reads_cat(line, sizeof line, n, " %s=%d", k_pass_names[c], r.rd[c]);
+            reads_cat(line, sizeof line, n, " stages=%x vpos=%d |", r.stages, r.vpos ? 1 : 0);
+            if (nw) reads_cat_writers(line, sizeof line, n, r);
+            else reads_cat(line, sizeof line, n, " not written this frame");
+        }
+        LOG("%s", line);
+        reads_drop(r.s);
+    }
+    g_reads.clear();
+    if (g_reads_dropped[0] || g_reads_dropped[1] || g_reads_dropped[2] || g_reads_dropped[3])
+        LOG("mvdropped %d mvread/mvwrite=%d mvread1=%d mvread2=%d mvcopy2=%d", frame, g_reads_dropped[0],
+            g_reads_dropped[1], g_reads_dropped[2], g_reads_dropped[3]);
+    memset(g_reads_dropped, 0, sizeof g_reads_dropped);
+}
+// At a Reset: let go of the surfaces recorded so far this frame, unlogged (Reset wants none referenced).
+static void stereo_reads_reset(void) {
+    for (const Read2Rec &r : g_reads2) reads_drop(r.s);
+    for (const Read1Rec &r : g_reads1) { reads_drop(r.s); reads_drop(r.rt); }
+    for (const Copy2Rec &r : g_copies2) { reads_drop(r.dst); reads_drop(r.src); }
+    for (const ReadRec &r : g_reads) reads_drop(r.s);
+    g_reads2.clear();
+    g_reads1.clear();
+    g_copies2.clear();
+    g_reads.clear();
+    memset(g_reads_dropped, 0, sizeof g_reads_dropped);
+}
+
 // After Present: set the eye, and the clock, for the next frame.
 /* Eye views, stage 2 of plans/eye-views.md (LB_EYE_LATE=1): the game camera trails the head (head steering is a
  * closed loop on the camera the game last presented, about 10 degrees behind a 27 deg/s sweep on the Mac), and
@@ -3039,6 +3440,11 @@ static void stereo_mask_seen(void) {}
 static void stereo_mask_present(bool) {}
 static void stereo_post_draw(void) {}
 static void stereo_post_present(bool) {}
+static void stereo_reads_init(void) {}
+static void stereo_reads_draw(int, uint32_t) {}
+static void stereo_reads_present(void) {}
+static void stereo_reads_reset(void) {}
+void d3d_passes_copy(IDirect3DSurface9 *, IDirect3DSurface9 *) {}
 static bool stereo_skip_fp(void) { return false; }
 static void vr180_before_present(IDirect3DDevice9 *) {}
 static void vr180_after_present(void) {}
