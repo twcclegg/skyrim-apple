@@ -13,7 +13,7 @@ is already the limit.
 
 ## The goal, and the path I'd take to it
 
-Pass/fail for the project (Thomas, 2026-11-10): the game is comfortably playable on the M2 Vision Pro in 3D
+Pass/fail for the project (2026-11-10): the game is comfortably playable on the M2 Vision Pro in 3D
 immersive with head tracking. "Comfortable" in a headset mostly means three things: the world stays still when
 the head moves (the compositor redraws at the display's 90 Hz with the newest head pose, whatever the game's
 frame rate), both eyes get a new image every displayed frame, and the game itself stays near 60 fps.
@@ -24,7 +24,7 @@ Three ways to get the second eye, cheapest for the game first:
 |---|---|---|---|---|---|
 | **A. Depth reprojection** (section 0) | one mono frame | mono frame + a small warp pass | display rate | moderate, mostly in our own compositor code | stretching at depth edges; HUD and transparent effects need care |
 | B. Per-eye draws in DXVK (section 1) | one mono frame | about 2× scene | game rate | large, inside vendored DXVK | screen-space effects slightly off |
-| C. Alternate-eye camera hook (plan M3) | one frame per eye | one frame per eye | half the game rate | moderate, in guest hooks | eye-to-eye lag in motion; 40 fps becomes 20 per eye |
+| C. Alternate-eye camera hook (the old plan's M3) | one frame per eye | one frame per eye | half the game rate | moderate, in guest hooks | eye-to-eye lag in motion; 40 fps becomes 20 per eye |
 
 I'd build **A first**. It is the only one whose cost doesn't land on the game's main thread or double the GPU
 scene, it gives head *translation* as well as rotation for free, and its pieces are ones the plan already needs
@@ -34,7 +34,7 @@ bother; C stays as the fallback that needs no depth.
 ## 0. Depth reprojection: one mono frame, two eyes drawn in the compositor (*idea*, pieces *read*)
 
 The game renders one frame as now, with a field of view wider than the headset shows and the camera turned by
-the head's rotation (the plan's M3a hook). The frame's colour **and depth** go to the compositor through the
+the head's rotation (the old plan's M3a hook, since built as head steering). The frame's colour **and depth** go to the compositor through the
 present tap. Each compositor frame (90 Hz) draws that frame as a depth-displaced grid mesh, once per eye, from
 each eye's real view and projection for the newest head pose, and writes its depth so visionOS's own
 reprojection keeps working. Head rotation and translation between game frames, and the offset between the
@@ -53,7 +53,7 @@ eyes, all come out of the same draw.
 
 ## 1. Stereo without a second game pass: per-eye draws inside DXVK
 
-The plan's M3 renders alternate eyes through a camera hook, which halves each eye's frame rate. The alternative
+The old plan's M3 rendered alternate eyes through a camera hook, which halves each eye's frame rate. The alternative
 is what NVIDIA 3D Vision Automatic did for D3D9 games: the game renders one mono frame, and the graphics layer
 issues each scene draw once per eye with the vertex shader shifting clip-space x by
 `eye * separation * (w - convergence)`. The game thread's cost doesn't change; the replay runs on DXVK's
@@ -100,7 +100,7 @@ than frame rate. A short real sleep after a few consecutive yields is the usual 
 
 If the headset turns out GPU-bound in immersive mode: render below the panel's angular resolution and upscale
 in the compositor pass (MetalFX spatial needs no motion vectors), and use the compositor's foveation with a
-rasterization rate map, as the plan already notes for M2.
+rasterization rate map, as the old plan noted for its M2 cinema screen.
 
 ## 5. Compiler-level work still open (*idea*)
 
