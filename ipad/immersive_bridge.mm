@@ -44,7 +44,8 @@ int skyrim_frame_eyes(float tangents[8], float eye_pose[32]);
 int skyrim_frame_eye(float *k_out);  /* runtime/d3d9_bridge.cpp: -1 left, 0 none/centre, +1 right; k_out: clip shift */
 int skyrim_present_frame(void);  /* runtime/d3d9_bridge.cpp: LB_SHOT's frame number */
 }
-void tap_shot_shown(int frame, id<MTLTexture> eye0, id<MTLTexture> eye1);  /* ipad/tap_shot.mm: LB_TAP_SHOT */
+/* ipad/tap_shot.mm: LB_TAP_SHOT */
+void tap_shot_shown(int frame, uint32_t vk_format, id<MTLTexture> eye0, id<MTLTexture> eye1);
 
 namespace {
 
@@ -362,7 +363,7 @@ extern "C" int skyrim_immersive_acquire(skyrim_immersive_frame *out) {
     if (!texture.sampled) return 0;
     out->texture = (__bridge void *)texture.sampled;
     out->needs_srgb_decode = texture.decode ? 1 : 0;
-    if (out->is_new) tap_shot_shown(g_shown.game_frame, texture.sampled, texture.sampled_eye2);
+    if (out->is_new) tap_shot_shown(g_shown.game_frame, g_shown.format, texture.sampled, texture.sampled_eye2);
     out->width = g_shown.width;
     out->height = g_shown.height;
     const CachedDepth &depth = depth_texture(g_shown);

@@ -2495,7 +2495,7 @@ static void stereo_late_report(void) {
 }
 /* LB_STEREO_DEBUG_HUD=X (live multiview, checks only): the interface in view 1 (the right eye) only is moved X in
  * clip units, i.e. left by X/2 of the picture's width (DXVK subtracts it). The left eye is untouched, so a capture
- * shows which eye it really holds. Needs the world camera (in game, not the main menu) and no LB_HUD_LAYER. */
+ * shows which eye it really holds. Needs the world camera (in game, not the main menu). */
 static float stereo_debug_hud(void) {
     static const float x = [] { const char *e = getenv("LB_STEREO_DEBUG_HUD"); return e ? (float)atof(e) : 0.0f; }();
     return x;
