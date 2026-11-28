@@ -334,6 +334,17 @@ final class ImmersiveCompositor: @unchecked Sendable {
     private var hudDepth: (any MTLDepthStencilState)?
     /// LB_HUD_DISTANCE: metres ahead of the frame's camera at which the interface layer (LB_HUD_LAYER) is shown.
     private lazy var hudDistance: Float = getenv("LB_HUD_DISTANCE").flatMap { Float(String(cString: $0)) }.map { max(0.3, $0) } ?? 2.0
+    /// LB_HUD_SCALE and LB_HUD_OFFSET (degrees right,up; 0,0): the interface layer's size as a fraction of the game's
+    /// field of view (unset: 55.5 degrees across, 0.28 of a 124-degree frame) and where its centre goes, while a frame
+    /// is placed by its camera. The game lays the HUD out against the frame's edges; at 1 it is shown there
+    /// (HUDLayerPlacement). A setting that can't be read is said once and counts as unset.
+    private lazy var hudPlacement: HUDLayerPlacement = {
+        let parsed = HUDLayerPlacement.parse(scaleSetting: getenv("LB_HUD_SCALE").map { String(cString: $0) },
+                                             offsetSetting: getenv("LB_HUD_OFFSET").map { String(cString: $0) })
+        for setting in parsed.unread { log("hud layer: \(setting) can't be read, taken as unset") }
+        return parsed.placement
+    }()
+    private var hudLogged: [Float] = []
     private let session = ARKitSession()
     private let tracking = WorldTrackingProvider()
     private var screen: simd_float4x4?
@@ -883,6 +894,33 @@ final class ImmersiveCompositor: @unchecked Sendable {
             }
             // The point between the eyes, in the device's space: the eye separation is scaled about it.
             let eyesCentre = drawable.views.reduce(SIMD4<Float>(0, 0, 0, 0)) { $0 + $1.transform.columns.3 } / Float(max(drawable.views.count, 1))
+            // LB_HUD_LAYER: the interface layer, and with a camera its rect on a plane hudDistance ahead of it (centre
+            // and half size in metres), the same for every view of this drawable: the game's field of view scaled
+            // about its centre (LB_HUD_SCALE; the reticle is at the centre, so with no offset it stays on the aim
+            // point), an offset cut short where it would take the layer out of what both eyes see.
+            let hudTexture = game.hud_texture.flatMap { Unmanaged<AnyObject>.fromOpaque($0).takeUnretainedValue() as? any MTLTexture }
+            var hudRect: SIMD4<Float>? = nil
+            if let c = hudCamera, let hud = hudTexture {
+                let d = hudDistance
+                let field = HUDLayerPlacement.Tangents(left: c[12], right: c[13], top: c[14], bottom: c[15])
+                // visionOS gives each tangent as a positive extent from the view axis. Each eye sees the plane from
+                // where it is drawn from (the separation scaled about the point between the eyes).
+                let bothEyes = HUDLayerPlacement.Tangents.shared(drawable.views.map { view -> HUDLayerPlacement.Tangents in
+                    let t = view.tangents, eye = (view.transform.columns.3 - eyesCentre) * eyeSeparationScale
+                    return HUDLayerPlacement.Tangents(left: -abs(t[0]), right: abs(t[1]), top: abs(t[2]), bottom: -abs(t[3]))
+                        .seen(fromEyeRight: eye.x, up: eye.y, distance: d)
+                })
+                let placed = hudPlacement.rect(frame: field, bothEyes: bothEyes)
+                hudRect = SIMD4(d * placed.centreX, d * placed.centreY, d * placed.halfWidth, d * placed.halfHeight)
+                // Said once, and again when the field of view or the eyes' extents change.
+                let eyes = bothEyes ?? HUDLayerPlacement.Tangents(left: 0, right: 0, top: 0, bottom: 0)
+                let key: [Float] = [field.left, field.right, field.top, field.bottom,
+                                    eyes.left, eyes.right, eyes.top, eyes.bottom, Float(hud.width)]
+                if key.count != hudLogged.count || !zip(key, hudLogged).allSatisfy({ abs($0 - $1) < 1e-3 }) {
+                    hudLogged = key
+                    log("hud layer: " + hudPlacement.summary(frame: field, bothEyes: bothEyes, pixelWidth: hud.width, distance: d))
+                }
+            }
             let centreDepthTexture = depthTexture
             for (index, view) in drawable.views.enumerated() {
                 let pass = MTLRenderPassDescriptor()
@@ -991,18 +1029,16 @@ final class ImmersiveCompositor: @unchecked Sendable {
                         encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: vertexCount)
                     }
                 }
-                if let hudPointer = game.hud_texture, let hudPipeline, let hudDepth, let place = heldModel ?? model,
-                   let hud = Unmanaged<AnyObject>.fromOpaque(hudPointer).takeUnretainedValue() as? any MTLTexture {
-                    // LB_HUD_LAYER: the interface as a flat layer, never moved by the depth mesh. With a camera, a
-                    // plane hudDistance ahead of it spanning the game's field of view (so the reticle stays on the
-                    // aim point), placed as the frame is but without the movement shift; without one (menus), over
-                    // the screen the picture is shown on, just in front of it.
+                if let hud = hudTexture, let hudPipeline, let hudDepth, let place = heldModel ?? model {
+                    // LB_HUD_LAYER: the interface as a flat layer, never moved by the depth mesh. With a camera, at
+                    // hudRect on a plane hudDistance ahead of it, placed as the frame is but without the movement
+                    // shift. Without one (menus), over the screen the picture is shown on, just in front of it, at
+                    // its full size.
                     var rect: SIMD4<Float>
                     var z: Float
-                    if let c = hudCamera {
-                        let d = hudDistance
-                        rect = SIMD4(d * (c[13] + c[12]) / 2, d * (c[14] + c[15]) / 2, d * (c[13] - c[12]) / 2, d * (c[14] - c[15]) / 2)
-                        z = Self.viewPlane - d  // the plane's space has the eye at z = viewPlane, looking to -z
+                    if let hudRect {
+                        rect = hudRect
+                        z = Self.viewPlane - hudDistance  // the plane's space has the eye at z = viewPlane, looking to -z
                     } else {
                         let aspect = game.height > 0 ? Float(game.width) / Float(game.height) : 16.0 / 9.0
                         let half = halfSize ?? SIMD2(Self.width / 2, Self.width / 2 / aspect)
