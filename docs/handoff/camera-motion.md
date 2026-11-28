@@ -85,9 +85,12 @@ of real play says more: run any build with `LB_CAMLOG=1 LB_FRAMETIMES=1`, keep s
 - **Things that move on their own** (people, animals, arrows) still move at the game's rate.
 - **The player's body in third person** travels with the camera but is further than 1 m away, so it is shifted
   with the world and will shake while the world is smooth. Not handled.
-- **Depth edges.** A shifted frame shows nothing where it was hidden. The existing rule (a triangle across a
-  depth edge is laid flat at the far side) covers it the same way it does for head movement. At a run, one
-  45 fps frame is 12 cm of movement.
+- **Depth edges.** A shifted frame shows nothing where it was hidden. The per-pixel depth search (on by
+  default) covers it in the world the same way it does for head movement, and with `LB_IMMERSIVE_REFINE=0`
+  the older rule does (a triangle across a depth edge is laid flat at the far side). The search is not run on
+  the hands and weapon (within 1.5 times the near distance): they are placed by a different transform from
+  the one the search's eye is worked out in, so their outlines show the mesh alone, stretched across the
+  edge. At a run, one 45 fps frame is 12 cm of movement.
 - **Hands, if their depth is wrong.** The first-person pass writes depth after a clear, and the shader turns
   depth into distance with the scene's near plane (15 units). If that pass uses another near plane the hands
   come out at the wrong distance and the 1 m test misses them. Unknown; see the first Mac check.

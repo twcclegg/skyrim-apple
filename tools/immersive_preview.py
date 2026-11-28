@@ -3,9 +3,9 @@
 
 Builds the same grid as the vertex shader from a Mac capture (LB_SHOT writes shot-N.bmp and depth-N.f32), then
 renders it from each eye of a viewer sitting where the headset user does, so depth settings can be tuned without
-the headset. It follows the shader step for step: nearest depth dilated over half a grid cell at each vertex,
-triangles that span a depth edge laid flat at their farthest corner, and (--refine) the per-pixel depth search of
-the fragment shader.
+the headset. It follows the shader step for step: nearest depth dilated over half a grid cell at each vertex, and
+the per-pixel depth search of the fragment shader (--refine, default 4 steps as in the app) over the whole mesh, or
+with --refine 0, triangles that span a depth edge laid flat at their farthest corner.
 
 Usage: immersive_preview.py shot-N.bmp depth-N.f32 out_prefix [options]
 Writes out_prefix-sbs.png (left | right) and out_prefix-anaglyph.png (red left, cyan right).
@@ -38,7 +38,7 @@ ap.add_argument("--head", action="store_true", help="LB_IMMERSIVE_HEAD=1: the fr
 ap.add_argument("--head-scale", type=float, default=1.0, help="LB_IMMERSIVE_HEAD_SCALE")
 ap.add_argument("--tan", type=float, nargs=2, default=[0.849, 0.478], help="--head: the frame's frustum tangents, right and top")
 ap.add_argument("--grid", type=int, default=4, help="game pixels per grid cell (the renderer uses 4; other values show what a finer mesh would give)")
-ap.add_argument("--refine", type=int, default=0, help="LB_IMMERSIVE_REFINE: per-pixel depth search steps in the fragment shader")
+ap.add_argument("--refine", type=int, default=4, help="LB_IMMERSIVE_REFINE: per-pixel depth search steps in the fragment shader (0 = off)")
 ap.add_argument("--ipd-scale", type=float, default=1.0, help="LB_IMMERSIVE_IPD_SCALE: eye separation multiplier for drawing")
 ap.add_argument("--metrics", action="store_true", help="disparity error against per-pixel depth; also writes out_prefix-error.png")
 args = ap.parse_args()
@@ -184,19 +184,29 @@ def refine(eye, uv):
 
     def step(uv):
         r = radial_faded(uv)
-        t = -ad + np.sqrt(np.maximum(ad * ad - aa + r * r, 0))
+        reach = ad * ad - aa + r * r
+        t = -ad + np.sqrt(np.maximum(reach, 0))
         from_origin = eye + d * t[..., None] - ORIGIN
         on = from_origin * (eye_back / np.maximum(-from_origin[..., 2], 1e-6))[..., None]
-        return np.clip(np.stack([(on[..., 0] / half[0] + 1) / 2, (1 - on[..., 1] / half[1]) / 2], -1), 0, 1).astype(F), r, t
+        new = np.stack([(on[..., 0] / half[0] + 1) / 2, (1 - on[..., 1] / half[1]) / 2], -1)
+        # No point on the ray at that distance, one behind the origin, or one outside the picture: the shader keeps
+        # the pixel's last uv and stops there, without the final test.
+        lost = (reach < 0) | (from_origin[..., 2] >= 0) | (new < 0).any(-1) | (new > 1).any(-1)
+        return np.clip(new, 0, 1).astype(F), r, t, lost
 
-    r_before = t_before = uv_before = None
+    active = np.ones(uv.shape[:-1], bool)
+    uv_before, r_before, t_before = uv, np.zeros(uv.shape[:-1], F), np.zeros(uv.shape[:-1], F)
     for _ in range(args.refine):
-        uv_before = uv
-        uv, r_before, t_before = step(uv)
+        new, r, t, lost = step(uv)
+        move = active & ~lost
+        uv_before = np.where(move[..., None], uv, uv_before)
+        r_before, t_before = np.where(move, r, r_before), np.where(move, t, t_before)
+        uv = np.where(move[..., None], new, uv)
+        active = move
     # A ray that keeps jumping between a near and a far surface sees neither's own pixel: it looks past the near
     # surface's edge at something the game's camera did not see. Show the far one there.
-    _, r_after, t_after = step(uv)
-    back = r_before > r_after * (1 + args.tear)
+    _, r_after, t_after, _ = step(uv)
+    back = active & (r_before > r_after * (1 + args.tear))
     return np.where(back[..., None], uv_before, uv), np.where(back, t_before, t_after)
 
 
