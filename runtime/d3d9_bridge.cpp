@@ -559,7 +559,8 @@ static void bisect_present(void) {
 //   fpdbg <frame> runs=<n> mask=<draws> prepass=<draws> colour=<draws> other=<draws> depth=<draws>
 //         draws=#<first>-#<last> near=<first-person near plane> [UNEXPECTED]
 // Off, it costs one branch per draw call, target change and Clear. g_d3d_passes turns the hooks on: also without
-// LB_PASSES when the first-person flag is wanted (LB_FP=1, LB_FP_SKIP, or LB_STEREO_EYE_UNITS set), then with no logs.
+// LB_PASSES when the first-person flag is wanted (LB_FP=1, LB_FP_SKIP, LB_STEREO_EYE_UNITS set, LB_SKIP_CLASS or
+// LB_DEPTH_COPY), then with no pass lines, and with LB_PASS_STATS (its own lines only).
 int g_d3d_passes;
 static int g_passes_log;  // LB_PASSES: 0 no lines, 1 pass lines, 2 also passdbg and fpdbg lines
 enum PassClass {
@@ -712,25 +713,29 @@ static void passdbg_flush(void) {
 
 // LB_PASS_STATS=shadow,fx (class names; any of k_pass_names) says what the draws of those classes are, to count the
 // work that grows with the scene (shadow casters, effects). Diagnostic only: every draw of those classes reads back
-// state from the device. Two kinds of lines:
+// state from the device. It turns the pass hooks on, with the same side effects as LB_PASSES=1 (first-person
+// detection, which stereo builds use for the first-person draws). Two kinds of lines:
 //   passvp <frame> <class> groups=<n> runs=<n> [<w>x<h>/<fmt> vp=<x>,<y>,<w>,<h> <draws>/<prims>]...
 //     once per frame and class: each render target 0 and viewport the class drew into (in order of first use), and
-//     runs, the number of times the draws moved from one of them to another
-//   passkind <first>-<last> <class> vs=<hash> ps=<hash> decl=<usages> stride=<n> at=<0|1> blend=<0|src.dst>
+//     runs, the number of runs of consecutive draws into one of them (1 when the class never moved)
+//   passkind <first>-<last> <class> vs=<hash> ps=<hash> decl=<usages> stride=<n|up<n>> at=<0|1> blend=<0|src.dst>
 //            tex0=<0|1> draws=<n> prims=<n> frames=<n>
 //     the draws of frames <first> to <last> grouped by what they draw with, written at each frame of
 //     LB_PASS_STATS_AT=F[,F...] (frames as in the "pass" line), or every 300 frames without it, then reset.
-//     vs/ps hash the shader bytecode (stable across runs); decl lists the vertex declaration's usages in order
-//     (P position, W blend weights, I blend indices, N normal, S point size, T texcoord, G tangent, B binormal,
-//     C colour; | starts another stream), so skinned meshes (W, I) are told from static ones; at is alpha test,
-//     blend the blend factors when blending is on.
+//     vs/ps hash the shader bytecode (stable across runs for the game's own shaders; for fp, ps is the bridge's
+//     rewrite of LB_FP_DEPTH_SCALE, whose bytecode holds the near planes); decl lists the vertex declaration's
+//     usages in order (P position, R pre-transformed position (POSITIONT), W blend weights, I blend indices,
+//     N normal, S point size, T texcoord, G tangent, B binormal, C colour, F fog, E tessellation factor, D depth,
+//     X sample; | where the stream changes), so skinned meshes (W, I) are told from static ones; stride is stream
+//     0's, up<n> for the draws that pass their vertices directly (DrawPrimitiveUP, DrawIndexedPrimitiveUP); at is
+//     alpha test, blend the blend factors when blending is on.
 static uint32_t g_pass_stats_mask;
 static std::vector<int> g_pass_stats_at;
 static int g_pass_stats_from = -1;
 struct PassVp { void *rt; uint32_t w, h, fmt; D3DVIEWPORT9 vp; int draws; uint32_t prims; };
 struct PassStatFrame { std::vector<PassVp> vps; int runs = 0, last = -1; };
 static PassStatFrame g_pass_stat_frame[PASS_COUNT];
-struct PassKind { int draws = 0; uint32_t prims = 0; int frames = 0, last_frame = -1; };
+struct PassKind { int draws = 0; uint64_t prims = 0; int frames = 0, last_frame = -1; };
 static std::map<std::string, PassKind> g_pass_kinds[PASS_COUNT];
 
 static uint32_t pass_stats_hash(const void *p, size_t n) {
@@ -738,37 +743,57 @@ static uint32_t pass_stats_hash(const void *p, size_t n) {
     for (size_t i = 0; i < n; i++) h = (h ^ ((const uint8_t *)p)[i]) * 16777619u;
     return h;
 }
+// Shader hashes and declaration strings, cached by object. Each cached object is held (AddRef), so its address is
+// not reused by a new shader or declaration while it keys the cache (the bridge releases and re-makes its own
+// first-person shaders, and the game may do the same). Emptied at each new device and past 4096 objects. While it
+// holds one, the game's last Release of that object returns 1, not 0, as with the first-person depth cache.
+static std::unordered_map<IUnknown *, uint32_t> g_pass_stats_shaders;
+static std::unordered_map<IUnknown *, std::string> g_pass_stats_decls;
+static void pass_stats_forget(void) {
+    for (auto &e : g_pass_stats_shaders) e.first->Release();
+    for (auto &e : g_pass_stats_decls) e.first->Release();
+    g_pass_stats_shaders.clear();
+    g_pass_stats_decls.clear();
+}
+static void pass_stats_room(void) {
+    if (g_pass_stats_shaders.size() + g_pass_stats_decls.size() >= 4096) pass_stats_forget();
+}
 template <class S> static uint32_t pass_stats_shader(S *s) {
-    static std::unordered_map<void *, uint32_t> cache;
     if (!s) return 0;
-    auto it = cache.find(s);
-    if (it != cache.end()) return it->second;
+    auto it = g_pass_stats_shaders.find(s);
+    if (it != g_pass_stats_shaders.end()) return it->second;
     UINT n = 0;
     uint32_t h = 1;
     if (SUCCEEDED(s->GetFunction(nullptr, &n)) && n) {
         std::vector<uint8_t> code(n);
         if (SUCCEEDED(s->GetFunction(code.data(), &n))) h = pass_stats_hash(code.data(), n);
     }
-    return cache[s] = h;
+    pass_stats_room();
+    s->AddRef();
+    return g_pass_stats_shaders[s] = h;
 }
 static const char *pass_stats_decl(IDirect3DVertexDeclaration9 *d) {
-    static std::unordered_map<void *, std::string> cache;
     if (!d) return "-";
-    auto it = cache.find(d);
-    if (it != cache.end()) return it->second.c_str();
+    auto it = g_pass_stats_decls.find(d);
+    if (it != g_pass_stats_decls.end()) return it->second.c_str();
     D3DVERTEXELEMENT9 e[MAXD3DDECLLENGTH + 1];
     UINT n = MAXD3DDECLLENGTH + 1;
     std::string s;
-    if (SUCCEEDED(d->GetDeclaration(e, &n)))
+    if (SUCCEEDED(d->GetDeclaration(e, &n))) {
+        int stream = 0;
         for (UINT i = 0; i < n && e[i].Stream != 0xFF; i++) {
-            static const char k[] = "PWINSTGBTTCTDX";  // by D3DDECLUSAGE (TESSFACTOR, POSITIONT, FOG: T; DEPTH D; SAMPLE X)
-            if (e[i].Stream && (s.empty() || s.back() != '|')) s += '|';
+            static const char k[] = "PWINSTGBERCFDX";  // by D3DDECLUSAGE
+            if (e[i].Stream != stream) s += '|';
+            stream = e[i].Stream;
             s += e[i].Usage < sizeof k - 1 ? k[e[i].Usage] : '?';
         }
-    return (cache[d] = s.empty() ? "?" : s).c_str();
+    }
+    pass_stats_room();
+    d->AddRef();
+    return (g_pass_stats_decls[d] = s.empty() ? "?" : s).c_str();
 }
 
-static void pass_stats_draw(int k, uint32_t prims) {
+static void pass_stats_draw(int k, uint32_t prims, int up_stride) {
     IDirect3DDevice9 *d = g_pass_device;
     if (!d) return;
     const PassTarget &t = g_pass_target;
@@ -810,10 +835,16 @@ static void pass_stats_draw(int k, uint32_t prims) {
         d->GetRenderState(D3DRS_SRCBLEND, &src);
         d->GetRenderState(D3DRS_DESTBLEND, &dst);
     }
-    char blend[24] = "0", key[192];
+    char blend[24] = "0", strides[16], key[200];
     if (ab) snprintf(blend, sizeof blend, "%u.%u", (unsigned)src, (unsigned)dst);
-    snprintf(key, sizeof key, "vs=%08x ps=%08x decl=%s stride=%u at=%d blend=%s tex0=%d", pass_stats_shader(vs),
-             pass_stats_shader(ps), pass_stats_decl(decl), vb ? stride : 0, at ? 1 : 0, blend, tex ? 1 : 0);
+    // a draw that passes its vertices directly doesn't use stream 0: its stride is its own argument
+    if (up_stride >= 0) snprintf(strides, sizeof strides, "up%d", up_stride);
+    else snprintf(strides, sizeof strides, "%u", vb ? stride : 0);
+    // in this order: a cache emptied by a later lookup would leave the declaration string dangling
+    const uint32_t vs_hash = pass_stats_shader(vs), ps_hash = pass_stats_shader(ps);
+    const char *decl_str = pass_stats_decl(decl);
+    snprintf(key, sizeof key, "vs=%08x ps=%08x decl=%s stride=%s at=%d blend=%s tex0=%d", vs_hash, ps_hash, decl_str,
+             strides, at ? 1 : 0, blend, tex ? 1 : 0);
     if (vs) vs->Release();
     if (ps) ps->Release();
     if (decl) decl->Release();
@@ -847,10 +878,12 @@ static void pass_stats_present(int frame) {
     for (int k = 0; k < PASS_COUNT; k++) {
         if (!(g_pass_stats_mask & (1u << k))) continue;
         std::vector<std::pair<std::string, PassKind>> rows(g_pass_kinds[k].begin(), g_pass_kinds[k].end());
-        std::sort(rows.begin(), rows.end(), [](const auto &a, const auto &b) { return a.second.prims > b.second.prims; });
+        // stable: rows with equal primitives keep the map's order, so dumps compare line for line
+        std::stable_sort(rows.begin(), rows.end(),
+                         [](const auto &a, const auto &b) { return a.second.prims > b.second.prims; });
         for (const auto &r : rows)
-            LOG("passkind %d-%d %s %s draws=%d prims=%u frames=%d", g_pass_stats_from, frame, k_pass_names[k],
-                r.first.c_str(), r.second.draws, r.second.prims, r.second.frames);
+            LOG("passkind %d-%d %s %s draws=%d prims=%llu frames=%d", g_pass_stats_from, frame, k_pass_names[k],
+                r.first.c_str(), r.second.draws, (unsigned long long)r.second.prims, r.second.frames);
         g_pass_kinds[k].clear();
     }
     g_pass_stats_from = frame + 1;
@@ -994,7 +1027,7 @@ static void gpu_init(IDirect3DDevice9 *d) {
         (unsigned long long)freq);
 }
 
-void d3d_passes_draw(uint32_t prims) {
+void d3d_passes_draw(uint32_t prims, int up_stride) {
     {
         const PassTarget &t = g_pass_target;
         if (!t.bb && (uint64_t)t.w * t.h > (uint64_t)g_pass_biggest_now.w * g_pass_biggest_now.h) g_pass_biggest_now = t;
@@ -1010,7 +1043,7 @@ void d3d_passes_draw(uint32_t prims) {
     if (k == PASS_MAIN && g_depth_copy == 1 && !g_main_ds && g_pass_device) g_pass_device->GetDepthStencilSurface(&g_main_ds);
     if (k == PASS_MAIN) stereo_late_eyes();
     if (g_passes_gpu) gpu_draw(k);
-    if (g_pass_stats_mask & (1u << k)) pass_stats_draw(k, prims);
+    if (g_pass_stats_mask & (1u << k)) pass_stats_draw(k, prims, up_stride);
     PassFrame &f = g_pass_frame;
     f.cls[k].draws++;
     f.cls[k].prims += prims;
@@ -1147,6 +1180,7 @@ static void passes_init(IDirect3DDevice9 *d) {
         else if (fp_wanted) LOG("first-person pass detection on (LB_FP, LB_FP_SKIP or LB_STEREO_EYE_UNITS)");
         if (g_d3d_passes) gpu_init(d);
     }
+    if (g_pass_stats_mask) pass_stats_forget();  // a new device: let go of the old one's shaders and declarations
     if (!g_d3d_passes) return;
     d3d_passes_target(d);
     g_pass_frame.rt_changes = 0;
