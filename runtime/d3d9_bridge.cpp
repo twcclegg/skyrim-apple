@@ -379,6 +379,7 @@ void B_IDirect3D9_GetAdapterDisplayMode(CPU *c) {
 static void fp_init(IDirect3DDevice9 *d);  // first-person depth, below
 static void passes_init(IDirect3DDevice9 *d);  // LB_PASSES, below
 static void d3d_passes_reset(IDirect3DDevice9 *d);
+static bool g_sc_on;  // LB_SCISSOR_BOUND's scissor is set on the device (below)
 
 void B_IDirect3D9_CreateDevice(CPU *c) {
     auto *d3d = (IDirect3D9 *)com_host(ARG(0));
@@ -848,6 +849,70 @@ static void gpu_init(IDirect3DDevice9 *d) {
         (unsigned long long)freq);
 }
 
+/* LB_SCISSOR_BOUND=f (0 < f < 1), a timing experiment; the picture is wrong by design. A visible-area depth mask
+ * (near depth over the part of each eye's render the lens never shows) can only cull draws that test depth or
+ * stencil against the scene's back-buffer-sized depth-stencil, and culls their fragments at the depth test. A
+ * scissor rectangle drops the same fragments before they are rasterised, so cutting a share of the target with a
+ * scissor saves at least what a mask of that share could: if a scissor keeping the centred f of the target (each
+ * side scaled by sqrt(f)) saves too little, the mask is not worth building. Applied to draws with the depth test
+ * (ZENABLE, ZFUNC not ALWAYS) or the stencil test on, a depth-stencil bound, and a back-buffer-sized render target,
+ * except the post and UI classes; intersected with the game's own scissor when it has one on. The game's scissor
+ * state is put back for its other draws, before each Clear (a Clear honours the scissor rectangle) and at Present.
+ * If the game changes the scissor while ours is set, its new state is what gets put back. The game reading the
+ * scissor state back while ours is set would see ours (not seen in Skyrim's lifted code; not checked). */
+static float g_scissor_keep;
+static int g_sc_cut_draws;                 // draws scissored this frame (LB_PASSES logs it)
+static DWORD g_sc_game_on;                 // the game's D3DRS_SCISSORTESTENABLE while ours is set
+static RECT g_sc_game_rect, g_sc_rect;     // the game's rectangle while ours is set; ours
+
+static void scissor_bound_restore(void) {
+    if (!g_sc_on || !g_pass_device) return;
+    g_sc_on = false;
+    g_pass_device->SetScissorRect(&g_sc_game_rect);
+    g_pass_device->SetRenderState(D3DRS_SCISSORTESTENABLE, g_sc_game_on);
+}
+
+static void scissor_bound_draw(int k) {
+    IDirect3DDevice9 *d = g_pass_device;
+    if (!d || !g_bb_w || !g_bb_h) return;
+    const PassTarget &t = g_pass_target;
+    bool want = false;
+    if (t.rt && t.ds && t.w == g_bb_w && t.h == g_bb_h && k != PASS_POST && k != PASS_UI) {
+        DWORD z = 0, zf = 0, st = 0;
+        d->GetRenderState(D3DRS_ZENABLE, &z);
+        d->GetRenderState(D3DRS_ZFUNC, &zf);
+        d->GetRenderState(D3DRS_STENCILENABLE, &st);
+        want = (z && zf != D3DCMP_ALWAYS) || st;
+    }
+    if (g_sc_on) {  // the game may have set the scissor since ours: then the device holds its state, not ours
+        DWORD on = 0;
+        RECT r = {};
+        d->GetRenderState(D3DRS_SCISSORTESTENABLE, &on);
+        d->GetScissorRect(&r);
+        if (!on || memcmp(&r, &g_sc_rect, sizeof r)) g_sc_on = false;
+    }
+    if (!want) { scissor_bound_restore(); return; }
+    g_sc_cut_draws++;
+    if (g_sc_on) return;
+    d->GetRenderState(D3DRS_SCISSORTESTENABLE, &g_sc_game_on);
+    d->GetScissorRect(&g_sc_game_rect);
+    const float s = sqrtf(g_scissor_keep);
+    const LONG w = (LONG)(g_bb_w * s + 0.5f), h = (LONG)(g_bb_h * s + 0.5f);
+    RECT r = {(LONG)(g_bb_w - w) / 2, (LONG)(g_bb_h - h) / 2, 0, 0};
+    r.right = r.left + w;
+    r.bottom = r.top + h;
+    if (g_sc_game_on) {
+        r.left = std::max(r.left, g_sc_game_rect.left);
+        r.top = std::max(r.top, g_sc_game_rect.top);
+        r.right = std::max(r.left, std::min(r.right, g_sc_game_rect.right));
+        r.bottom = std::max(r.top, std::min(r.bottom, g_sc_game_rect.bottom));
+    }
+    g_sc_rect = r;
+    d->SetScissorRect(&r);
+    d->SetRenderState(D3DRS_SCISSORTESTENABLE, TRUE);
+    g_sc_on = true;
+}
+
 void d3d_passes_draw(uint32_t prims) {
     {
         const PassTarget &t = g_pass_target;
@@ -863,6 +928,7 @@ void d3d_passes_draw(uint32_t prims) {
     }
     if (k == PASS_MAIN && g_depth_copy == 1 && !g_main_ds && g_pass_device) g_pass_device->GetDepthStencilSurface(&g_main_ds);
     if (k == PASS_MAIN) stereo_late_eyes();
+    if (g_scissor_keep > 0) scissor_bound_draw(k);
     if (g_passes_gpu) gpu_draw(k);
     PassFrame &f = g_pass_frame;
     f.cls[k].draws++;
@@ -913,12 +979,14 @@ void d3d_passes_target(IDirect3DDevice9 *d) {
 // is in progress whatever the frame did before it.
 static void d3d_passes_reset(IDirect3DDevice9 *d) {
     g_pass_frame.fp_late = g_pass_frame.fp_proj = false;
+    g_sc_on = false;  // Reset puts the scissor state back to its defaults
     d3d_passes_target(d);
 }
 
 // A Clear of depth without colour into a back-buffer-sized target, once the main pass has drawn: the late
 // first-person pass may start (d3d_first_person). Its projection confirms it (d3d_passes_projection).
 void d3d_passes_clear(uint32_t flags) {
+    scissor_bound_restore();  // a Clear honours the scissor rectangle: clear what the game meant to
     if (!(flags & D3DCLEAR_ZBUFFER) || (flags & D3DCLEAR_TARGET)) return;
     const PassTarget &t = g_pass_target;
     PassFrame &f = g_pass_frame;
@@ -980,8 +1048,17 @@ static void passes_init(IDirect3DDevice9 *d) {
                 if (strstr(sc, k_pass_names[c])) g_skip_class_mask |= 1u << c;
             LOG("LB_SKIP_CLASS=%s: skipping pass classes mask %x", sc, g_skip_class_mask);
         }
+        if (const char *sb = getenv("LB_SCISSOR_BOUND")) {  // timing experiment: the picture is wrong by design
+            const float keep = (float)atof(sb);
+            g_scissor_keep = keep > 0 && keep < 1 ? keep : 0;
+            if (g_scissor_keep > 0)
+                LOG("LB_SCISSOR_BOUND=%.3f: depth- or stencil-tested draws into back-buffer-sized targets are scissored "
+                    "to the centred %.1f%% of the target (an upper bound for a visible-area depth mask)",
+                    g_scissor_keep, 100.0 * g_scissor_keep);
+            else LOG("LB_SCISSOR_BOUND=%s: not a fraction between 0 and 1; off", sb);
+        }
         const bool fp_wanted = (fp && atoi(fp)) || getenv("LB_FP_SKIP") || (eye && atof(eye) != 0) || g_fp_flame
-                            || g_skip_class_mask || g_depth_copy == 1;
+                            || g_skip_class_mask || g_depth_copy == 1 || g_scissor_keep > 0;
         g_d3d_passes = g_passes_log || fp_wanted;
         // without an LB_D3DTRACE range, LB_PASSES=2 looks at the first frame
         g_passdbg = g_passes_log == 2 && !getenv("LB_D3DTRACE");
@@ -1012,6 +1089,11 @@ static bool depth_copy_draw(void) {
 }
 
 static void passes_present(void) {
+    scissor_bound_restore();
+    if (g_scissor_keep > 0 && g_passes_log) {
+        LOG("scissor %d cut=%d", g_frame, g_sc_cut_draws);
+    }
+    g_sc_cut_draws = 0;
     g_pass_biggest = g_pass_biggest_now;
     g_pass_biggest_now = PassTarget();
     for (int c = 0; c < PASS_COUNT && c < 16; c++) g_pass_draws_last[c] = (int)g_pass_frame.cls[c].draws;
