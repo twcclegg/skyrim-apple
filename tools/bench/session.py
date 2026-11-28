@@ -8,7 +8,8 @@
                                              the plan's runs of that name (e.g. warmup, timed, uncapped)
     session.py PLAN push ARM                 put one arm's launch-env.json on the device and stop (for play by hand)
     session.py PLAN ask                      the plan's questions, answered at the prompt, saved with the session
-    session.py PLAN restore                  put the device's own launch-env.json back (taken before the first push)
+    session.py PLAN restore                  put the device's own launch-env.json back (check and run do this
+                                             themselves when they end, however they end)
     session.py PLAN status                   the runs so far
     session.py PLAN report                   report.py over the manifest -> SESSION/summary.md
 
@@ -17,21 +18,26 @@ PLAN is a JSON file (sessions/*.json, or a path). It names env fragments, arms b
 Documents/SkyrimNative/launch-env.json over the environment bench.py launches it with, so each arm's keys go into
 that file, not onto bench's command line; bench's own keys (frame times, the exit frame, the scenario's input) are
 unaffected. For each run the driver pushes the arm's file, runs bench.py with the scenario and a label
-`<plan>-<tag>-<arm>-r<run>`, and appends a record (results directory, worst thermal state, clean exit) to the
-session's manifest.jsonl.
+`<plan>-<tag>-<arm>-r<run>`, and appends a record (results directory, worst thermal state, clean exit, build and
+tag) to the session's manifest.jsonl. Before its first push the driver keeps the device's own launch-env.json in the
+session folder (or notes that it had none; any other devicectl error stops it), and `check` and `run` put it back when
+they end, whether they finish, stop, time out or are interrupted; `push` leaves the arm on until `restore`.
 
 After each run the driver reads the log to check that the arm reached the game (check_run): on a device every key
 echoed by `native: launch-env.json: K=V`, and wherever the arm sets them, the compositor's foveation and depth-search
 steps, the frame cap, the depth copy, live stereo, and with --build the installed build's commit. A run that fails a
 check is recorded with its problems and left out of report.py's per-arm means, as is a run that reaches thermal
 state *serious*. After a serious run the driver waits --cooldown seconds (default 300) before the next; serious twice
-in a row, or critical, stops the session with the run to resume from. On a device it waits for the headset to be
+in a row, or critical, stops the session. Any stop or interruption in the middle of a sequence prints the command
+that resumes it. On a device it waits for the headset to be
 unlocked before each run, since a locked headset suspends the app. The plan's "minutes" (per scenario) give the time
 estimate: `list` prints it, and each run prints the time spent and the time left.
 
 Nothing about a particular person's setup lives here: the device is --device or SKYRIM_BENCH_DEVICE, the app's bundle
-ID SKYRIM_BUNDLE_ID (as for bench.py), and the session folder --dir (default bench-results/sessions/<plan>, which git
-ignores). --tag names what is under test (default: --build, the installed build's commit).
+ID SKYRIM_BUNDLE_ID (as for bench.py), and the session folder --dir (default bench-results/sessions/<plan>-<tag>,
+which git ignores). --tag names what is under test (default: --build, the installed build's commit), so each build
+gets its own folder; pass the same --build or --tag to every step. A session folder takes one build: `check` and
+`run` refuse to add runs of another --build to its manifest.
 
 --mac BUILD_DIR runs the same plan on the macOS build (a dry run of the driver and the scenarios): the arm's keys
 are passed as --env, and the manifest is mac-manifest.jsonl, kept apart from the session's own.
@@ -40,6 +46,7 @@ import argparse
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import tempfile
@@ -57,8 +64,13 @@ LOCK = Path(os.environ["SKYRIM_BENCH_LOCK"]) if os.environ.get("SKYRIM_BENCH_LOC
 FATAL = re.compile(r"\[mvk-error\]|mvk-error|fatal|device lost|abort|Assertion|terminating", re.I)
 SOURCE_COMMIT = re.compile(r'"source_commit":"([0-9a-f]{7,40})"')
 FOVEATION = re.compile(r"immersive: layer \d+, foveation (on|off)")
+# devicectl's error when the file to copy isn't there (any other error is not taken to mean "no file")
+MISSING = re.compile(r"no such file|doesn.t exist|does not exist|NSCocoaErrorDomain error 260\b|"
+                     r"NSPOSIXErrorDomain error 2\b", re.I)
+RESULTS_IN = re.compile(r"^bench: results in (.+?)\s*$", re.M)
 COOLDOWN_S = 300
 LOCK_POLL_S = 10
+STATE = {"resume": None}  # the command that resumes the sequence under way, for stop() to print
 
 
 def say(text):
@@ -66,7 +78,8 @@ def say(text):
 
 
 def stop(text):
-    print(f"\nSTOP: {text}", flush=True)
+    resume = STATE["resume"]
+    print(f"\nSTOP: {text}" + (f" Resume with `{resume}`." if resume else ""), flush=True)
     sys.exit(1)
 
 
@@ -189,14 +202,47 @@ class Session:
         self.mac = args.mac
         self.game = args.game or os.environ.get("SKYRIM_BENCH_GAME")
         self.device = None if self.mac else (args.device or os.environ.get("SKYRIM_BENCH_DEVICE"))
-        self.dir = Path(args.dir) if args.dir else bench.RESULTS / "sessions" / plan["name"]
-        self.dir.mkdir(parents=True, exist_ok=True)
-        self.manifest = self.dir / ("mac-manifest.jsonl" if self.mac else "manifest.jsonl")
-        self.backup = self.dir / "launch-env.original.json"
         self.build = args.build
         self.tag = re.sub(r"[^\w.-]+", "-", args.tag or args.build or "run")
+        # one folder per plan and tag (a build by default), so a second build never lands in the first's manifest
+        self.dir = Path(args.dir) if args.dir else bench.RESULTS / "sessions" / f"{plan['name']}-{self.tag}"
+        self.manifest = self.dir / ("mac-manifest.jsonl" if self.mac else "manifest.jsonl")
+        self.backup = self.dir / "launch-env.original.json"
+        self.none = self.dir / "launch-env.original.none"
         self.holding_lock = args.holding_lock
         self.cooldown = args.cooldown
+        self.pushed = False      # this process put an arm's launch-env.json on the device
+        self.backed_up = False   # ...after keeping the device's own
+        flags = [f"--{k} {v}" for k, v in (("build", args.build), ("tag", args.tag), ("dir", args.dir),
+                                           ("mac", args.mac)) if v]
+        self.command = f"session.py {getattr(args, 'plan', None) or plan['name']}" + "".join(" " + f for f in flags)
+
+    def need_folder(self):
+        """For the steps that read a session (status, report, restore): stop when the folder isn't there."""
+        if self.dir.is_dir():
+            return
+        others = sorted(p.name for p in self.dir.parent.glob(f"{self.plan['name']}-*") if p.is_dir())
+        stop(f"no session folder {self.dir}" + (f"; there are {', '.join(others)} (pass the --build or --tag they "
+                                                 "were made with, or --dir)" if others else ""))
+
+    def check_build(self):
+        """A session folder holds one build: refuse to add runs of another to its manifest."""
+        if not self.manifest.exists():
+            return
+        builds = {r.get("build") for r in map(json.loads, filter(str.strip, self.manifest.read_text().splitlines()))
+                  if "build" in r}
+        other = sorted(str(b) for b in builds if b != self.build)
+        if other:
+            stop(f"{self.manifest} holds runs of build {', '.join(other)}, not {self.build}: pass another --tag or "
+                 "--dir so the report doesn't average different builds together")
+
+    def device_call(self, what, fn, *args):
+        """A devicectl call that stops the session, rather than raising, when the device doesn't answer."""
+        try:
+            return fn(*args)
+        except subprocess.TimeoutExpired as expired:
+            stop(f"devicectl didn't answer within {expired.timeout:.0f} s while {what}: check that the headset is "
+                 "connected, awake and unlocked")
 
     def need_device(self):
         if not self.device:
@@ -220,21 +266,51 @@ class Session:
 
     def write_presets(self):
         folder = self.dir / "presets"
-        folder.mkdir(exist_ok=True)
+        folder.mkdir(parents=True, exist_ok=True)
         for arm in self.plan["arms"]:
             (folder / f"{arm}.json").write_text(json.dumps(arm_env(self.plan, arm), indent=2, sort_keys=True) + "\n")
         print(f"wrote {len(self.plan['arms'])} presets to {folder}")
 
+    def is_arm_file(self, text):
+        """Whether a launch-env.json is one of this plan's arms (left on the device by an interrupted session)."""
+        try:
+            env = json.loads(text)
+        except ValueError:
+            return False
+        return isinstance(env, dict) and any({k: str(v) for k, v in env.items()} == arm_env(self.plan, a)
+                                             for a in self.plan.get("arms", {}))
+
     def backup_launch_env(self, device):
-        """Once per session: keep the device's own launch-env.json, or note that it had none."""
-        none = self.dir / "launch-env.original.none"
-        if self.backup.exists() or none.exists():
+        """Before this process's first push: keep the device's own launch-env.json, or note that it had none. If the
+        device holds one of the plan's arms, an earlier session didn't put the device's own back, so the backup
+        taken then is kept. Any devicectl error other than "no such file" stops the session."""
+        if self.backed_up:
             return
-        if device.pull(LAUNCH_ENV, self.backup):
-            print(f"saved the device's launch-env.json to {self.backup}")
-        else:
-            none.write_text("the device had no launch-env.json\n")
-            print("the device had no launch-env.json; `restore` will leave an empty one ({})")
+        self.dir.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory() as tmp:
+            local = Path(tmp) / "launch-env.json"
+            done = self.device_call("reading the device's launch-env.json", device.copy_from, LAUNCH_ENV, local)
+            if done.returncode == 0 and local.exists():
+                text = local.read_text(errors="replace")
+                if not self.is_arm_file(text):
+                    self.backup.write_text(text)
+                    self.none.unlink(missing_ok=True)
+                    print(f"saved the device's launch-env.json to {self.backup}")
+                elif self.backup.exists() or self.none.exists():
+                    print("the device holds one of this plan's arms (an earlier session didn't finish); keeping the "
+                          "backup of its own file taken before that")
+                else:
+                    self.none.write_text("the device held one of the plan's arms and no backup was found\n")
+                    print("WARNING: the device holds one of this plan's arms and this folder has no backup of its own "
+                          "file (it may be in another session folder); `restore` will leave an empty one ({})")
+            elif MISSING.search(done.stderr + done.stdout):
+                self.none.write_text("the device had no launch-env.json\n")
+                self.backup.unlink(missing_ok=True)
+                print("the device had no launch-env.json; `restore` will leave an empty one ({})")
+            else:
+                stop(f"couldn't read the device's launch-env.json, so it can't be kept for `restore`: "
+                     f"{(done.stderr or done.stdout).strip()[-400:]}")
+        self.backed_up = True
 
     def push(self, arm):
         if self.mac:
@@ -244,7 +320,8 @@ class Session:
         with tempfile.TemporaryDirectory() as tmp:
             local = Path(tmp) / "launch-env.json"
             local.write_text(json.dumps(arm_env(self.plan, arm), indent=2, sort_keys=True) + "\n")
-            done = device.push(local, LAUNCH_ENV)
+            self.pushed = True  # from here on the device may hold the arm's file, whatever devicectl says
+            done = self.device_call(f"placing {LAUNCH_ENV}", device.push, local, LAUNCH_ENV)
         if done.returncode:
             stop(f"couldn't place {LAUNCH_ENV} on the device: {done.stderr.strip()[-400:]}")
         print(f"launch-env.json on the device: {arm}")
@@ -252,15 +329,24 @@ class Session:
     def restore(self):
         if self.mac:
             return
+        if not self.backup.exists() and not self.none.exists():
+            stop(f"nothing to restore: {self.dir} holds no backup of the device's launch-env.json")
         device = self.need_device()
         with tempfile.TemporaryDirectory() as tmp:
             src = self.backup
             if not src.exists():
                 src = Path(tmp) / "launch-env.json"
                 src.write_text("{}\n")
-            done = device.push(src, LAUNCH_ENV)
-        if done.returncode:
-            stop(f"couldn't restore {LAUNCH_ENV}: {done.stderr.strip()[-400:]}")
+            try:
+                done = device.push(src, LAUNCH_ENV)
+                why = done.stderr.strip()[-400:] if done.returncode else None
+            except subprocess.TimeoutExpired as expired:
+                why = f"devicectl didn't answer within {expired.timeout:.0f} s"
+        if why is not None:
+            STATE["resume"] = None
+            stop(f"couldn't restore {LAUNCH_ENV} ({why}); the device keeps the last arm's settings until "
+                 f"`{self.command} restore` succeeds")
+        self.pushed = False
         print("launch-env.json restored" + ("" if self.backup.exists() else " (empty: the device had none)"))
 
     def bench_run(self, scenario, arm, run, sequence_name):
@@ -269,7 +355,8 @@ class Session:
         self.wait_unlocked()
         self.push(arm)
         cmd = [sys.executable, str(HERE / "bench.py"), "run", scenario, "--label", self.label(arm, run)]
-        env = dict(os.environ)
+        # bench.py's own BENCH_* options (immersive, re-entry, ...) come from the plan, never from the shell
+        env = {k: v for k, v in os.environ.items() if not k.startswith("BENCH_")}
         if self.mac:
             cmd += ["--mac", self.mac] + (["--game", self.game] if self.game else [])
             for k, v in arm_env(self.plan, arm).items():
@@ -280,10 +367,13 @@ class Session:
                 env["BENCH_IMMERSIVE"] = "1"  # Play Immersive: stereo, the compositor and head tracking need it
         say(f"{scenario}  {arm}  run {run}")
         t0 = time.time()
-        done = subprocess.run(cmd, capture_output=True, text=True, env=env)
-        out = done.stdout + done.stderr
-        print(out[-1500:])
-        m = re.search(r"bench: results in (\S+)", out)
+        lines = []
+        with subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env) as proc:
+            for line in proc.stdout:  # shown as it comes: a run takes minutes
+                print(line, end="", flush=True)
+                lines.append(line)
+        out = "".join(lines)
+        m = RESULTS_IN.search(out)
         run_dir = Path(m[1]) if m else None
         meta = {}
         if run_dir and (run_dir / "summary.json").exists():
@@ -295,9 +385,11 @@ class Session:
         rec = {"utc": datetime.now(timezone.utc).isoformat(timespec="seconds"), "sequence": sequence_name,
                "scenario": scenario, "arm": arm, "run": run, "label": self.label(arm, run),
                "target": "mac" if self.mac else "device", "dir": str(run_dir) if run_dir else None,
-               "bench_exit": done.returncode, "seconds": round(time.time() - t0),
+               "build": self.build, "tag": self.tag, "bench_exit": proc.returncode,
+               "seconds": round(time.time() - t0),
                "thermal": meta.get("thermal", {}).get("worst", "unknown"),
                "complete": bool(meta.get("exited_cleanly")), "problems": problems}
+        self.dir.mkdir(parents=True, exist_ok=True)
         with open(self.manifest, "a") as f:
             f.write(json.dumps(rec) + "\n")
         print(f"thermal: {rec['thermal']}   complete: {rec['complete']}   {rec['seconds']} s   "
@@ -319,7 +411,7 @@ class Session:
                 continue
             base = m[1][:-len(f"shot-{frame}.bmp")]
             for name in (f"shot-{frame}-layer1.bmp", f"depth-{frame}.f32", f"depth-{frame}-layer1.f32"):
-                ok = device.pull(base + name, run_dir / name)
+                ok = self.device_call(f"pulling {name}", device.pull, base + name, run_dir / name)
                 print(f"  {frame} {name}: {'ok' if ok else 'missing'}")
 
 
@@ -329,6 +421,7 @@ def cmd_check(s):
     check = s.plan.get("check")
     if not check:
         stop("the plan has no check")
+    s.check_build()
     rec, run_dir, _ = s.bench_run(check["scenario"], check["arm"], 1, "check")
     if not run_dir:
         stop("the launch check produced no results (the app may have aborted at launch). Keep the bench output above "
@@ -354,8 +447,9 @@ def cmd_check(s):
 
 def cmd_run(s, name, start=1, only=None, layers=False):
     """Runs a sequence. Thermal state: after a serious run, wait s.cooldown seconds; serious twice in a row, or
-    critical, stops the session with the run to resume from."""
+    critical, stops the session. Any stop prints the command that resumes the sequence."""
     plan = sequence(s.plan, name)
+    s.check_build()
     chosen = [(i, x) for i, x in enumerate(plan, 1) if i >= start and (not only or i == only)]
     total, unknown = estimate(s.plan, [x for _, x in chosen])
     say(f"{name}: {len(chosen)} runs, about {total:.0f} min"
@@ -363,32 +457,33 @@ def cmd_run(s, name, start=1, only=None, layers=False):
     t0, serious = time.time(), 0
     for k, (i, (scenario, arm, run)) in enumerate(chosen):
         print(f"\n[{i}/{len(plan)}]")
+        STATE["resume"] = None if only else f"{s.command} run {name} --from {i}"
         rec, run_dir, _ = s.bench_run(scenario, arm, run, name)
         if layers:
             s.pull_layers(run_dir)
         if not rec["complete"]:
             print(f"WARNING: run {i} didn't complete; carry on, then repeat it with --only {i} if there is time.")
         elif rec["problems"]:
-            print(f"WARNING: run {i} failed its checks and is left out of the means; repeat it with --only {i} once "
-                  "the cause is fixed.")
+            print(f"WARNING: run {i} failed its checks and is left out of the means; repeat it with --only {i} "
+                  "once the cause is fixed.")
         if k + 1 == len(chosen):
             break
-        resume = chosen[k + 1][0]
+        STATE["resume"] = f"{s.command} run {name} --from {chosen[k + 1][0]}"
         if rec["thermal"] == "critical":
-            stop(f"thermal critical. Let the headset cool, then resume with `run {name} --from {resume}`.")
+            stop("thermal critical. Let the headset cool.")
         if rec["thermal"] == "serious":
             serious += 1
             if serious >= 2:
-                stop(f"thermal serious twice in a row. Let the headset cool, then resume with `run {name} --from "
-                     f"{resume}`.")
-            print(f"Cooling down for {s.cooldown // 60} min {s.cooldown % 60} s: take the headset off and leave it on "
-                  "AC, then put it back on (or up on your forehead).", flush=True)
+                stop("thermal serious twice in a row. Let the headset cool.")
+            print(f"Cooling down for {s.cooldown // 60} min {s.cooldown % 60} s: take the headset off and leave it "
+                  "on AC, then put it back on (or up on your forehead).", flush=True)
             time.sleep(s.cooldown)
-        else:
+        elif rec["thermal"] != "unknown":  # a run with no results says nothing about the headset's temperature
             serious = 0
         left, unknown = estimate(s.plan, [x for _, x in chosen[k + 1:]])
         print(f"    {(time.time() - t0) / 60:.0f} min so far; about {left:.0f} min left"
               + (f" (+{unknown} runs without an estimate)" if unknown else ""), flush=True)
+    STATE["resume"] = None  # the sequence is done (a stop or interruption leaves it for the message)
 
 
 def cmd_list(s):
@@ -413,6 +508,7 @@ def cmd_ask(s):
     qs = s.plan.get("questions", [])
     if not qs:
         stop("the plan has no questions")
+    s.dir.mkdir(parents=True, exist_ok=True)
     lines = [f"{datetime.now():%Y-%m-%d %H:%M}, {s.plan['name']}, {s.tag}"]
     for q in qs:
         lines.append(f"{q} -> {input(q + ' ').strip()}")
@@ -423,6 +519,7 @@ def cmd_ask(s):
 
 
 def cmd_status(s):
+    s.need_folder()
     if not s.manifest.exists():
         print("no runs yet")
         return
@@ -435,6 +532,7 @@ def cmd_status(s):
 
 def cmd_report(s):
     import report
+    s.need_folder()
     out = s.dir / ("summary.md" if not s.mac else "mac-summary.md")
     report.main(["--manifest", str(s.manifest), "--out", str(out)])
     answers = s.dir / "answers.txt"
@@ -453,7 +551,7 @@ def main(argv=None):
     ap.add_argument("--device", help="Vision Pro UDID (default: SKYRIM_BENCH_DEVICE)")
     ap.add_argument("--mac", metavar="BUILD_DIR", help="a dry run on a macOS build instead of the headset")
     ap.add_argument("--game", help="with --mac: the game folder (default: SKYRIM_BENCH_GAME)")
-    ap.add_argument("--dir", help="the session folder (default: bench-results/sessions/<plan>)")
+    ap.add_argument("--dir", help="the session folder (default: bench-results/sessions/<plan>-<tag>)")
     ap.add_argument("--build", help="the installed build's commit: each run's log must show it (and the default tag)")
     ap.add_argument("--tag", help="what is under test, for the run labels (default: --build)")
     ap.add_argument("--from", dest="start", type=int, default=1, help="run: start at run N")
@@ -465,10 +563,40 @@ def main(argv=None):
     s = Session(load_plan(a.plan), a)
     if a.step in ("run", "push") and not a.what:
         ap.error(f"{a.step} needs a {'sequence' if a.step == 'run' else 'arm'}")
-    {"list": lambda: cmd_list(s), "presets": s.write_presets, "check": lambda: cmd_check(s),
-     "run": lambda: cmd_run(s, a.what, a.start, a.only, a.pull_layers),
-     "push": lambda: s.push(a.what), "ask": lambda: cmd_ask(s), "restore": s.restore,
-     "status": lambda: cmd_status(s), "report": lambda: cmd_report(s)}[a.step]()
+    step = {"list": lambda: cmd_list(s), "presets": s.write_presets, "check": lambda: cmd_check(s),
+            "run": lambda: cmd_run(s, a.what, a.start, a.only, a.pull_layers),
+            "push": lambda: push_by_hand(s, a.what), "ask": lambda: cmd_ask(s), "restore": restore_by_hand(s),
+            "status": lambda: cmd_status(s), "report": lambda: cmd_report(s)}[a.step]
+    signal.signal(signal.SIGTERM, _exit_on_signal)
+    signal.signal(signal.SIGHUP, _exit_on_signal)
+    try:
+        step()
+    except subprocess.TimeoutExpired as expired:  # a devicectl call not already guarded
+        stop(f"devicectl didn't answer within {expired.timeout:.0f} s: check that the headset is connected and awake")
+    except KeyboardInterrupt:
+        resume = STATE["resume"]
+        print("\ninterrupted" + (f"; resume with `{resume}`" if resume else ""), flush=True)
+        raise SystemExit(130)
+    finally:
+        if a.step in ("check", "run") and s.pushed:  # never leave an arm's settings on the device for ordinary play
+            s.restore()
+
+
+def _exit_on_signal(signum, _frame):
+    raise KeyboardInterrupt  # so check and run restore the device's launch-env.json on the way out
+
+
+def push_by_hand(s, arm):
+    s.push(arm)
+    if not s.mac:
+        print(f"the arm stays on the device until `{s.command} restore`")
+
+
+def restore_by_hand(s):
+    def step():
+        s.need_folder()
+        s.restore()
+    return step
 
 
 if __name__ == "__main__":

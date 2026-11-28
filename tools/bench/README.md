@@ -85,13 +85,24 @@ older logs parse as before.
   A compile counts towards the frame whose `ft` line follows it.
 - `hitches`: frames the hitch sampler caught (`LB_HITCH_MS`), with its threshold and the longest. Screenshot frames
   are left out, as for frame times.
+- `frame_budget`: the phase against the frame cap in `meta.frame_cap_fps`: `budget_ms` (1000 / cap), `late` (frames
+  longer than the budget plus a quarter refresh: 25 ms at 45 fps on 90 Hz, so every frame held for a third refresh
+  counts, which `over_33ms` misses), and `fits`: work p95 and the game GPU latency mean within the budget (`over`
+  names whichever isn't). Uncapped runs have no budget. `overall` fits when every phase does.
 
 The windowed lines carry no frame number, so each is placed at the last `ft` frame before it and covers the frames
-of its window; it counts towards a phase when at least half of it lies inside. `overall` covers loading and menus
-too (a menu can run at the cap with almost no GPU work), so its windowed blocks keep the windows that count towards
-any of the scenario's phases (`basis: "phases"`); without phases, those in which the game delivered at least 90% of
-its frame cap (`basis: "steady"`), when there are any. A log without `ft` lines (a play session) puts everything in
-`overall`.
+of its window. A window contributes to a phase in proportion to the share of its frames inside it; ranges and
+maxima come from the windows at least half inside. `overall` covers loading and menus too (a menu can run at the cap
+with almost no GPU work), so its windowed blocks keep the windows that count towards any of the scenario's phases
+(`basis: "phases"`); without phases, those in which the game delivered at least 90% of its frame cap (`basis:
+"steady"`), when there are any. A log without `ft` lines (a play session) puts everything in `overall`, as do
+windows read from the console.
+
+Screenshot frames are left out of frame times and hitches, and the windows that contain one are left out of the
+windowed blocks, since a screenshot's stall shows up as a held-4+ frame, a high game GPU latency and a low busy
+share. Where that would leave a phase without a window at least half inside, the windows are kept, the cadence loses
+one held-4+ frame per screenshot, and the block says so (`screenshots: {"windows": k, "dropped": false}`; the report
+marks those figures `s`).
 
 `meta` gets the run's `thermal` state (`worst`, `last`, `seen`), `frame_cap_fps` (from the runtime's `present
 pacing` line, not the environment: on a device `launch-env.json` overrides it), `state_cache_entries`,
@@ -114,16 +125,21 @@ two rounds each in the boss fight and the Whiterun market, after two warm-up run
     python3 tools/bench/session.py budget run warmup --build <commit> # untimed: fills DXVK's pipeline cache
     python3 tools/bench/session.py budget run timed --build <commit>  # --from N / --only N to resume or repeat
     python3 tools/bench/session.py budget run uncapped --build <commit>
-    python3 tools/bench/session.py budget restore                  # the device's own launch-env.json back
-    python3 tools/bench/session.py budget report                   # bench-results/sessions/budget/summary.md
+    python3 tools/bench/session.py budget report --build <commit>    # bench-results/sessions/budget-<commit>/summary.md
 
 On a device the app applies `Documents/SkyrimNative/launch-env.json` over the environment bench launches it with, so
-the driver puts each arm's keys in that file (saving the device's own first) rather than on bench's command line.
+the driver puts each arm's keys in that file rather than on bench's command line. Before its first push it saves the
+device's own file in the session folder (or notes that there was none; any other devicectl error stops it), and
+`check` and `run` put it back when they end, however they end: finished, stopped, timed out or interrupted. `restore`
+does the same by hand, after `push` or if putting it back failed.
 The plan's `"immersive": true` starts the game through Play Immersive (`BENCH_IMMERSIVE=1`), which stereo and the
 compositor need. Runs are labelled `<plan>-<tag>-<arm>-r<run>`; run 0 is a warm-up. `push ARM` puts one arm on the
 device for play by hand; `--pull-layers` also pulls both eyes' shots and depth files. `--mac BUILD_DIR` runs the
 same plan on the macOS build as a dry run (its own manifest; there is no compositor there). The session folder
-(`--dir`, default `bench-results/sessions/<plan>`) holds the manifest, the saved `launch-env.json` and the answers.
+(`--dir`, default `bench-results/sessions/<plan>-<tag>`, the tag being `--tag` or else `--build`) holds the manifest,
+the saved `launch-env.json` and the answers; pass the same `--build` or `--tag` to every step. One folder takes one
+build: `check` and `run` refuse to add runs of another `--build`. The driver runs bench with the plan's own
+`BENCH_IMMERSIVE` and never passes on `BENCH_*` options from the shell.
 
 After each run the driver checks in the log that the arm reached the game, and records any problem in the manifest:
 on a device, every key echoed as `native: launch-env.json: K=V` (none ignored); wherever the arm sets them, the
@@ -131,15 +147,16 @@ compositor's foveation (`immersive: layer N, foveation on|off`) and depth-search
 pacing: …`), the depth copy and live stereo (and no stereo lines in a mono arm); with `--build`, the commit in the
 runtime's identity line; and no fatal-looking lines. The launch check stops on any problem; later runs carry on and
 say which run to repeat. Thermal state: after a run at *serious* the driver waits `--cooldown` seconds (default
-300) while the headset rests on AC; *serious* twice in a row, or *critical*, stops the session and prints the
-`--from` to resume with. Before each device run it waits until the headset is unlocked (a locked headset suspends
+300) while the headset rests on AC; *serious* twice in a row, or *critical*, stops the session. Any stop or Ctrl-C in
+the middle of a sequence prints the command that resumes it. Before each device run it waits until the headset is unlocked (a locked headset suspends
 the app). The plan's `"minutes"` per scenario give the estimate that `list` prints and each run updates (time spent,
 time left).
 
 `report.py` re-parses runs (a manifest, result directories, or a hand-pulled game log) and writes one Markdown
-report: per run and phase, work mean and p95, frame p95 and frames over 33 ms, held counts, game GPU latency,
-compositor GPU, GPU busy (capped or not), at-draw compiles, hitches and thermal state; then a mean per scenario and
-arm over complete runs below *serious* that passed their checks, without warm-ups. `--json` writes every re-parsed
+report: per run and phase, work mean and p95, frame p95, late frames and whether the phase fits its budget, held
+counts, game GPU latency, compositor GPU, GPU busy (capped or not), at-draw compiles, hitches and thermal state; then
+a mean per scenario, tag and arm over complete runs below *serious* that passed their checks, without warm-ups, with
+how many fit. `--json` writes every re-parsed
 summary.
 
 `test_bench.py` checks all of this on a synthetic log.

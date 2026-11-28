@@ -191,10 +191,13 @@ class Device:
                              "--domain-identifier", BUNDLE, "--subdirectory", folder).stdout
         return re.findall(r"^(\S+\.log)\s", out, re.M)
 
-    def pull(self, source, destination):
-        done = self.devicectl("device", "copy", "from", "--device", self.udid, "--domain-type", "appDataContainer",
+    def copy_from(self, source, destination):
+        """Copies a file out of the app's container; returns devicectl's result (its stderr says why it failed)."""
+        return self.devicectl("device", "copy", "from", "--device", self.udid, "--domain-type", "appDataContainer",
                               "--domain-identifier", BUNDLE, "--source", source, "--destination", str(destination))
-        return done.returncode == 0 and Path(destination).exists()
+
+    def pull(self, source, destination):
+        return self.copy_from(source, destination).returncode == 0 and Path(destination).exists()
 
 
 class Simulator:
@@ -595,6 +598,12 @@ def budget_line(b):
         cells.append(f"at draw {p['at_draw']} / {p['at_draw_ms']:.0f} ms (longest {p['at_draw_max_ms']:.0f})")
     if b.get("hitches"):
         cells.append(f"hitches {b['hitches']['frames']}")
+    fb = b.get("frame_budget")
+    if fb and fb.get("budget_ms"):
+        cells.append(f"late {fb['late']} (> {fb['late_ms']:.1f} ms)")
+        if fb["fits"] is not None:
+            cells.append(f"fits {fb['budget_ms']:.1f} ms" if fb["fits"] else f"over {fb['budget_ms']:.1f} ms: "
+                         + ", ".join(fb["over"]))
     return "   ".join(cells)
 
 
