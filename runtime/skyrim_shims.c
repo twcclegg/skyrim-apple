@@ -465,8 +465,25 @@ static void ini_set(IniFile *f, const char *sec, const char *key, const char *va
     memmove(&f->e[last + 2], &f->e[last + 1], sizeof(IniEnt) * (size_t)(f->n - 1 - (last + 1)));
     f->e[last + 1] = added;
 }
+static const char g_prefs_path[] = "C:\\Users\\Player\\Documents\\My Games\\Skyrim\\SkyrimPrefs.ini";
+
+/* An integer from SkyrimPrefs.ini as the game would read it (an LB_INI override first), for runtime code that
+ * follows a game setting (head steering reads [Controls] bInvertYValues). def when the file or key is missing.
+ * Re-parses the file only when it changed. Any thread. */
+int skyrim_pref_int(const char *sec, const char *key, int def) {
+    pthread_mutex_lock(&g_ini_lock);
+    const char *v = ini_override(sec, key);
+    if (!v) {
+        IniFile *f = ini_get(g_prefs_path);
+        v = f ? ini_find(f, sec, key) : NULL;
+    }
+    int r = v && *v ? (int)strtol(v, NULL, 10) : def;
+    pthread_mutex_unlock(&g_ini_lock);
+    return r;
+}
+
 void skyrim_seed_prefs(int w, int h) {
-    const char *prefs = "C:\\Users\\Player\\Documents\\My Games\\Skyrim\\SkyrimPrefs.ini";
+    const char *prefs = g_prefs_path;
     char host[1024];
     /* An existing file is kept (the player's settings), unless LB_PRESET asks for a preset. An explicit LB_WINDOW
      * still sets the render size in it: the game renders at iSize W x iSize H whatever the window is, so without

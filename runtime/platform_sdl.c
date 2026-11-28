@@ -165,6 +165,77 @@ static void head_note_event(const SDL_Event *e) {
         g_head_external = 15;
 }
 static float head_wrap(float a) { return a - 6.2831853f * floorf((a + 3.1415927f) / 6.2831853f); }
+/* Vertical inversion (the game's Invert Y option). The sign comes from the game's own setting, [Controls]
+ * bInvertYValues in SkyrimPrefs.ini, read whenever steering anchors, so a change made in the game's menu applies
+ * once the menu closes. Kept separately for the mouse path [0] and the pad path [1]: that the game applies the
+ * option to the stick as well is assumed, and the check below corrects either path if the sign is wrong. */
+static float g_ysign[2] = {1, 1};
+static int g_ylocked[2], g_yini = -2;  /* g_yini: the setting last read; -1 none found, -2 not read yet */
+/* The check, for a missing or stale setting: 20-frame windows of steering, comparing the pitch change with the
+ * vertical error the motion sent was meant to close. */
+static int g_win_n, g_win_mode, g_win_sent, g_win_agree, g_win_against;
+static float g_win_p0, g_win_err0, g_win_push;
+static double g_head_prev_t;  /* when the last mouse-steered frame ran, for its frame_scale */
+static float g_head_prev_err;  /* the divergence guard's last error and count of frames it grew */
+static int g_head_diverging;
+/* Steering paused (head off, menu, re-anchoring, real mouse or stick, divergence): drop the window and both streaks,
+ * so no evidence spans motion that steering didn't send, and restart the frame timing and the divergence count. */
+static void head_pause(void) {
+    g_win_n = g_win_agree = g_win_against = 0;
+    g_head_prev_t = 0;
+    g_head_diverging = 0;
+}
+static void head_read_invert(void) {
+    int skyrim_pref_int(const char *sec, const char *key, int def);  /* runtime/skyrim_shims.c */
+    int v = skyrim_pref_int("Controls", "bInvertYValues", -1);
+    if (v == g_yini) return;
+    g_yini = v;
+    g_ysign[0] = g_ysign[1] = v > 0 ? -1.0f : 1.0f;
+    g_ylocked[0] = g_ylocked[1] = 0;
+    g_win_n = g_win_agree = g_win_against = 0;
+    LOG("head: Invert Y %s", v < 0 ? "not in the game's settings; assuming off and checking while steering"
+                            : v ? "on in the game's settings" : "off in the game's settings");
+}
+/* One steered frame of the check. push: the pitch error this frame's vertical motion was sent to close, 0 if none was
+ * sent. Two windows in a row in which the pitch moved against the push, or sat still while a large error persisted
+ * (held at the game's pitch limit, where a wrong sign drives it), flip the sign. Three in a row in which it moved with
+ * the push confirm the sign. A confirmed sign ignores motion against the push (the game lagging a moving head looks
+ * like that) and flips only after four windows in a row held at the limit: the player turned Invert Y on or off in
+ * the game's menu and the game hasn't saved its settings yet. */
+static void head_check_invert(int mode, float game_pitch, float err_pitch, float push) {
+    if (mode != g_win_mode) { g_win_mode = mode; g_win_n = g_win_agree = g_win_against = 0; }
+    if (g_win_n == 0) { g_win_p0 = game_pitch; g_win_err0 = err_pitch; g_win_push = 0; g_win_sent = 0; }
+    g_win_push += push;
+    g_win_sent += push != 0;
+    if (++g_win_n < 20) return;
+    g_win_n = 0;
+    const bool confirmed = g_ylocked[mode];
+    float tilted = game_pitch - g_win_p0;
+    bool moved = fabsf(tilted) > 0.02f;
+    bool with = moved && (tilted > 0) == (g_win_push > 0);
+    bool pinned = !moved && g_win_sent >= 15 && fabsf(g_win_err0) > 0.35f && fabsf(err_pitch) > 0.35f
+                  && (g_win_err0 > 0) == (err_pitch > 0);
+    if (fabsf(g_win_push) < 0.08f) {  /* too little sent to tell */
+        g_win_against = 0;
+    } else if (with) {
+        g_win_against = 0;
+        if (!confirmed && ++g_win_agree >= 3) {
+            g_ylocked[mode] = 1;
+            LOG("head: vertical %s steering confirmed %s", mode ? "stick" : "mouse", g_ysign[mode] > 0 ? "normal" : "inverted");
+        }
+    } else if (pinned || (moved && !confirmed)) {
+        g_win_agree = 0;
+        if (++g_win_against >= (confirmed ? 4 : 2)) {
+            g_ysign[mode] = -g_ysign[mode];
+            g_ylocked[mode] = 0;
+            g_win_against = 0;
+            LOG("head: vertical %s steering %s; now %s", mode ? "stick" : "mouse",
+                pinned ? "held the pitch at its limit" : "moved the pitch the wrong way", g_ysign[mode] > 0 ? "normal" : "inverted");
+        }
+    } else {
+        g_win_against = 0;
+    }
+}
 static void head_steer(void) {
     static int init, test, logged;
     static float counts, gain, stick_gain, stick_dead, test_yaw, test_pitch, offset, carry_x, carry_y;
@@ -185,18 +256,25 @@ static void head_steer(void) {
     if (test == 1) { head_yaw = test_yaw * 0.017453293f; head_pitch = test_pitch * 0.017453293f; }
     else if (test == 2) {  /* LB_HEAD_TEST_SPEED: the sweep this many times faster (1: 27 deg/s at most) */
         static float speed = -1;
+        static double t0;
         if (speed < 0) speed = getenv("LB_HEAD_TEST_SPEED") ? fmaxf(0.1f, (float)atof(getenv("LB_HEAD_TEST_SPEED"))) : 1.0f;
-        float t = frame / 60.0f * speed; head_yaw = 0.6f * sinf(t * 0.8f); head_pitch = 0.25f * sinf(t * 0.5f);
+        /* on the clock, not the frame count, so the head moves the same at any frame rate (LB_MAX_FPS) */
+        double now = (double)SDL_GetPerformanceCounter() / (double)SDL_GetPerformanceFrequency();
+        if (t0 == 0) t0 = now;
+        float t = (float)(now - t0) * speed; head_yaw = 0.6f * sinf(t * 0.8f); head_pitch = 0.25f * sinf(t * 0.5f);
     }
     else if (atomic_load(&g_head_on)) { head_yaw = atomic_load(&g_head_yaw); head_pitch = atomic_load(&g_head_pitch); }
-    else { if (anchored) { void input_head_stick(float, float); input_head_stick(0, 0); } anchored = 0; atomic_store(&g_head_anchored, 0); return; }
+    else {
+        if (anchored) { void input_head_stick(float, float); input_head_stick(0, 0); }
+        anchored = 0; atomic_store(&g_head_anchored, 0); head_pause(); return;
+    }
     if (test) {  /* for skyrim_head_now */
         atomic_store(&g_head_test_yaw, head_yaw);
         atomic_store(&g_head_test_pitch, head_pitch);
         atomic_store(&g_head_test_on, 1);
     }
     float cam[18];
-    if (!g_window) return;
+    if (!g_window) { head_pause(); return; }
     void input_head_stick(float x, float y);
     /* Menus, loading screens and any frame without the world camera: let go of the stick (a held deflection would
      * scroll the menu) and re-anchor once the world is back. A menu frame carries no camera either. */
@@ -204,32 +282,51 @@ static void head_steer(void) {
         anchored = 0;
         atomic_store(&g_head_anchored, 0);
         input_head_stick(0, 0);
+        head_pause();
         return;
     }
     /* Columns of the camera rotation: forward (cam[0], cam[3], cam[6]); Skyrim heading is clockwise from +Y. */
     float game_yaw = atan2f(cam[0], cam[3]);
     float game_pitch = asinf(fmaxf(-1.0f, fminf(1.0f, cam[6])));
     if (!anchored || g_head_external > 0) {
+        if (!anchored) head_read_invert();  /* first anchor, and after every menu (where the setting can change) */
         offset = head_wrap(game_yaw - head_yaw);
         atomic_store(&g_head_offset, offset);
         atomic_store(&g_head_anchored, 1);
         anchored = 1;
         carry_x = carry_y = 0;
         if (g_head_external > 0) g_head_external--;
+        head_pause();
         return;
     }
     float err_yaw = head_wrap(head_yaw + offset - game_yaw);
     float err_pitch = fmaxf(-1.1f, fminf(1.1f, head_pitch)) - game_pitch;
-    if (fabsf(game_pitch) > 1.2f) err_yaw = 0;  /* looking nearly straight up or down: the heading is meaningless */
-    void input_head_stick(float x, float y);
+    /* Looking nearly straight up or down, a heading means little: the head's yaw swings with small movements past
+     * about 65 degrees of pitch, and steering never aims the game past 1.1 rad, so the game's own pitch only gets
+     * there through mouse look. */
+    if (fabsf(head_pitch) > 1.15f || fabsf(game_pitch) > 1.2f) err_yaw = 0;
     int input_pad_connected(void), input_right_stick_moved(void);
-    if (input_right_stick_moved()) { g_head_external = 15; input_head_stick(0, 0); return; }
+    if (input_right_stick_moved()) { g_head_external = 15; input_head_stick(0, 0); head_pause(); return; }
+    /* Safety, both paths: an error that keeps growing past 40 degrees means the loop is fighting the game; stop and
+     * re-anchor. */
+    float err_abs = fabsf(err_yaw) + fabsf(err_pitch);
+    g_head_diverging = err_abs > 0.7f && err_abs > g_head_prev_err ? g_head_diverging + 1 : 0;
+    g_head_prev_err = err_abs;
+    if (g_head_diverging > 30) {
+        LOG("head: steering diverged (error %.0f deg); re-anchoring", err_abs * 57.3f);
+        anchored = 0; atomic_store(&g_head_anchored, 0);
+        input_head_stick(0, 0);
+        head_pause();
+        return;
+    }
     if (input_pad_connected()) {
         /* Gamepad mode: the stick sets a turn rate. Proportional, starting just past the game's dead zone. */
-        float sx = err_yaw * stick_gain, sy = err_pitch * stick_gain;
+        float sx = err_yaw * stick_gain, sy = err_pitch * stick_gain * g_ysign[1];  /* stick up = look up, unless inverted */
         float mx = fabsf(sx) > 0.003f ? copysignf(stick_dead + (1 - stick_dead) * fminf(1, fabsf(sx)), sx) : 0;
         float my = fabsf(sy) > 0.003f ? copysignf(stick_dead + (1 - stick_dead) * fminf(1, fabsf(sy)), sy) : 0;
         input_head_stick(mx, my);
+        head_check_invert(1, game_pitch, err_pitch, my != 0 ? err_pitch : 0);
+        g_head_prev_t = 0;
         if (test && frame - logged >= 30) {
             logged = frame;
             LOG("head: frame %d target %.1f/%.1f game %.1f/%.1f err %.2f/%.2f deg stick %.2f,%.2f", frame,
@@ -240,63 +337,36 @@ static void head_steer(void) {
     }
     input_head_stick(0, 0);
     /* Mouse path. How far the game turns per count depends on the player's sensitivity setting, so the gain is
-     * moderate (LB_HEAD_GAIN, 0.5; 0.8 already overshoots at the default sensitivity) and each frame's motion is
-     * capped (LB_HEAD_CAP, below). Y inversion is detected (below). */
-    static float prev_err, ysign = 1, win_dy, win_pitch0;
-    static int diverging, win_n, contradicting, y_decided;
+     * moderate (LB_HEAD_GAIN, 0.5 of the error per frame; 0.8 already overshoots at the default sensitivity) and
+     * each frame's motion is capped (LB_HEAD_CAP). */
     const float kx = counts, ky = counts;
-    /* Inverted Y (the game's Invert Y Axis option): over 20-frame windows, if the pitch moved against the
-     * vertical motion sent, flip the sign. Uninverted, mouse down (dy > 0) looks down. The evidence must hold for
-     * three windows in a row, and the sign is decided once: on the Vision Pro a single window often disagreed
-     * (the head moving the target while the game lags), and the sign flipped 5 times in a 5-minute session, each
-     * wrong flip steering pitch the wrong way until the next. */
-    if (win_n == 0) { win_pitch0 = game_pitch; win_dy = 0; }
-    if (++win_n >= 20) {
-        float tilted = game_pitch - win_pitch0;
-        /* expected: dy > 0 tilts down (tilted < 0) when ysign = 1, up when ysign = -1 */
-        const bool against = fabsf(win_dy) > 40 && fabsf(tilted) > 0.02f && (tilted > 0) == ((win_dy > 0) == (ysign > 0));
-        contradicting = against ? contradicting + 1 : 0;
-        if (!y_decided && contradicting >= 3) {
-            ysign = -ysign;
-            y_decided = 1;
-            LOG("head: vertical mouse looks inverted; flipping (now %s), decided for this session", ysign > 0 ? "normal" : "inverted");
-        }
-        win_n = 0;
-    }
-    /* Safety: an error that keeps growing past 40 degrees means the loop is fighting the game; stop and re-anchor. */
-    float err_abs = fabsf(err_yaw) + fabsf(err_pitch);
-    diverging = err_abs > 0.7f && err_abs > prev_err ? diverging + 1 : 0;
-    prev_err = err_abs;
-    if (diverging > 30) {
-        LOG("head: mouse steering diverged (error %.0f deg); re-anchoring", err_abs * 57.3f);
-        diverging = 0; anchored = 0; atomic_store(&g_head_anchored, 0);
-        return;
-    }
-    /* The gain is per 60 Hz frame: scale by this frame's length so a frame cap (LB_MAX_FPS=30/45) responds as fast. */
-    static double prev_t;
+    /* The gain is per 60 Hz frame. The game answers a frame or two after the motion whatever the frame rate, so a
+     * longer frame can't take proportionally more of the error without ringing: shorter frames get less, but longer
+     * ones (LB_MAX_FPS=45 or 30) at most 0.5 per frame (or LB_HEAD_GAIN if higher), so they follow more slowly. */
     double t_now = (double)SDL_GetPerformanceCounter() / (double)SDL_GetPerformanceFrequency();
-    float frame_scale = prev_t > 0 ? (float)((t_now - prev_t) * 60.0) : 1.0f;
-    prev_t = t_now;
+    float frame_scale = g_head_prev_t > 0 ? (float)((t_now - g_head_prev_t) * 60.0) : 1.0f;
+    g_head_prev_t = t_now;
     frame_scale = fmaxf(0.5f, fminf(3.0f, frame_scale));
-    carry_x += err_yaw * kx * gain * frame_scale;
-    carry_y -= err_pitch * ky * gain * ysign * frame_scale;   /* mouse down = look down, unless inverted */
-    /* LB_HEAD_CAP: the most counts sent per frame and axis (120 by default; it was 40, about 2.3 degrees per frame
-     * at the default 1000 counts per radian, so a fast head turn outran the game camera). With LB_HEAD_GAIN 0.5 (was
-     * 0.2), a sweep at up to 81 deg/s on the Mac (LB_HEAD_TEST=sweep LB_HEAD_TEST_SPEED=3) trails by 2.2 degrees on
-     * average and 3.8 at most, against 5.4 and 8.8 before; gain 0.8 with cap 200 overshoots (6.0 and 18.3). */
+    float g = fminf(gain * frame_scale, fmaxf(gain, 0.5f));
+    carry_x += err_yaw * kx * g;
+    carry_y -= err_pitch * ky * g * g_ysign[0];   /* mouse down = look down, unless inverted */
+    /* LB_HEAD_CAP: the most counts per axis per 60 Hz frame (120 by default, about 6.9 degrees at the default 1000
+     * counts per radian), scaled by the frame's length so the fastest follow (about 410 deg/s at those defaults) is
+     * the same at any frame rate. A lower cap let fast head turns outrun the game camera. */
     static float cap = -1;
     if (cap < 0) cap = getenv("LB_HEAD_CAP") ? fmaxf(1.0f, (float)atof(getenv("LB_HEAD_CAP"))) : 120.0f;
-    carry_x = fmaxf(-cap, fminf(cap, carry_x));
-    carry_y = fmaxf(-cap, fminf(cap, carry_y));
+    float cap_now = cap * frame_scale;
+    carry_x = fmaxf(-cap_now, fminf(cap_now, carry_x));
+    carry_y = fmaxf(-cap_now, fminf(cap_now, carry_y));
     int dx = (int)carry_x, dy = (int)carry_y;
     carry_x -= dx;
     carry_y -= dy;
-    win_dy += dy;
+    head_check_invert(0, game_pitch, err_pitch, dy ? err_pitch : 0);
     if (frame - logged >= (test ? 30 : 600)) {
         logged = frame;
         LOG("head: mouse target %.1f/%.1f game %.1f/%.1f err %.2f/%.2f deg sent %d,%d (%.0f counts/rad/frame)",
             (head_yaw + offset) * 57.29578f, head_pitch * 57.29578f, game_yaw * 57.29578f, game_pitch * 57.29578f,
-            err_yaw * 57.29578f, err_pitch * 57.29578f, dx, dy, kx * gain);
+            err_yaw * 57.29578f, err_pitch * 57.29578f, dx, dy, kx * g);
     }
     if (!dx && !dy) return;
     void dinput_inject_mouse(int dx, int dy);
