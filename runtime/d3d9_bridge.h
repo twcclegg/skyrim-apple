@@ -40,9 +40,9 @@ void d3d_passes_clear(uint32_t flags);         // before a Clear, with its D3DCL
 void d3d_passes_projection(const float *m);    // SetTransform(D3DTS_PROJECTION), the guest's matrix
 bool hud_screen_in_pass(void);                 // drawing a menu into the second screen's image (hud_screen.cpp)
 /* LB_HIDDEN_DRAWS=1/2 (d3d9_bridge.cpp, diagnostic): each draw inside an occlusion query, so the log says per frame
- * and pass class how many draws wrote no samples; 2 also draws each one again first with the depth test and all
- * writes off (its coverage), to tell draws hidden by depth from draws with nothing on screen. The hooks are called
- * only while g_hidden_draws is set. */
+ * and pass class how many draws wrote no samples; 2 also draws each depth- or stencil-tested one again first with
+ * those tests and all writes off (its coverage), to tell draws hidden by depth or stencil from draws with nothing on
+ * screen. The hooks are called only while g_hidden_draws is set. */
 extern int g_hidden_draws;
 bool d3d_hidden_probe(void);                          // mode 2: true if the caller is to make the same draw again now
 void d3d_hidden_probe_done(void);                     // ... after that draw

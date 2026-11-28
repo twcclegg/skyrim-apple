@@ -963,46 +963,73 @@ void d3d_passes_projection(const float *m) {
 }
 
 /* LB_HIDDEN_DRAWS (diagnostic, off by default): how many of a frame's draws write no pixels at all, per pass class,
- * and, with 2, how many of those were on screen and hidden by depth (what occlusion culling could have skipped).
+ * and, with 2, how many of those were on screen and hidden by depth or stencil (occlusion culling could have skipped
+ * the ones hidden by depth; it cannot predict stencil masking, so the hidwin line splits the two by stencil state).
  *   1  Each draw the game makes goes inside its own D3DQUERYTYPE_OCCLUSION query (Issue BEGIN just before the real
  *      draw, END just after): the samples that passed the depth, stencil and alpha tests.
- *   2  Also, just before that, each draw with the depth test on is drawn once more inside a second query with the
- *      depth test, depth writes, stencil and colour writes off (states put back after): its coverage, the samples it
- *      has on screen after clipping, culling and alpha test. That probe changes no pixel, depth or stencil value.
- *      A draw with no samples is then "off" (no coverage: outside the view, back-facing, alpha-tested away) or
- *      hidden by depth (coverage, but every sample failed the depth or stencil test). Doubles the GPU's draws.
+ *   2  Also, just before that, each draw with the depth test or the stencil test on is drawn once more inside a
+ *      second query with the depth test, depth writes, stencil and colour writes off (states put back after): its
+ *      coverage, the samples it has on screen after clipping, culling and alpha test. That probe changes no pixel,
+ *      depth or stencil value. A draw with no samples is then "off" (no coverage: outside the view, back-facing,
+ *      alpha-tested away) or hidden by depth or stencil (coverage, but every sample failed the depth or stencil
+ *      test). Doubles the GPU's draws.
  * The queries are read without flushing a few frames later, and each frame gets one line once its last query is in:
  *   hid <frame> <class>=<zero>/<measured>/<tiny>/<off> ... unm=<n> lost=<n>
  * for each class that drew: draws with 0 samples / draws measured / draws with 1-63 samples (about 8x8 pixels or
- * less) / draws with 0 samples and no coverage (mode 2; a draw with the depth test off counts as off when it has 0
- * samples; in mode 1 off is only those). unm counts draws not measured (made while one of the game's own occlusion
- * queries was open, since two active occlusion queries are invalid in Vulkan; past HID_MAX draws; or with the ring
- * full of unread frames); lost counts queries that gave no result. Every 300 read frames a "hidwin" line per class
- * adds the depth state of the draws, from GetRenderState at the draw:
- *   hidwin <first>-<last> <class> draws=<n> zero=<n> off=<n> tiny=<n> zoff=<n> zoff_zero=<n> zwoff=<n> nocolor=<n>
- *          atest=<n> atest_zero=<n> zfunc=<count per D3DCMPFUNC 0-8>
- * zoff: depth test off; zwoff: depth writes off; nocolor: COLORWRITEENABLE 0 (depth only). Hidden by depth means
- * hidden by the depth written before the draw: the measure depends on the order the game draws in. Needs the pass
- * classes, so it turns the pass hooks on (like LB_FP=1, without the per-frame "pass" lines unless LB_PASSES is set
- * too). Off, it costs one branch per draw and per IDirect3DQuery9::Issue. */
+ * less) / draws with 0 samples and no coverage (mode 2; a draw with both the depth and stencil tests off counts as
+ * off when it has 0 samples; in mode 1 off is only those). unm counts draws not measured (made while one of the
+ * game's own occlusion queries was open, since two active occlusion queries are invalid in Vulkan; or past HID_MAX
+ * draws); lost counts queries that gave no result. Every 300 read frames a "hidwin" line per class adds the depth
+ * and stencil state of the draws, from GetRenderState at the draw:
+ *   hidwin <first>-<last> <class> draws=<n> zero=<n> off=<n> tiny=<n> hidden=<n> hidden_st=<n> hidden_nost=<n>
+ *          zoff=<n> zoff_zero=<n> zwoff=<n> nocolor=<n> stencil=<n> stencil_zero=<n> atest=<n> atest_zero=<n>
+ *          zfunc=<count per D3DCMPFUNC 0-8>
+ * hidden: zero samples but not off (zero - off): in mode 2 hidden by depth or stencil, in mode 1 only that a depth or
+ * stencil test was on (on screen or not); hidden_st / hidden_nost: those with the
+ * stencil test on / off (hidden_nost is hidden by depth alone). zoff: depth test off; zwoff: depth writes off;
+ * nocolor: render target 0's COLORWRITEENABLE is 0 (depth only, unless the draw writes RT1-3, whose masks are not
+ * looked at); stencil: stencil test on; zfunc: draws with the depth test on only. Hidden by depth means hidden by the
+ * depth written before the draw: the measure depends on the order the game draws in.
+ * Stereo: a query covers both eyes, so 0 means 0 samples in both eyes in either mode. The tiny bucket does not: with
+ * multiview the DXVK fork reads both view slots and returns their average rounded up (1-63 is per eye), with
+ * LB_STEREO_DUP both copies of the draw land in one query and are summed (1-63 is both eyes together). Compare tiny
+ * counts only between runs in the same stereo mode.
+ * Needs the pass classes, so it turns the pass hooks on (like LB_FP=1, without the per-frame "pass" lines unless
+ * LB_PASSES is set too). Off, it costs a test of g_hidden_draws at each hook: three per draw (probe, begin, end),
+ * one per IDirect3DQuery9::Issue and one per Present.
+ * One device: the switch is read and the device kept on the first CreateDevice only (passes_init), as gpu_init does;
+ * Skyrim makes one. The queries (up to HID_RING x HID_MAX x 2) are created as needed and never released, and nothing
+ * tears them down if the device goes away. Fine for a diagnostic run, not for a second device. */
 int g_hidden_draws;
-static IDirect3DDevice9 *g_hid_dev;  // the real device (CreateDevice), not AddRef'd
+static IDirect3DDevice9 *g_hid_dev;  // the real device (CreateDevice), not AddRef'd; see "One device" above
 enum { HID_MAX = 6144, HID_RING = 8, HID_WINDOW = 300, HID_TINY = 64 };
+// HidFrame::z bits
+enum { HZ_DEPTH = 1, HZ_ZWRITE = 2, HZ_ATEST = 4, HZ_NOCOLOR = 8, HZ_ZFUNC_SHIFT = 4, HZ_STENCIL = 0x100 };
 struct HidFrame {
     IDirect3DQuery9 *q[HID_MAX];   // samples of the draw
     IDirect3DQuery9 *qc[HID_MAX];  // its coverage (mode 2)
     int8_t cls[HID_MAX];
-    uint8_t z[HID_MAX];  // bit 0 depth test on, 1 depth write on, 2 alpha test on, 3 no colour writes, 4-7 D3DZFUNC
+    // bit 0 depth test on, 1 depth write on, 2 alpha test on, 3 no colour writes to RT0, 4-7 D3DZFUNC, 8 stencil on
+    uint16_t z[HID_MAX];
     bool probed[HID_MAX];
     int n, frame, unmeasured;
     bool pending;
 };
 static HidFrame *g_hid_ring;   // HID_RING frames, allocated when the switch is on
-static int g_hid_cur, g_hid_drops;
+static int g_hid_cur, g_hid_drops, g_hid_presents, g_hid_guest_drops;
 static IDirect3DQuery9 *g_hid_open;            // the query around the draw being made
 static bool g_hid_probed;                      // the draw being made had a coverage probe
-static std::vector<IDirect3DQuery9 *> g_hid_guest;  // the game's occlusion queries begun and not yet ended
-struct HidClass { long draws, zero, off, tiny, zoff, zoff_zero, zwoff, nocolor, atest, atest_zero, zfunc[9]; };
+// The game's occlusion queries begun and not yet ended, with the Present count at their BEGIN. One left open longer
+// than HID_RING Presents (released while begun, or never ended) is dropped at Present with a log line, so it does not
+// make every later draw unmeasured (if the game really does keep one open that long, later draws inside it are
+// wrapped again, two active occlusion queries; the log line marks where). Keyed by pointer, so a released query's
+// address reused by a new one is the same entry (harmless: its next BEGIN/END updates it).
+struct HidGuest { IDirect3DQuery9 *q; int since; };
+static std::vector<HidGuest> g_hid_guest;
+struct HidClass {
+    long draws, zero, off, tiny, hidden, hidden_st, zoff, zoff_zero, zwoff, nocolor, stencil, stencil_zero, atest,
+        atest_zero, zfunc[9];
+};
 static HidClass g_hid_win[PASS_COUNT];
 static int g_hid_win_frames, g_hid_win_first;
 // states the coverage probe turns off, and what it sets them to
@@ -1022,7 +1049,7 @@ static void hidden_init(IDirect3DDevice9 *d) {
 }
 
 static bool hidden_measurable(const HidFrame &h) {
-    return !h.pending && h.n < HID_MAX && g_hid_guest.empty() && g_last_class >= 0;
+    return h.n < HID_MAX && g_hid_guest.empty() && g_last_class >= 0;
 }
 
 static IDirect3DQuery9 *hidden_query(IDirect3DQuery9 *&q) {
@@ -1034,16 +1061,17 @@ static IDirect3DQuery9 *hidden_query(IDirect3DQuery9 *&q) {
     return q;
 }
 
-// Mode 2, before the draw: if it is to be measured and has the depth test on, start its coverage probe (the caller
-// then makes the same draw once more and calls d3d_hidden_probe_done).
+// Mode 2, before the draw: if it is to be measured and has the depth or stencil test on, start its coverage probe
+// (the caller then makes the same draw once more and calls d3d_hidden_probe_done).
 bool d3d_hidden_probe(void) {
     g_hid_probed = false;
     if (g_hidden_draws != 2) return false;
     HidFrame &h = g_hid_ring[g_hid_cur];
     if (!hidden_measurable(h)) return false;
-    DWORD zen = 0;
+    DWORD zen = 0, sten = 0;
     g_hid_dev->GetRenderState(D3DRS_ZENABLE, &zen);
-    if (!zen) return false;
+    g_hid_dev->GetRenderState(D3DRS_STENCILENABLE, &sten);
+    if (!zen && !sten) return false;
     IDirect3DQuery9 *q = hidden_query(h.qc[h.n]);
     if (!q) return false;
     for (size_t i = 0; i < sizeof k_hid_states / sizeof k_hid_states[0]; i++) {
@@ -1068,14 +1096,16 @@ void d3d_hidden_begin(void) {
     if (!hidden_measurable(h)) { h.unmeasured++; return; }
     IDirect3DQuery9 *q = hidden_query(h.q[h.n]);
     if (!q) return;
-    DWORD zen = 0, zw = 0, zf = 0, at = 0, cw = 0;
+    DWORD zen = 0, zw = 0, zf = 0, at = 0, cw = 0, sten = 0;
     g_hid_dev->GetRenderState(D3DRS_ZENABLE, &zen);
     g_hid_dev->GetRenderState(D3DRS_ZWRITEENABLE, &zw);
     g_hid_dev->GetRenderState(D3DRS_ZFUNC, &zf);
     g_hid_dev->GetRenderState(D3DRS_ALPHATESTENABLE, &at);
-    g_hid_dev->GetRenderState(D3DRS_COLORWRITEENABLE, &cw);
+    g_hid_dev->GetRenderState(D3DRS_COLORWRITEENABLE, &cw);  // RT0 only
+    g_hid_dev->GetRenderState(D3DRS_STENCILENABLE, &sten);
     h.cls[h.n] = (int8_t)g_last_class;
-    h.z[h.n] = (uint8_t)((zen ? 1 : 0) | (zw ? 2 : 0) | (at ? 4 : 0) | ((cw & 0xF) ? 0 : 8) | ((zf & 0xF) << 4));
+    h.z[h.n] = (uint16_t)((zen ? HZ_DEPTH : 0) | (zw ? HZ_ZWRITE : 0) | (at ? HZ_ATEST : 0) | ((cw & 0xF) ? 0 : HZ_NOCOLOR)
+                          | ((zf & 0xF) << HZ_ZFUNC_SHIFT) | (sten ? HZ_STENCIL : 0));
     h.probed[h.n] = g_hid_probed;
     g_hid_probed = false;
     q->Issue(D3DISSUE_BEGIN);
@@ -1091,9 +1121,26 @@ void d3d_hidden_end(void) {
 
 void d3d_hidden_guest_issue(IDirect3DQuery9 *q, uint32_t flags) {
     if (q->GetType() != D3DQUERYTYPE_OCCLUSION) return;
-    auto it = std::find(g_hid_guest.begin(), g_hid_guest.end(), q);
-    if (flags & D3DISSUE_BEGIN) { if (it == g_hid_guest.end()) g_hid_guest.push_back(q); }
-    else if (it != g_hid_guest.end()) g_hid_guest.erase(it);
+    auto it = std::find_if(g_hid_guest.begin(), g_hid_guest.end(), [q](const HidGuest &g) { return g.q == q; });
+    if (flags & D3DISSUE_BEGIN) {
+        if (it == g_hid_guest.end()) g_hid_guest.push_back({q, g_hid_presents});
+        else it->since = g_hid_presents;  // BEGIN again restarts the query
+    } else if (it != g_hid_guest.end()) {
+        g_hid_guest.erase(it);
+    }
+}
+
+// At Present: forget the game's occlusion queries left begun for more than HID_RING frames (a query that spans a
+// Present or two is legal, so not every Present).
+static void hidden_guest_present(void) {
+    g_hid_presents++;
+    for (auto it = g_hid_guest.begin(); it != g_hid_guest.end();) {
+        if (g_hid_presents - it->since <= HID_RING) { ++it; continue; }
+        if (g_hid_guest_drops++ < 10 || g_hid_guest_drops % 100 == 0)
+            LOG("hid: game occlusion query %p begun %d frames ago and not ended; no longer tracked (%d so far)",
+                (void *)it->q, g_hid_presents - it->since, g_hid_guest_drops);
+        it = g_hid_guest.erase(it);
+    }
 }
 
 static void hidden_window_log(int last) {
@@ -1103,9 +1150,11 @@ static void hidden_window_log(int last) {
         char zf[128];
         int n = 0;
         for (int i = 0; i < 9 && n < (int)sizeof zf; i++) n += snprintf(zf + n, sizeof zf - n, "%s%ld", i ? "," : "", w.zfunc[i]);
-        LOG("hidwin %d-%d %s draws=%ld zero=%ld off=%ld tiny=%ld zoff=%ld zoff_zero=%ld zwoff=%ld nocolor=%ld atest=%ld "
-            "atest_zero=%ld zfunc=%s", g_hid_win_first, last, k_pass_names[k], w.draws, w.zero, w.off, w.tiny, w.zoff,
-            w.zoff_zero, w.zwoff, w.nocolor, w.atest, w.atest_zero, zf);
+        LOG("hidwin %d-%d %s draws=%ld zero=%ld off=%ld tiny=%ld hidden=%ld hidden_st=%ld hidden_nost=%ld zoff=%ld "
+            "zoff_zero=%ld zwoff=%ld nocolor=%ld stencil=%ld stencil_zero=%ld atest=%ld atest_zero=%ld zfunc=%s",
+            g_hid_win_first, last, k_pass_names[k], w.draws, w.zero, w.off, w.tiny, w.hidden, w.hidden_st,
+            w.hidden - w.hidden_st, w.zoff, w.zoff_zero, w.zwoff, w.nocolor, w.stencil, w.stencil_zero, w.atest,
+            w.atest_zero, zf);
     }
     memset(g_hid_win, 0, sizeof g_hid_win);
     g_hid_win_frames = 0;
@@ -1125,18 +1174,22 @@ static void hidden_collect(void) {
             if (h.q[j]->GetData(&s, sizeof s, 0) != S_OK) { lost++; continue; }
             if (h.probed[j] && h.qc[j]->GetData(&cov, sizeof cov, 0) != S_OK) { lost++; continue; }
             const int k = h.cls[j];
-            const uint8_t z = h.z[j];
-            const bool none = s == 0 && (h.probed[j] ? cov == 0 : !(z & 1));  // no samples on screen at all
+            const unsigned z = h.z[j];
+            // no samples on screen at all (unprobed: no depth or stencil test that could have rejected them)
+            const bool none = s == 0 && (h.probed[j] ? cov == 0 : !(z & (HZ_DEPTH | HZ_STENCIL)));
+            const unsigned zfunc = (z >> HZ_ZFUNC_SHIFT) & 0xF;
             HidClass &w = g_hid_win[k];
             meas[k]++; w.draws++;
             if (s == 0) { zero[k]++; w.zero++; }
             else if (s < HID_TINY) { tiny[k]++; w.tiny++; }
             if (none) { off[k]++; w.off++; }
-            if (!(z & 1)) { w.zoff++; w.zoff_zero += s == 0; }
-            if (!(z & 2)) w.zwoff++;
-            if (z & 4) { w.atest++; w.atest_zero += s == 0; }
-            if (z & 8) w.nocolor++;
-            if ((z >> 4) <= 8) w.zfunc[z >> 4]++;
+            else if (s == 0) { w.hidden++; w.hidden_st += (z & HZ_STENCIL) != 0; }  // hidden by depth or stencil
+            if (!(z & HZ_DEPTH)) { w.zoff++; w.zoff_zero += s == 0; }
+            if (!(z & HZ_ZWRITE)) w.zwoff++;
+            if (z & HZ_STENCIL) { w.stencil++; w.stencil_zero += s == 0; }
+            if (z & HZ_ATEST) { w.atest++; w.atest_zero += s == 0; }
+            if (z & HZ_NOCOLOR) w.nocolor++;
+            if ((z & HZ_DEPTH) && zfunc <= 8) w.zfunc[zfunc]++;
         }
         char line[512];
         int n = snprintf(line, sizeof line, "hid %d", h.frame);
@@ -1152,12 +1205,11 @@ static void hidden_collect(void) {
 // At Present, before the real one: this frame's queries are issued; read what is in, then the next slot.
 static void hidden_present(int frame) {
     if (!g_hidden_draws || !g_hid_ring) return;
-    HidFrame &h = g_hid_ring[g_hid_cur];
-    if (!h.pending) {
-        h.frame = frame;
-        h.pending = h.n > 0;
-        if (!h.pending) h.unmeasured = 0;
-    }
+    HidFrame &h = g_hid_ring[g_hid_cur];  // never pending: the slot was cleared when the ring moved on to it
+    h.frame = frame;
+    h.pending = h.n > 0;
+    if (!h.pending) h.unmeasured = 0;
+    hidden_guest_present();
     hidden_collect();
     g_hid_cur = (g_hid_cur + 1) % HID_RING;
     HidFrame &next = g_hid_ring[g_hid_cur];
