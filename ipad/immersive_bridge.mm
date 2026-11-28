@@ -38,9 +38,11 @@ typedef struct skyrim_immersive_frame {
     int eye_views;             /* 1: each layer was rendered through that eye's own frustum and pose (below) */
     float eye_tangents[2][4];  /* l r t b at unit distance, per eye */
     float eye_pose[2][16];     /* the eye in the game camera's frame: column-major, metres, x right y up z back */
-    void *hud_texture;         /* LB_HUD_LAYER: the interface on its own (sRGB view, premultiplied); NULL otherwise */
+    void *hud_texture;         /* LB_HUD_LAYER: the interface on its own (UNORM, sRGB-encoded colour premultiplied by
+                                  coverage, coverage in alpha); NULL otherwise */
 } skyrim_immersive_frame;
 int skyrim_frame_camera(float out[18]);  /* runtime/d3d9_bridge.cpp */
+void skyrim_hud_layer_exclusive(int on);  /* runtime/d3d9_bridge.cpp: LB_HUD_LAYER redirects only while on */
 int skyrim_frame_eyes(float tangents[8], float eye_pose[32]);
 int skyrim_frame_eye(float *k_out);  /* runtime/d3d9_bridge.cpp: -1 left, 0 none/centre, +1 right; k_out: clip shift */
 }
@@ -84,7 +86,7 @@ std::atomic<uint32_t> g_mailbox_drops;  /* frames pushed out of a full mailbox b
 void *g_cache_state;
 std::unordered_map<uint64_t, Cached> g_cache;
 std::unordered_map<uint64_t, CachedDepth> g_depth_cache;  /* R32Float, sampled as it is */
-std::unordered_map<uint64_t, id<MTLTexture>> g_hud_cache;  /* LB_HUD_LAYER, through an sRGB view */
+std::unordered_map<uint64_t, id<MTLTexture>> g_hud_cache;  /* LB_HUD_LAYER, sampled as stored (UNORM) */
 PFN_vkExportMetalObjectsEXT g_export;
 
 uint64_t now_ns() { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW); }
@@ -187,14 +189,12 @@ id<MTLTexture> hud_texture(const Entry &entry) {
     texture.plane = VK_IMAGE_ASPECT_PLANE_0_BIT;
     VkExportMetalObjectsInfoEXT info = {VK_STRUCTURE_TYPE_EXPORT_METAL_OBJECTS_INFO_EXT, &texture};
     g_export((VkDevice)entry.device, &info);
+    /* No sRGB view: the colour is premultiplied, so the compositor decodes it itself (hud_fragment), and the tap
+     * image is not created with MUTABLE_FORMAT. */
     id<MTLTexture> exported = texture.mtlTexture;
-    MTLPixelFormat srgb = exported.pixelFormat == MTLPixelFormatRGBA8Unorm ? MTLPixelFormatRGBA8Unorm_sRGB
-                                                                            : MTLPixelFormatBGRA8Unorm_sRGB;
-    id<MTLTexture> view = [exported newTextureViewWithPixelFormat:srgb];
-    fprintf(stderr, "immersive: slot %u hud exported %lux%lu, Metal format %lu, sRGB view %d\n", entry.slot,
-            (unsigned long)exported.width, (unsigned long)exported.height, (unsigned long)exported.pixelFormat,
-            view ? 1 : 0);
-    return g_hud_cache[entry.hud] = view ? view : exported;
+    fprintf(stderr, "immersive: slot %u hud exported %lux%lu, Metal format %lu\n", entry.slot,
+            (unsigned long)exported.width, (unsigned long)exported.height, (unsigned long)exported.pixelFormat);
+    return g_hud_cache[entry.hud] = exported;
 }
 
 const CachedDepth &depth_texture(const Entry &entry) {
@@ -275,10 +275,12 @@ extern "C" void skyrim_immersive_start(void) {
     metalfx_probe();
     dxvk_present_tap_set(on_frame, nullptr);
     dxvk_present_tap_set_exclusive(1);
+    skyrim_hud_layer_exclusive(1);
     fprintf(stderr, "immersive: tap registered, tap-only presents on\n");
 }
 
 extern "C" void skyrim_immersive_stop(void) {
+    skyrim_hud_layer_exclusive(0);  /* the window gets the interface back from the next frame */
     dxvk_present_tap_set_exclusive(0);
     dxvk_present_tap_set(nullptr, nullptr);
     Entry waiting[2];
@@ -294,6 +296,7 @@ extern "C" void skyrim_immersive_stop(void) {
     g_shown = Entry();
     g_cache.clear();
     g_depth_cache.clear();
+    g_hud_cache.clear();
     g_cache_state = nullptr;
     fprintf(stderr, "immersive: tap cleared, window presents back on\n");
 }

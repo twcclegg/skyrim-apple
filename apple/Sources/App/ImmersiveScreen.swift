@@ -312,12 +312,19 @@ final class ImmersiveCompositor: @unchecked Sendable {
         o.position = h.mvp * float4(h.rect.x + (uv.x * 2 - 1) * h.rect.z, h.rect.y + (1 - uv.y * 2) * h.rect.w, h.z, 1);
         return o;
     }
-    // The game blended the interface onto transparent black: colour times coverage a, and alpha a * a (the same
-    // blend applied to alpha). Premultiplied colour over the scene with coverage sqrt(alpha).
+    // The runtime drew the interface onto transparent black with alpha forced to coverage: colour is sRGB-encoded
+    // and premultiplied by coverage, alpha is the coverage. The texture is sampled as stored, so un-premultiply,
+    // decode and premultiply again (decoding the premultiplied value would darken translucent pixels), then put it
+    // over the scene with that coverage. Additive interface draws add colour without coverage, so colour can exceed
+    // alpha: dividing by m = max(alpha, colour) keeps them, and is plain un-premultiplying otherwise.
     fragment float4 hud_fragment(HudOut in [[stage_in]], texture2d<float> hud [[texture(0)]]) {
         constexpr sampler linear_clamp(filter::linear, address::clamp_to_edge);
         float4 c = hud.sample(linear_clamp, in.uv);
-        return float4(c.rgb, sqrt(saturate(c.a)));
+        float m = max(c.a, max(c.r, max(c.g, c.b)));
+        if (m <= 0.0) return float4(0);
+        float3 g = saturate(c.rgb / m);
+        float3 l = select(pow((g + 0.055) / 1.055, 2.4), g / 12.92, g <= 0.04045);
+        return float4(l * m, saturate(c.a));
     }
     """
 
@@ -563,7 +570,8 @@ final class ImmersiveCompositor: @unchecked Sendable {
         hud.colorAttachments[0].sourceAlphaBlendFactor = .one
         hud.colorAttachments[0].destinationAlphaBlendFactor = .oneMinusSourceAlpha
         hud.depthAttachmentPixelFormat = layer.configuration.depthFormat
-        hudPipeline = try device.makeRenderPipelineState(descriptor: hud)
+        // Optional: without it the interface stays out of the layer, and the picture is still shown.
+        do { hudPipeline = try device.makeRenderPipelineState(descriptor: hud) } catch { log("hud pipeline: \(error)") }
         let always = MTLDepthStencilDescriptor()
         always.depthCompareFunction = .always
         always.isDepthWriteEnabled = false
@@ -993,7 +1001,8 @@ final class ImmersiveCompositor: @unchecked Sendable {
                 }
                 if let hudPointer = game.hud_texture, let hudPipeline, let hudDepth, let place = heldModel ?? model,
                    let hud = Unmanaged<AnyObject>.fromOpaque(hudPointer).takeUnretainedValue() as? any MTLTexture {
-                    // LB_HUD_LAYER: the interface as a flat layer, never moved by the depth mesh. With a camera, a
+                    // LB_HUD_LAYER: the interface as a flat layer, never moved by the depth mesh (visionOS's own late
+                    // reprojection still sees the scene's depth under it: no depth is written here). With a camera, a
                     // plane hudDistance ahead of it spanning the game's field of view (so the reticle stays on the
                     // aim point), placed as the frame is but without the movement shift; without one (menus), over
                     // the screen the picture is shown on, just in front of it.

@@ -52,8 +52,9 @@ typedef struct skyrim_immersive_frame {
     int eye_views;
     float eye_tangents[2][4];
     float eye_pose[2][16];
-    /* LB_HUD_LAYER=1: the interface drawn on its own, transparent elsewhere (an sRGB view; colours premultiplied by
-     * coverage), shown as a flat layer instead of inside the picture. NULL otherwise. Same lifetime as texture. */
+    /* LB_HUD_LAYER=1: the interface drawn on its own, shown as a flat layer instead of inside the picture. Sampled as
+     * stored (UNORM): sRGB-encoded colour premultiplied by coverage, coverage in alpha, transparent black where there
+     * is no interface. NULL otherwise. Same lifetime as texture. */
     void *hud_texture;
 } skyrim_immersive_frame;
 void skyrim_immersive_start(void);
